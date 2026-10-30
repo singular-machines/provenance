@@ -52,17 +52,6 @@ pub enum State {
     Ended,
 }
 
-impl State {
-    pub fn label(self) -> &'static str {
-        match self {
-            State::Running => "● running",
-            State::Waiting => "◐ waiting",
-            State::Stopped => "✕ stopped",
-            State::Ended => "○ ended",
-        }
-    }
-}
-
 pub fn state(r: &Record, alive: bool) -> State {
     match r.last_event.as_str() {
         "SessionEnd" => State::Ended,
@@ -332,7 +321,14 @@ pub fn sightings(records: &[Record]) -> Vec<Sighting> {
             r.branches.iter().map(move |b| Sighting {
                 harness: r.harness,
                 session_id: r.session_id.clone(),
-                app: r.app.clone(),
+                // Hooks don't always say which app ran the session; the folder often does.
+                app: if r.app.is_empty() {
+                    crate::sessions::app_from_path(&b.cwd)
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    r.app.clone()
+                },
                 cwd: b.cwd.clone(),
                 branch: b.branch.clone(),
                 repo_url: None,

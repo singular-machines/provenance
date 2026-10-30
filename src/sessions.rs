@@ -17,15 +17,6 @@ pub enum Harness {
     Codex,
 }
 
-impl Harness {
-    pub fn label(self) -> &'static str {
-        match self {
-            Harness::ClaudeCode => "Claude Code",
-            Harness::Codex => "Codex",
-        }
-    }
-}
-
 /// One session seen on one branch in one folder.
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct Sighting {
@@ -206,7 +197,7 @@ pub fn claude_app(entrypoint: Option<&str>, cwd: &str) -> String {
     }
 }
 
-fn app_from_path(cwd: &str) -> Option<&'static str> {
+pub fn app_from_path(cwd: &str) -> Option<&'static str> {
     if cwd.contains("/.t3/worktrees/") {
         Some("T3 Code")
     } else if cwd.contains("/conductor/workspaces/") {

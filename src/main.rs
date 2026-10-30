@@ -3,6 +3,7 @@ mod github;
 mod install;
 mod live;
 mod matching;
+mod render;
 mod sessions;
 mod stamps;
 
@@ -10,10 +11,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 
-use matching::{MatchKind, PrRow, SessionMatch};
+use matching::PrRow;
 use sessions::Harness;
 
 /// Find the coding-agent session behind each pull request.
@@ -40,6 +41,9 @@ enum Cmd {
         /// Search GitHub now instead of using a PR list cached in the last 2 minutes.
         #[arg(long)]
         refresh: bool,
+        /// Also show how many sessions were matched by stamp, repo and folder path.
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Install the commit-stamp git hook and the Claude Code and Codex session hooks.
     Install {
@@ -90,7 +94,8 @@ fn main() -> Result<()> {
             author,
             json,
             refresh,
-        } => prs(&home()?, repo, &author, json, refresh),
+            verbose,
+        } => prs(&home()?, repo, &author, json, refresh, verbose),
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
             report(install::install(&home()?, &bin, dry_run)?, dry_run);
@@ -146,6 +151,7 @@ fn prs(
     author: &str,
     json: bool,
     refresh: bool,
+    verbose: bool,
 ) -> Result<()> {
     let mut search = format!("author:{author}");
     if let Some(r) = &repo {
@@ -186,132 +192,18 @@ fn prs(
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
-        print_table(&rows, now);
-        if fetched.from_cache {
-            println!(
-                "PR list from {} ago (cached; --refresh to search GitHub now)",
-                ago(fetched.fetched_at, now)
-            );
-        }
+        let cached = fetched
+            .from_cache
+            .then(|| render::ago(fetched.fetched_at, now));
+        print!(
+            "{}",
+            render::render(
+                &rows,
+                now,
+                &render::Style::detect(verbose),
+                cached.as_deref()
+            )
+        );
     }
     Ok(())
-}
-
-fn session_label(m: &SessionMatch) -> String {
-    let s = &m.sighting;
-    let id: String = s
-        .session_id
-        .trim_start_matches("session_")
-        .chars()
-        .take(8)
-        .collect();
-    let place = match (&s.app[..], &s.machine) {
-        ("", Some(machine)) => format!("on {machine}"),
-        ("", None) => "?".into(),
-        (app, _) => app.into(),
-    };
-    format!("{} · {place} · {id}", s.harness.label())
-}
-
-fn print_table(rows: &[PrRow], now: DateTime<Utc>) {
-    let table: Vec<[String; 7]> = rows
-        .iter()
-        .map(|r| {
-            let [session, kind, state, active] = match r.sessions.first() {
-                Some(m) => [
-                    session_label(m),
-                    match m.kind {
-                        MatchKind::Stamp => "stamp",
-                        MatchKind::Repo => "repo",
-                        MatchKind::Path => "path",
-                    }
-                    .to_string(),
-                    m.state.map(|s| s.label().to_string()).unwrap_or_default(),
-                    ago(m.sighting.last_seen, now),
-                ],
-                None => ["— no session found".into(), "".into(), "".into(), "".into()],
-            };
-            [
-                truncate(&r.pr.repo, 28),
-                format!("#{}", r.pr.number),
-                truncate(&r.pr.title, 40),
-                session,
-                kind,
-                state,
-                active,
-            ]
-        })
-        .collect();
-
-    let header = [
-        "REPO",
-        "PR",
-        "TITLE",
-        "LAST SESSION",
-        "MATCH",
-        "STATE",
-        "ACTIVE",
-    ]
-    .map(String::from);
-    let mut widths = header.clone().map(|h| h.chars().count());
-    for row in &table {
-        for (w, cell) in widths.iter_mut().zip(row) {
-            *w = (*w).max(cell.chars().count());
-        }
-    }
-    for row in std::iter::once(&header).chain(&table) {
-        let line: Vec<String> = row
-            .iter()
-            .zip(widths)
-            .map(|(c, w)| format!("{c:<w$}"))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    }
-
-    let matched: Vec<_> = rows.iter().filter_map(|r| r.sessions.first()).collect();
-    let count = |k: MatchKind| matched.iter().filter(|m| m.kind == k).count();
-    println!(
-        "\n{} open PRs · {} with a session ({} by stamp, {} by repo, {} by folder path) · {} no session found",
-        rows.len(),
-        matched.len(),
-        count(MatchKind::Stamp),
-        count(MatchKind::Repo),
-        count(MatchKind::Path),
-        rows.len() - matched.len()
-    );
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max - 1).collect();
-        t.push('…');
-        t
-    }
-}
-
-fn ago(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let secs = (now - t).num_seconds().max(0);
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    #[test]
-    fn formats_relative_time_and_truncates_by_char() {
-        let now = Utc.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
-        assert_eq!(ago(now - chrono::Duration::minutes(3), now), "3m");
-        assert_eq!(ago(now - chrono::Duration::days(2), now), "2d");
-        assert_eq!(truncate("héllo world", 6), "héllo…");
-        assert_eq!(truncate("short", 6), "short");
-    }
 }
