@@ -1,51 +1,67 @@
+<div align="center">
+
 # provenance
 
-Find the coding-agent session behind each pull request.
+**Which agent session opened this PR, and is it still running?**
 
-You run many Claude Code and Codex sessions across apps (terminal, Claude desktop, Codex desktop, T3 Code, Conductor), and they open PRs. When you look at a PR, provenance tells you which session worked on it, in which app, and when it was last active.
+[![CI](https://github.com/singular-machines/provenance/actions/workflows/ci.yml/badge.svg)](https://github.com/singular-machines/provenance/actions/workflows/ci.yml) ![Rust](https://img.shields.io/badge/Rust-2024-dea584?logo=rust&logoColor=white) ![Claude Code](https://img.shields.io/badge/Claude_Code-supported-d97757) ![Codex](https://img.shields.io/badge/Codex-supported-10a37f)
 
-Example output (the `●`/`◐` status dots appear once `provenance install` has been run):
+[Quick start](#quick-start) · [Reading the table](#reading-the-table) · [How it works](#how-it-works) · [Install hooks](#install-hooks) · [Privacy](#privacy) · [Roadmap](#roadmap)
 
-```
-$ provenance prs
-acme/storefront                                            3 open · 1 running · 1 waiting
-  ● #927  Add retry when checkout times out              T3 Code    Claude 4f2a91c0 ~ 55m
-  ◐ #931  Show stock levels on the product page          T3 Code    Codex  01a1c0de    1h
-    #896  fix: round totals before applying discounts    T3 Code    Claude d361dde1 ~ 10h
+<img src="docs/demo.svg" alt="provenance prs: open PRs grouped by repository, each showing the app, harness and ID of its session and whether it is running or waiting for you" width="860">
 
-acme/api                                                                           2 open
-    #950  fix: remove unused exports from the client     web        Claude 01Hq3xKe    7h
-    #68   Ask before rebuilding the local cache          Conductor  Claude 7be310aa ~  3d
+</div>
 
-example/web                                                                        1 open
-    #41   Bump deps                                      — no session found
+You run Claude Code and Codex in lots of apps: the terminal, Claude desktop, Codex desktop, T3 Code, Conductor, the web. They all open PRs. On GitHub you can't tell which session opened a PR, or whether that session is still alive.
 
-6 open PRs in 3 repos · 1 with no session found  ·  ● running  ◐ waiting for you  ~ matched by branch, not stamped
-```
+`provenance prs` lists your open PRs with the session behind each one: the app it runs in, when it was last active, and whether it's running or waiting for you.
 
-PRs are grouped by repository, with live sessions first. In a terminal the PR numbers are links to the PRs (and web session IDs to the sessions), running sessions are green, sessions waiting for you are yellow, and idle PRs are dimmed. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
+## Highlights
 
-Terminal only. No setup beyond the GitHub CLI.
+- **Works with nothing installed.** It reads the session logs Claude Code and Codex already write.
+- **Exact matches with stamps.** An optional git hook adds `Agent-Session` trailers to agent commits. Claude Code on the web's `Claude-Session` trailers are read too.
+- **Live status.** Session hooks show whether each session is running, waiting for you, stopped or ended.
+- **Every app.** Terminal, Claude desktop, Codex desktop, T3 Code, Conductor and the web.
+- **Fast.** Cached repeat runs take well under a second.
+- **Private by default.** Commit stamps carry a random machine ID, never your host name.
+- **Terminal only.** One Rust binary plus the GitHub CLI. `--json` for scripts and agents.
 
-## Install
+## Quick start
 
 ```sh
 cargo install --git https://github.com/singular-machines/provenance
-gh auth status   # provenance uses your existing gh login
+gh auth status          # provenance uses your existing gh login
+provenance prs          # your open PRs and the session behind each
+provenance install      # optional: exact stamps and live status
 ```
 
 ## Usage
 
-```sh
-provenance install                # optional: commit stamps + live session state (see below)
-provenance prs                    # your open PRs across GitHub
-provenance prs --repo owner/name  # one repository
-provenance prs --author someone   # someone else's PRs
-provenance prs --json             # every matching session per PR, for scripts and agents
-provenance prs --refresh          # search GitHub now instead of using the 2-minute cache
-provenance prs --verbose          # also count matches by stamp, repo and folder path
-provenance machine [alias]        # show or set this machine's name in stamps
-```
+| Command | What it does |
+|---|---|
+| `provenance prs` | Your open PRs across GitHub |
+| `provenance prs --repo owner/name` | One repository |
+| `provenance prs --author someone` | Someone else's PRs |
+| `provenance prs --verbose` | Also count matches by stamp, repo and folder path |
+| `provenance prs --json` | Every matching session per PR, for scripts and agents |
+| `provenance prs --refresh` | Search GitHub now instead of using the 2-minute cache |
+| `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks |
+| `provenance machine [alias]` | Show or set this machine's name in stamps |
+
+## Reading the table
+
+PRs are grouped by repository, live sessions first. Each row reads: status, PR, title, app, harness and session ID, then when the session was last active.
+
+| Mark | Meaning |
+|---|---|
+| `●` green | Running: working on a turn, and its process is up |
+| `◐` yellow | Waiting for you: finished its turn |
+| `✕` red | Stopped: was mid-turn when its process disappeared |
+| `○` | Ended: the session was closed |
+| dimmed row | No live session |
+| `~` | Matched by branch, not by a commit stamp |
+
+Status marks need [`provenance install`](#install-hooks). In a terminal, PR numbers are links to the PRs, and web session IDs link to the sessions. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
 
 ## How it works
 
@@ -69,33 +85,40 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 - Apps built on the agent SDKs report a generic entrypoint, so they're named from their worktree folder: `.t3/worktrees` → T3 Code, `conductor/workspaces` → Conductor.
 - Sessions known only from a stamp show where they ran: `web`, or `on <machine>`.
 
-## Speed
+## Install hooks
 
-`provenance prs` keeps caches in `~/.cache/provenance/`, so a repeat run takes well under a second:
+`provenance install` is optional. It makes matches exact and adds live status, and `provenance uninstall` removes everything it added.
 
-- **PR list:** reused for 2 minutes; the table footer says how old it is. `--refresh` searches GitHub now.
-- **Commit stamps:** kept per PR head commit, which never changes, so only PRs with new pushes have their commits fetched again.
-- **Session logs:** each log file is read again only when its size or modified time changes.
+> [!TIP]
+> Codex asks you to review new hooks before it runs them. Approve the provenance hooks when it asks.
 
-Deleting `~/.cache/provenance/` is always safe; it's rebuilt on the next run.
-
-## `provenance install`
-
-Optional. Adds two things, and `provenance uninstall` removes both:
+<details>
+<summary><b>What <code>install</code> changes</b></summary>
 
 1. **A git hook that stamps agent commits.** It adds `hook.provenance` to your global git config: a config-defined `prepare-commit-msg` hook, which git runs alongside each repository's own hooks (including repositories with their own `core.hooksPath`), so nothing is displaced. When a commit is made inside a Claude Code or Codex session (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID` is set), it adds `Agent-Session` and `Agent-Machine` trailers. Commits you make yourself are left alone. Needs a git that supports hooks defined in config (`hook.<name>.command`, as in git 2.56); `install` checks and refuses otherwise.
-2. **Session hooks for Claude Code and Codex** (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`) in `~/.claude/settings.json` and `~/.codex/hooks.json`, appended after your existing hooks; a backup is written first and the file keeps its permissions. `uninstall` removes only provenance's own commands. In Codex, which keys hook approvals by position, a removed group that has later groups after it keeps a no-op `true` command so those later hooks keep their approvals. Each event updates `~/.local/state/provenance/live/<harness>-<id>.json`: the harness process ID and its start time, the last event, and every folder and branch the session has been on. That gives the status dot:
+2. **Session hooks for Claude Code and Codex** (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`) in `~/.claude/settings.json` and `~/.codex/hooks.json`, appended after your existing hooks; a backup is written first and the file keeps its permissions. `uninstall` removes only provenance's own commands. In Codex, which keys hook approvals by position, a removed group that has later groups after it keeps a no-op `true` command so those later hooks keep their approvals. Each event updates `~/.local/state/provenance/live/<harness>-<id>.json`: the harness process ID and its start time, the last event, and every folder and branch the session has been on. That gives the status marks described in [Reading the table](#reading-the-table).
 
-| Status | Meaning |
+</details>
+
+## Privacy
+
+> [!NOTE]
+> Stamps never contain your host name. Each machine gets a random ID such as `m-7f3a9c2e`, created on first use and kept in the global git setting `provenance.machine`.
+
+- `provenance machine <alias>` sets a name of your choice (letters, digits, `.`, `-`, `_`). `provenance machine` shows the current one.
+- `PROVENANCE_MACHINE` overrides it for one shell.
+- Stamps are part of commit history. On public repositories they publish the session ID and this machine name.
+- Everything else stays on your machine: session logs are read locally, and nothing is sent anywhere except `gh` queries to GitHub.
+
+## Speed
+
+Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
+
+| Cache | Kept until |
 |---|---|
-| `● running` | Working on a turn, and its process is up |
-| `◐ waiting` | Finished its turn; waiting for you |
-| `✕ stopped` | Was mid-turn when its process disappeared |
-| `○ ended` | The session was closed |
-
-Codex asks you to review new hooks before it runs them: approve the provenance hooks when it asks.
-
-**Machine name.** Stamps never contain your host name. Each machine gets a random ID such as `m-7f3a9c2e`, created on first use and kept in the global git setting `provenance.machine`. To use a name of your choice instead, run `provenance machine <alias>` (letters, digits, `.`, `-`, `_`); `provenance machine` shows the current one, and `PROVENANCE_MACHINE` overrides it for one shell. Stamps are part of commit history, so on public repositories they publish the session ID and this machine name.
+| PR list | 2 minutes; the footer says how old it is, and `--refresh` skips it |
+| Commit stamps | The PR's head or base moves |
+| Session logs | The log file's size or modified time changes |
 
 ## Known gaps
 
@@ -107,7 +130,7 @@ Codex asks you to review new hooks before it runs them: approve the provenance h
 
 ## Roadmap
 
-1. ✅ `provenance prs` from existing session logs.
-2. ✅ Commit stamps (including Claude Code on the web's) and live session state.
-3. `provenance show`, `go` (reopen the session) and `send` (steer it through Singular).
-4. An MCP server exposing the same functions to agents.
+- [x] `provenance prs` from existing session logs
+- [x] Commit stamps (including Claude Code on the web's) and live session status
+- [ ] `provenance show`, `go` (reopen the session) and `send` (steer it through Singular)
+- [ ] An MCP server exposing the same functions to agents
