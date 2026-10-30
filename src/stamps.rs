@@ -84,17 +84,70 @@ pub fn trailer_value(harness: Harness, id: &str) -> String {
     format!("{prefix}/{id}")
 }
 
-/// Name for this machine: `PROVENANCE_MACHINE`, else the short host name.
+/// Name for this machine in stamps. Never the host name, which would publish
+/// the owner's name and device on public repositories. In order:
+/// `PROVENANCE_MACHINE`, the `provenance.machine` global git setting (an
+/// alias, or the random ID stored there), else a new random ID, saved there.
 pub fn machine_name() -> Option<String> {
     if let Some(m) = std::env::var("PROVENANCE_MACHINE")
         .ok()
-        .filter(|m| !m.is_empty())
+        .filter(|m| valid_alias(m))
     {
         return Some(m);
     }
-    let out = Command::new("hostname").arg("-s").output().ok()?;
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!name.is_empty()).then_some(name)
+    if let Some(m) = configured_machine().filter(|m| valid_alias(m)) {
+        return Some(m);
+    }
+    let id = random_id()?;
+    // If saving fails the ID still stamps this commit; the next one retries.
+    let _ = set_machine(&id);
+    Some(id)
+}
+
+pub fn configured_machine() -> Option<String> {
+    let out = Command::new("git")
+        .args(["config", "--global", "--get", "provenance.machine"])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !v.is_empty()).then_some(v)
+}
+
+pub fn set_machine(name: &str) -> Result<()> {
+    if !valid_alias(name) {
+        bail!("machine names use letters, digits, '.', '-' and '_' (up to 40 characters)");
+    }
+    let status = Command::new("git")
+        .args(["config", "--global", "provenance.machine", name])
+        .status()
+        .context("running git config")?;
+    if !status.success() {
+        bail!("git config --global provenance.machine failed");
+    }
+    Ok(())
+}
+
+/// Aliases end up in commit trailers, so keep them to one safe token.
+pub fn valid_alias(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// `m-` and eight random hex digits.
+pub fn random_id() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 4];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut bytes)
+        .ok()?;
+    Some(format!(
+        "m-{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ))
 }
 
 /// `prepare-commit-msg` entry point: add trailers when an agent session is
@@ -220,5 +273,24 @@ mod tests {
         assert_eq!(text.matches("Agent-Session: codex/t1").count(), 1, "{text}");
         assert_eq!(text.matches("Agent-Machine: box").count(), 1, "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn machine_ids_are_random_and_safe() {
+        let a = random_id().unwrap();
+        let b = random_id().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 10);
+        assert!(a.starts_with("m-") && valid_alias(&a));
+    }
+
+    #[test]
+    fn aliases_are_single_safe_tokens() {
+        assert!(valid_alias("mbp"));
+        assert!(valid_alias("work-laptop_2"));
+        assert!(!valid_alias(""));
+        assert!(!valid_alias("my mac"));
+        assert!(!valid_alias("mbp\nAgent-Session: codex/x"));
+        assert!(!valid_alias(&"x".repeat(41)));
     }
 }

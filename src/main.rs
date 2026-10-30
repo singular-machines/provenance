@@ -43,6 +43,13 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show this machine's name in stamps, or set an alias for it.
+    ///
+    /// The default is a random ID, never the host name.
+    Machine {
+        /// New name: letters, digits, '.', '-', '_'.
+        alias: Option<String>,
+    },
     /// Remove everything `install` added.
     Uninstall {
         #[arg(long)]
@@ -78,10 +85,25 @@ fn main() -> Result<()> {
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
             report(install::install(&home()?, &bin, dry_run)?, dry_run);
+            if !dry_run && let Some(m) = stamps::machine_name() {
+                println!(
+                    "machine name in stamps: {m} (random, not your host name; set an alias with `provenance machine <alias>`)"
+                );
+            }
             if !dry_run {
                 println!(
                     "\nCodex asks you to review new hooks before running them: approve the provenance hooks when it asks."
                 );
+            }
+            Ok(())
+        }
+        Cmd::Machine { alias } => {
+            if let Some(a) = alias {
+                stamps::set_machine(&a)?;
+            }
+            match stamps::machine_name() {
+                Some(m) => println!("{m}"),
+                None => anyhow::bail!("couldn't read or create a machine name"),
             }
             Ok(())
         }

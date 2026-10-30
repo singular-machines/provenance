@@ -35,6 +35,7 @@ provenance prs                    # your open PRs across GitHub
 provenance prs --repo owner/name  # one repository
 provenance prs --author someone   # someone else's PRs
 provenance prs --json             # every matching session per PR, for scripts and agents
+provenance machine [alias]        # show or set this machine's name in stamps
 ```
 
 ## How it works
@@ -75,7 +76,7 @@ Optional. Adds two things, and `provenance uninstall` removes both:
 
 Codex asks you to review new hooks before it runs them: approve the provenance hooks when it asks.
 
-The machine name in stamps is the short host name; set `PROVENANCE_MACHINE` to use another name. Stamps are part of commit history, so on public repositories they publish the session ID and machine name.
+**Machine name.** Stamps never contain your host name. Each machine gets a random ID such as `m-7f3a9c2e`, created on first use and kept in the global git setting `provenance.machine`. To use a name of your choice instead, run `provenance machine <alias>` (letters, digits, `.`, `-`, `_`); `provenance machine` shows the current one, and `PROVENANCE_MACHINE` overrides it for one shell. Stamps are part of commit history, so on public repositories they publish the session ID and this machine name.
 
 ## Known gaps
 
