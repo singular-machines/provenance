@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::live::State;
 use crate::matching::{MatchKind, PrRow, SessionMatch};
@@ -95,12 +96,20 @@ fn rank(s: Option<State>) -> u8 {
     }
 }
 
+/// The session a row shows: a live one if any (running, then waiting), else
+/// the most recent. `sessions` is newest first, which `--json` keeps.
+fn pick(r: &PrRow) -> Option<&SessionMatch> {
+    r.sessions
+        .iter()
+        .min_by_key(|m| (rank(m.state), std::cmp::Reverse(m.sighting.last_seen)))
+}
+
 fn state(r: &PrRow) -> Option<State> {
-    r.sessions.first().and_then(|m| m.state)
+    pick(r).and_then(|m| m.state)
 }
 
 fn last_seen(r: &PrRow) -> Option<DateTime<Utc>> {
-    r.sessions.first().map(|m| m.sighting.last_seen)
+    pick(r).map(|m| m.sighting.last_seen)
 }
 
 /// Plain-text session cells: where to find it, which harness and the short ID.
@@ -159,15 +168,12 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
         )
     });
 
-    let sessions: Vec<Option<Session>> = rows
-        .iter()
-        .map(|r| r.sessions.first().map(session_cells))
-        .collect();
+    let sessions: Vec<Option<Session>> = rows.iter().map(|r| pick(r).map(session_cells)).collect();
 
     let max = |f: &dyn Fn(&Session) -> usize| sessions.iter().flatten().map(f).max().unwrap_or(0);
-    let place_w = max(&|s| s.place.chars().count());
+    let place_w = max(&|s| width(&s.place));
     let harness_w = max(&|s| s.harness.len());
-    let id_w = max(&|s| s.id.chars().count());
+    let id_w = max(&|s| width(&s.id));
     let num_w = rows
         .iter()
         .map(|r| r.pr.number.to_string().len() + 1)
@@ -178,16 +184,12 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
         .filter_map(|r| last_seen(r).map(|t| ago(t, now).len()))
         .max()
         .unwrap_or(0);
-    let longest_title = rows
-        .iter()
-        .map(|r| r.pr.title.chars().count())
-        .max()
-        .unwrap_or(0);
+    let longest_title = rows.iter().map(|r| width(&r.pr.title)).max().unwrap_or(0);
     // "  ● #927  " + title + "  " + place + "  " + harness + " " + id + " ~" + " " + ago
     let session_w = if sessions.iter().any(Option::is_some) {
         place_w + 2 + harness_w + 1 + id_w + 2
     } else {
-        "— no session found".chars().count()
+        width("— no session found")
     };
     let fixed = 2 + 1 + 1 + num_w + 2 + 2 + session_w + 1 + ago_w;
     let title_w = match style.width {
@@ -218,9 +220,7 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
             counts.push(format!("{waiting} waiting"));
         }
         let counts = counts.join(" · ");
-        let gap = line_w
-            .saturating_sub(repo.chars().count() + counts.chars().count())
-            .max(2);
+        let gap = line_w.saturating_sub(width(repo) + width(&counts)).max(2);
         out.push_str(&format!(
             "{}{}{}\n",
             style.paint(BOLD, repo),
@@ -243,7 +243,7 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
                 _ if live => title,
                 _ => style.paint(DIM, &title),
             };
-            let (session, when) = match r.sessions.first().map(session_cells) {
+            let (session, when) = match pick(r).map(session_cells) {
                 Some(s) => {
                     let id = style.paint(DIM, &pad(&s.id, id_w));
                     let id = match s.url {
@@ -306,7 +306,7 @@ fn footer(rows: &[PrRow], repos: usize, style: &Style, cached: Option<&str>) -> 
             ));
         }
     }
-    let matched: Vec<&SessionMatch> = rows.iter().filter_map(|r| r.sessions.first()).collect();
+    let matched: Vec<&SessionMatch> = rows.iter().filter_map(pick).collect();
     if matched.iter().any(|m| m.kind != MatchKind::Stamp) {
         parts.push("~ matched by branch, not stamped".into());
     }
@@ -358,18 +358,32 @@ fn footer(rows: &[PrRow], repos: usize, style: &Style, cached: Option<&str>) -> 
     out
 }
 
-fn pad(s: &str, w: usize) -> String {
-    format!("{s:<w$}")
+/// Terminal cells, not chars: CJK and emoji take two, combining marks none.
+fn width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
 }
 
+fn pad(s: &str, w: usize) -> String {
+    format!("{s}{}", " ".repeat(w.saturating_sub(width(s))))
+}
+
+/// Cut to at most `max` cells, ending in `…` when cut.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-        t.push('…');
-        t
+    if width(s) <= max {
+        return s.to_string();
     }
+    let mut t = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        used += w;
+        t.push(c);
+    }
+    t.push('…');
+    t
 }
 
 pub fn ago(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -581,5 +595,33 @@ example/web                                                                     
         assert_eq!(ago(now() - Duration::days(2), now()), "2d");
         assert_eq!(truncate("héllo world", 6), "héllo…");
         assert_eq!(truncate("short", 6), "short");
+        assert_eq!(truncate("修正修正", 5), "修正…");
+        assert_eq!(width(&pad("修正", 6)), 6);
+    }
+
+    #[test]
+    fn wide_titles_fit_the_terminal() {
+        let mut rows = sample();
+        rows[2].pr.title = "修正".repeat(40);
+        let got = render(&rows, now(), &plain(Some(80)), None);
+        for l in got.lines().filter(|l| l.starts_with("  ")) {
+            assert!(width(l) <= 80, "{} cells: {l}", width(l));
+        }
+    }
+
+    #[test]
+    fn a_live_session_wins_over_a_newer_idle_one() {
+        let mut rows = sample();
+        // #896: an older session waiting for the owner, plus a newer idle one.
+        let mut waiting = rows[1].sessions[0].clone();
+        waiting.state = Some(State::Waiting);
+        waiting.sighting.session_id = "aaaabbbb-old".into();
+        waiting.sighting.last_seen = now() - Duration::minutes(700);
+        rows[1].sessions[0].sighting.last_seen = now() - Duration::minutes(5);
+        rows[1].sessions.push(waiting);
+        let got = render(&rows, now(), &plain(Some(100)), None);
+        assert!(got.contains("3 open · 1 running · 2 waiting"), "{got}");
+        assert!(got.contains("◐ #896"), "{got}");
+        assert!(got.contains("aaaabbbb"), "{got}");
     }
 }
