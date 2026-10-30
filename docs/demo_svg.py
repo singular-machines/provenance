@@ -3,24 +3,25 @@
 import html, sys
 FG, DIM, GREEN, YELLOW, RED, BG, BAR = "#e6edf3", "#7d8590", "#3fb950", "#d29922", "#f85149", "#0d1117", "#161b22"
 B = "bold"
-# Each line: list of (column, text, colour, weight)
+# Each line: list of (column, text, colour, weight). Columns match src/render.rs
+# for these rows: title at 10, app 55, harness 66, ID 73, ~ 82, time 84.
 def row(glyph, gcol, num, numw, title, tcol, tw, place, harness, hid, tilde, when, wcol, live, ww=""):
     out = []
     out.append((2, glyph, gcol, B if gcol == YELLOW else ""))
     out.append((4, num, FG, numw))
-    out.append((11, title, tcol, tw))
+    out.append((10, title, tcol, tw))
     if place is None:
-        out.append((58, "— no session found", DIM, ""))
+        out.append((55, "— no session found", DIM, ""))
         return out
     pc = FG if live else DIM
-    out.append((58, place, pc, ""))
-    out.append((69, harness, pc, ""))
-    out.append((76, hid, DIM, ""))
-    out.append((85, tilde, DIM, ""))
-    out.append((87, when.rjust(3), wcol, ww))
+    out.append((55, place, pc, ""))
+    out.append((66, harness, pc, ""))
+    out.append((73, hid, DIM, ""))
+    out.append((82, tilde, DIM, ""))
+    out.append((84, when.rjust(3), wcol, ww))
     return out
 def heading(repo, counts):
-    return [(0, repo, FG, B), (90 - len(counts), counts, DIM, "")]
+    return [(0, repo, FG, B), (87 - len(counts), counts, DIM, "")]
 lines = [
     [(0, "$", GREEN, B), (2, "provenance prs", FG, B)],
     [],

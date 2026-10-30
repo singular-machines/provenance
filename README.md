@@ -87,7 +87,7 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 
 ## Install hooks
 
-`provenance install` is optional. It makes matches exact and adds live status, and `provenance uninstall` removes everything it added.
+`provenance install` is optional. It makes matches exact and adds live status. `provenance uninstall` removes the hooks it added; it leaves the settings backups, your machine name, the live-session records and the caches.
 
 > [!TIP]
 > Codex asks you to review new hooks before it runs them. Approve the provenance hooks when it asks.
@@ -122,7 +122,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 
 ## Known gaps
 
-- **Only this machine.** Sessions that ran on another machine or a server show "no session found".
+- **Unstamped sessions on other machines.** A session that ran elsewhere is found only through its commit stamps, and shows as `web` or `on <machine>` with the stamped commit's time but no live status. Without a stamp it shows "no session found".
 - **Without `install`:** a Codex session that starts on `main` and then creates the PR branch isn't matched (Codex logs its branch only at session start), and nor is a session that works in another repository by changing directory. Stamps and session hooks cover both.
 - **A repository's own `prepare-commit-msg` runs after provenance's.** One that rewrites the whole message would drop the stamp.
 - **Desktop apps start a new harness process per turn** (Conductor does; others may), so between turns a waiting session has no process of its own. The status relies on the last event for that reason.
