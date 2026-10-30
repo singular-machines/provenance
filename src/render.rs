@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::live::State;
 use crate::matching::{MatchKind, PrRow, SessionMatch};
@@ -367,23 +367,21 @@ fn pad(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w.saturating_sub(width(s))))
 }
 
-/// Cut to at most `max` cells, ending in `…` when cut.
+/// Cut to at most `max` cells, ending in `…` when cut. Each prefix is
+/// measured whole, because a sequence such as `©` + U+FE0F is wider than its
+/// characters added up.
 pub fn truncate(s: &str, max: usize) -> String {
     if width(s) <= max {
         return s.to_string();
     }
-    let mut t = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w + 1 > max {
-            break;
-        }
-        used += w;
-        t.push(c);
-    }
-    t.push('…');
-    t
+    let budget = max.saturating_sub(1);
+    let end = s
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .rev()
+        .find(|&end| width(&s[..end]) <= budget)
+        .unwrap_or(0);
+    format!("{}…", &s[..end])
 }
 
 pub fn ago(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -596,16 +594,20 @@ example/web                                                                     
         assert_eq!(truncate("héllo world", 6), "héllo…");
         assert_eq!(truncate("short", 6), "short");
         assert_eq!(truncate("修正修正", 5), "修正…");
+        let emoji = "\u{a9}\u{fe0f}".repeat(4);
+        assert!(width(&truncate(&emoji, 5)) <= 5);
         assert_eq!(width(&pad("修正", 6)), 6);
     }
 
     #[test]
     fn wide_titles_fit_the_terminal() {
-        let mut rows = sample();
-        rows[2].pr.title = "修正".repeat(40);
-        let got = render(&rows, now(), &plain(Some(80)), None);
-        for l in got.lines().filter(|l| l.starts_with("  ")) {
-            assert!(width(l) <= 80, "{} cells: {l}", width(l));
+        for title in ["修正".repeat(40), "\u{a9}\u{fe0f}".repeat(80)] {
+            let mut rows = sample();
+            rows[2].pr.title = title;
+            let got = render(&rows, now(), &plain(Some(80)), None);
+            for l in got.lines().filter(|l| l.starts_with("  ")) {
+                assert!(width(l) <= 80, "{} cells: {l}", width(l));
+            }
         }
     }
 
