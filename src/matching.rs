@@ -1,6 +1,8 @@
 //! Joins open PRs to session sightings on repository + head branch.
 
 use std::collections::HashMap;
+
+use rayon::prelude::*;
 use std::path::Path;
 use std::process::Command;
 
@@ -39,7 +41,7 @@ pub struct PrRow {
 }
 
 /// Where a sighting's folder points, resolved once per folder.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Location {
     /// Every GitHub repository among the folder's remotes (a fork clone often
     /// has both the fork and upstream).
@@ -49,14 +51,37 @@ pub enum Location {
     Unknown,
 }
 
+#[cfg(test)]
 pub fn match_prs(prs: Vec<PullRequest>, sightings: &[Sighting]) -> Vec<PrRow> {
-    let mut folders: HashMap<&str, Location> = HashMap::new();
-    for s in sightings {
-        folders
-            .entry(s.cwd.as_str())
-            .or_insert_with(|| locate(&s.cwd));
-    }
+    let folders = resolve_folders(&prs, sightings);
+    match_prs_with(prs, sightings, &folders)
+}
 
+/// The location of each folder where a session was on one of the PRs' head
+/// branches; no other folder can produce a branch match. Git is asked for
+/// each in parallel. Not cached: a folder's remotes can come from any config
+/// file git reads (includes, global settings), so only git can say they're unchanged.
+pub fn resolve_folders(prs: &[PullRequest], sightings: &[Sighting]) -> HashMap<String, Location> {
+    let heads: std::collections::HashSet<&str> = prs
+        .iter()
+        .filter(|p| !is_default_branch(p))
+        .map(|p| p.head_branch.as_str())
+        .collect();
+    let cwds: std::collections::HashSet<&str> = sightings
+        .iter()
+        .filter(|s| heads.contains(s.branch.as_str()))
+        .map(|s| s.cwd.as_str())
+        .collect();
+    cwds.into_par_iter()
+        .map(|cwd| (cwd.to_string(), locate(cwd)))
+        .collect()
+}
+
+pub fn match_prs_with(
+    prs: Vec<PullRequest>,
+    sightings: &[Sighting],
+    folders: &HashMap<String, Location>,
+) -> Vec<PrRow> {
     let mut by_branch: HashMap<&str, Vec<&Sighting>> = HashMap::new();
     for s in sightings {
         by_branch.entry(s.branch.as_str()).or_default().push(s);
@@ -88,7 +113,8 @@ pub fn match_prs(prs: Vec<PullRequest>, sightings: &[Sighting]) -> Vec<PrRow> {
                 .collect();
             if !is_default_branch(&pr) {
                 for s in by_branch.get(pr.head_branch.as_str()).into_iter().flatten() {
-                    let loc = sighting_location(s, &folders[s.cwd.as_str()]);
+                    let loc =
+                        sighting_location(s, folders.get(&s.cwd).unwrap_or(&Location::Unknown));
                     if let Some(kind) = classify(&pr, &loc) {
                         sessions.push(SessionMatch {
                             kind,
@@ -265,6 +291,9 @@ mod tests {
 
     fn pr(repo: &str, head_repo: Option<&str>, branch: &str) -> PullRequest {
         PullRequest {
+            id: "PR".into(),
+            head_sha: "sha".into(),
+            base_sha: "base".into(),
             repo: repo.into(),
             head_repo: head_repo.map(Into::into),
             number: 1,
@@ -455,5 +484,55 @@ mod tests {
         assert_eq!(s[0].sighting.session_id, "other", "newest first");
         assert_eq!(s[1].kind, MatchKind::Stamp);
         assert_eq!(s[1].sighting.app, "web");
+    }
+
+    #[test]
+    fn resolves_each_folder_from_git() {
+        let dir = std::env::temp_dir().join(format!("prov-remote-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        // A remote from an included config file, which only git itself resolves.
+        std::fs::write(
+            dir.join("extra.cfg"),
+            "[remote \"origin\"]\n\turl = https://github.com/o/first\n",
+        )
+        .unwrap();
+        git(&[
+            "config",
+            "include.path",
+            dir.join("extra.cfg").to_str().unwrap(),
+        ]);
+        let prs = [pr("o/first", None, "feat")];
+        let mut s = sighting("s", "feat", None, 1);
+        s.cwd = repo.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_folders(&prs, std::slice::from_ref(&s))[&s.cwd],
+            Location::Repos(vec!["o/first".into()])
+        );
+        std::fs::write(
+            dir.join("extra.cfg"),
+            "[remote \"origin\"]\n\turl = https://github.com/o/second\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_folders(&prs, std::slice::from_ref(&s))[&s.cwd],
+            Location::Repos(vec!["o/second".into()])
+        );
+        // Folders on no PR's branch aren't looked up at all.
+        let other = [pr("o/first", None, "unrelated")];
+        assert!(resolve_folders(&other, std::slice::from_ref(&s)).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -35,6 +35,7 @@ provenance prs                    # your open PRs across GitHub
 provenance prs --repo owner/name  # one repository
 provenance prs --author someone   # someone else's PRs
 provenance prs --json             # every matching session per PR, for scripts and agents
+provenance prs --refresh          # search GitHub now instead of using the 2-minute cache
 provenance machine [alias]        # show or set this machine's name in stamps
 ```
 
@@ -59,6 +60,16 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 - `ACTIVE` is the session's last logged event, or the stamped commit's time for sessions not on this machine.
 - Apps built on the agent SDKs report a generic entrypoint, so they're named from their worktree folder: `.t3/worktrees` → T3 Code, `conductor/workspaces` → Conductor.
 - Sessions known only from a stamp show where they ran: `web`, or `on <machine>`.
+
+## Speed
+
+`provenance prs` keeps caches in `~/.cache/provenance/`, so a repeat run takes well under a second:
+
+- **PR list:** reused for 2 minutes; the table footer says how old it is. `--refresh` searches GitHub now.
+- **Commit stamps:** kept per PR head commit, which never changes, so only PRs with new pushes have their commits fetched again.
+- **Session logs:** each log file is read again only when its size or modified time changes.
+
+Deleting `~/.cache/provenance/` is always safe; it's rebuilt on the next run.
 
 ## `provenance install`
 

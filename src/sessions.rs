@@ -27,7 +27,7 @@ impl Harness {
 }
 
 /// One session seen on one branch in one folder.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct Sighting {
     pub harness: Harness,
     pub session_id: String,
@@ -44,12 +44,82 @@ pub struct Sighting {
     pub url: Option<String>,
 }
 
-pub fn load_all(home: &Path) -> Vec<Sighting> {
-    let mut out = load_claude(&home.join(".claude/projects"));
-    out.extend(load_codex(&[
+/// What was read from one log file, valid while its size and modified time
+/// are unchanged.
+#[derive(serde::Serialize, Deserialize, Clone)]
+struct Indexed {
+    len: u64,
+    modified_ns: u128,
+    sightings: Vec<Sighting>,
+}
+
+/// All sightings from both harnesses' logs. With a cache folder, only files
+/// whose size or modified time changed since the last run are read again.
+pub fn load_all(home: &Path, cache_dir: Option<&Path>) -> Vec<Sighting> {
+    let mut files: Vec<(PathBuf, Harness)> = Vec::new();
+    let mut claude = Vec::new();
+    jsonl_files(&home.join(".claude/projects"), &mut claude);
+    files.extend(claude.into_iter().map(|p| (p, Harness::ClaudeCode)));
+    let mut codex = Vec::new();
+    for root in [
         home.join(".codex/sessions"),
         home.join(".codex/archived_sessions"),
-    ]));
+    ] {
+        jsonl_files(&root, &mut codex);
+    }
+    files.extend(codex.into_iter().map(|p| (p, Harness::Codex)));
+
+    let index_path = cache_dir.map(|d| crate::cache::path(d, "logs"));
+    let old: HashMap<String, Indexed> = index_path
+        .as_deref()
+        .and_then(crate::cache::read)
+        .unwrap_or_default();
+
+    let entries: Vec<(String, Indexed, bool)> = files
+        .par_iter()
+        .filter_map(|(path, harness)| {
+            let meta = std::fs::metadata(path).ok()?;
+            let len = meta.len();
+            let modified_ns = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            let key = path.to_string_lossy().into_owned();
+            if let Some(hit) = old
+                .get(&key)
+                .filter(|e| e.len == len && e.modified_ns == modified_ns)
+            {
+                return Some((key, hit.clone(), false));
+            }
+            let sightings = match harness {
+                Harness::ClaudeCode => read_claude_file(path),
+                Harness::Codex => read_codex_file(path).into_iter().collect(),
+            };
+            Some((
+                key,
+                Indexed {
+                    len,
+                    modified_ns,
+                    sightings,
+                },
+                true,
+            ))
+        })
+        .collect();
+
+    let changed = entries.iter().any(|(_, _, fresh)| *fresh) || entries.len() != old.len();
+    let out = entries
+        .iter()
+        .flat_map(|(_, e, _)| e.sightings.iter().cloned())
+        .collect();
+    if let Some(p) = index_path
+        && changed
+    {
+        let index: HashMap<String, Indexed> = entries.into_iter().map(|(k, e, _)| (k, e)).collect();
+        crate::cache::write(&p, &index);
+    }
     out
 }
 
@@ -83,15 +153,6 @@ struct ClaudeLine {
 
 /// Claude Code records `gitBranch` and `cwd` on every message, so a session that
 /// switches branches is seen on each of them.
-pub fn load_claude(root: &Path) -> Vec<Sighting> {
-    let mut files = Vec::new();
-    jsonl_files(root, &mut files);
-    files
-        .par_iter()
-        .flat_map_iter(|p| read_claude_file(p))
-        .collect()
-}
-
 fn read_claude_file(path: &Path) -> Vec<Sighting> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
@@ -186,17 +247,6 @@ struct CodexGit {
 
 /// Codex records git details once, in the `session_meta` first line, so a
 /// session is only seen on the branch it started on.
-pub fn load_codex(roots: &[PathBuf]) -> Vec<Sighting> {
-    let mut files = Vec::new();
-    for root in roots {
-        jsonl_files(root, &mut files);
-    }
-    files
-        .par_iter()
-        .filter_map(|p| read_codex_file(p))
-        .collect()
-}
-
 fn read_codex_file(path: &Path) -> Option<Sighting> {
     let mut first = String::new();
     BufReader::new(File::open(path).ok()?)
@@ -339,5 +389,45 @@ mod tests {
         assert_eq!(got[0].branch, "feat");
         assert_eq!(got[0].last_seen.to_rfc3339(), "2026-10-02T00:00:00+00:00");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn index_reuses_unchanged_files_and_rereads_changed_ones() {
+        let home = std::env::temp_dir().join(format!("prov-index-{}", std::process::id()));
+        let proj = home.join(".claude/projects/p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let log = proj.join("s.jsonl");
+        let line = |b: &str, t: &str| {
+            format!(
+                r#"{{"sessionId":"s1","cwd":"/r","gitBranch":"{b}","timestamp":"{t}","entrypoint":"cli"}}"#
+            )
+        };
+        std::fs::write(&log, line("feat", "2026-10-01T00:00:00Z") + "\n").unwrap();
+        let cache = home.join("cache");
+        assert_eq!(load_all(&home, Some(&cache)).len(), 1);
+
+        // Unchanged file: served from the index even if its contents can't be read.
+        let saved = std::fs::read(&log).unwrap();
+        let modified = std::fs::metadata(&log).unwrap().modified().unwrap();
+        std::fs::write(&log, "x".repeat(saved.len())).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(load_all(&home, Some(&cache))[0].branch, "feat");
+
+        // Changed file: read again.
+        std::fs::write(
+            &log,
+            line("feat", "2026-10-01T00:00:00Z")
+                + "\n"
+                + &line("other", "2026-10-02T00:00:00Z")
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(load_all(&home, Some(&cache)).len(), 2);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

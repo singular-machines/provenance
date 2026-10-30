@@ -1,3 +1,4 @@
+mod cache;
 mod github;
 mod install;
 mod live;
@@ -36,6 +37,9 @@ enum Cmd {
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Search GitHub now instead of using a PR list cached in the last 2 minutes.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Install the commit-stamp git hook and the Claude Code and Codex session hooks.
     Install {
@@ -81,7 +85,12 @@ fn main() -> Result<()> {
         ))
     };
     match Cli::parse().command {
-        Cmd::Prs { repo, author, json } => prs(&home()?, repo, &author, json),
+        Cmd::Prs {
+            repo,
+            author,
+            json,
+            refresh,
+        } => prs(&home()?, repo, &author, json, refresh),
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
             report(install::install(&home()?, &bin, dry_run)?, dry_run);
@@ -131,17 +140,32 @@ fn report(lines: Vec<String>, dry_run: bool) {
     }
 }
 
-fn prs(home: &std::path::Path, repo: Option<String>, author: &str, json: bool) -> Result<()> {
+fn prs(
+    home: &std::path::Path,
+    repo: Option<String>,
+    author: &str,
+    json: bool,
+    refresh: bool,
+) -> Result<()> {
     let mut search = format!("author:{author}");
     if let Some(r) = &repo {
         search.push_str(&format!(" repo:{r}"));
     }
-    let (prs, (mut sightings, records)) = rayon::join(
-        || github::open_prs(&search),
-        || (sessions::load_all(home), live::load_records(home)),
+    let now = Utc::now();
+    let cache_dir = cache::dir(home);
+    let (fetched, (mut sightings, records)) = rayon::join(
+        || github::open_prs(&search, &cache_dir, refresh, now),
+        || {
+            (
+                sessions::load_all(home, Some(&cache_dir)),
+                live::load_records(home),
+            )
+        },
     );
+    let fetched = fetched?;
     sightings.extend(live::sightings(&records));
-    let mut rows = matching::match_prs(prs?, &sightings);
+    let folders = matching::resolve_folders(&fetched.prs, &sightings);
+    let mut rows = matching::match_prs_with(fetched.prs, &sightings, &folders);
 
     let alive = live::alive_pids(&records);
     let by_id: HashMap<(Harness, &str), &live::Record> = records
@@ -162,7 +186,13 @@ fn prs(home: &std::path::Path, repo: Option<String>, author: &str, json: bool) -
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
-        print_table(&rows, Utc::now());
+        print_table(&rows, now);
+        if fetched.from_cache {
+            println!(
+                "PR list from {} ago (cached; --refresh to search GitHub now)",
+                ago(fetched.fetched_at, now)
+            );
+        }
     }
     Ok(())
 }

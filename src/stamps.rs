@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 
 use crate::sessions::Harness;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Stamp {
     pub harness: Harness,
     pub session_id: String,
