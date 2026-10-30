@@ -5,12 +5,15 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::github::PullRequest;
-use crate::sessions::Sighting;
+use crate::sessions::{Harness, Sighting};
+use crate::stamps::Stamp;
 
 /// How a session was tied to a PR, strongest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MatchKind {
+    /// A commit in the PR names the session (`Agent-Session` or `Claude-Session`).
+    Stamp,
     /// The session's repository (from its log or its folder's git remote) is the PR's.
     Repo,
     /// The folder no longer exists, but its path names the PR's repository.
@@ -20,6 +23,9 @@ pub enum MatchKind {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionMatch {
     pub kind: MatchKind,
+    /// From the session's live record, when hooks are installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<crate::live::State>,
     #[serde(flatten)]
     pub sighting: Sighting,
 }
@@ -56,27 +62,105 @@ pub fn match_prs(prs: Vec<PullRequest>, sightings: &[Sighting]) -> Vec<PrRow> {
         by_branch.entry(s.branch.as_str()).or_default().push(s);
     }
 
+    // Latest sighting per session, to enrich sessions named by a stamp.
+    let mut by_id: HashMap<(Harness, &str), &Sighting> = HashMap::new();
+    for s in sightings {
+        let e = by_id.entry((s.harness, s.session_id.as_str())).or_insert(s);
+        if s.last_seen > e.last_seen {
+            *e = s;
+        }
+    }
+
     prs.into_iter()
         .map(|pr| {
-            let mut sessions: Vec<SessionMatch> = Vec::new();
+            let mut sessions: Vec<SessionMatch> = pr
+                .stamps
+                .iter()
+                .map(|st| SessionMatch {
+                    kind: MatchKind::Stamp,
+                    state: None,
+                    sighting: from_stamp(
+                        st,
+                        &pr,
+                        by_id.get(&(st.harness, st.session_id.as_str())).copied(),
+                    ),
+                })
+                .collect();
             if !is_default_branch(&pr) {
                 for s in by_branch.get(pr.head_branch.as_str()).into_iter().flatten() {
                     let loc = sighting_location(s, &folders[s.cwd.as_str()]);
                     if let Some(kind) = classify(&pr, &loc) {
                         sessions.push(SessionMatch {
                             kind,
+                            state: None,
                             sighting: (*s).clone(),
                         });
                     }
                 }
             }
-            sessions.sort_by_key(|m| std::cmp::Reverse(m.sighting.last_seen));
-            // Keep each session once, at its most recent sighting.
-            let mut seen = std::collections::HashSet::new();
-            sessions.retain(|m| seen.insert(m.sighting.session_id.clone()));
-            PrRow { pr, sessions }
+            PrRow {
+                sessions: merge_sessions(sessions),
+                pr,
+            }
         })
         .collect()
+}
+
+/// A stamped session: the local sighting when this machine has one, else
+/// what the stamp itself says.
+fn from_stamp(st: &Stamp, pr: &PullRequest, local: Option<&Sighting>) -> Sighting {
+    match local {
+        Some(l) => Sighting {
+            last_seen: l.last_seen.max(st.committed),
+            machine: st.machine.clone().or_else(|| l.machine.clone()),
+            ..l.clone()
+        },
+        None => Sighting {
+            harness: st.harness,
+            session_id: st.session_id.clone(),
+            app: if st.url.is_some() {
+                "web".into()
+            } else {
+                String::new()
+            },
+            cwd: String::new(),
+            branch: pr.head_branch.clone(),
+            repo_url: None,
+            last_seen: st.committed,
+            log_path: None,
+            machine: st.machine.clone(),
+            url: st.url.clone(),
+        },
+    }
+}
+
+/// One entry per session, newest first, keeping the strongest match kind and
+/// filling gaps (app, machine, link) from the other matches of that session.
+fn merge_sessions(mut sessions: Vec<SessionMatch>) -> Vec<SessionMatch> {
+    sessions.sort_by_key(|m| std::cmp::Reverse(m.sighting.last_seen));
+    let mut out: Vec<SessionMatch> = Vec::new();
+    let mut index: HashMap<(Harness, String), usize> = HashMap::new();
+    for m in sessions {
+        let key = (m.sighting.harness, m.sighting.session_id.clone());
+        match index.get(&key) {
+            Some(&i) => {
+                let kept = &mut out[i];
+                kept.kind = kept.kind.min(m.kind);
+                let k = &mut kept.sighting;
+                if k.app.is_empty() {
+                    k.app = m.sighting.app;
+                }
+                k.machine = k.machine.take().or(m.sighting.machine);
+                k.url = k.url.take().or(m.sighting.url);
+                k.log_path = k.log_path.take().or(m.sighting.log_path);
+            }
+            None => {
+                index.insert(key, out.len());
+                out.push(m);
+            }
+        }
+    }
+    out
 }
 
 /// Adds the repository the harness recorded itself (Codex) to the folder's remotes.
@@ -189,6 +273,7 @@ mod tests {
             head_branch: branch.into(),
             base_branch: "main".into(),
             default_branches: vec!["main".into()],
+            stamps: vec![],
         }
     }
 
@@ -201,7 +286,9 @@ mod tests {
             branch: branch.into(),
             repo_url: url.map(Into::into),
             last_seen: Utc.with_ymd_and_hms(2026, 10, day, 0, 0, 0).unwrap(),
-            log_path: "/x".into(),
+            log_path: None,
+            machine: None,
+            url: None,
         }
     }
 
@@ -315,5 +402,58 @@ mod tests {
         let sightings = vec![sighting("s", "feat", None, 1)];
         let rows = match_prs(vec![pr("o/myrepo", None, "feat")], &sightings);
         assert_eq!(rows[0].sessions[0].kind, MatchKind::Path);
+    }
+
+    #[test]
+    fn stamp_beats_branch_match_and_works_on_default_branches() {
+        use chrono::TimeZone;
+        let mut p = pr("o/myrepo", None, "main");
+        p.stamps = vec![Stamp {
+            harness: Harness::Codex,
+            session_id: "s".into(),
+            machine: Some("box".into()),
+            url: None,
+            committed: Utc.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap(),
+        }];
+        let local = vec![sighting(
+            "s",
+            "other",
+            Some("https://github.com/o/myrepo"),
+            1,
+        )];
+        let rows = match_prs(vec![p], &local);
+        let m = &rows[0].sessions[0];
+        assert_eq!(m.kind, MatchKind::Stamp);
+        assert_eq!(m.sighting.app, "CLI", "enriched from the local log");
+        assert_eq!(m.sighting.machine.as_deref(), Some("box"));
+        assert_eq!(
+            m.sighting.last_seen.to_rfc3339(),
+            "2026-10-03T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn unknown_stamped_session_and_branch_match_merge_into_one() {
+        use chrono::TimeZone;
+        let mut p = pr("o/myrepo", None, "feat");
+        p.stamps = vec![Stamp {
+            harness: Harness::ClaudeCode,
+            session_id: "session_01".into(),
+            machine: None,
+            url: Some("https://claude.ai/code/session_01".into()),
+            committed: Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap(),
+        }];
+        let local = vec![sighting(
+            "other",
+            "feat",
+            Some("https://github.com/o/myrepo"),
+            5,
+        )];
+        let rows = match_prs(vec![p], &local);
+        let s = &rows[0].sessions;
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].sighting.session_id, "other", "newest first");
+        assert_eq!(s[1].kind, MatchKind::Stamp);
+        assert_eq!(s[1].sighting.app, "web");
     }
 }

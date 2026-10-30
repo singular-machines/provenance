@@ -4,7 +4,10 @@
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
+
+use crate::stamps::{self, Stamp};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PullRequest {
@@ -17,6 +20,8 @@ pub struct PullRequest {
     pub base_branch: String,
     /// Configured default branches of the base and head repositories.
     pub default_branches: Vec<String>,
+    /// Session stamps in the PR's commit messages, oldest commit first.
+    pub stamps: Vec<Stamp>,
 }
 
 const QUERY: &str = r#"
@@ -28,6 +33,7 @@ query($q: String!, $endCursor: String) {
         number title url headRefName baseRefName
         repository { nameWithOwner defaultBranchRef { name } }
         headRepository { nameWithOwner defaultBranchRef { name } }
+        commits(last: 100) { nodes { commit { message committedDate } } }
       }
     }
   }
@@ -55,6 +61,21 @@ struct Node {
     base_ref_name: Option<String>,
     repository: Option<Repo>,
     head_repository: Option<Repo>,
+    commits: Option<Commits>,
+}
+#[derive(Deserialize)]
+struct Commits {
+    nodes: Vec<CommitNode>,
+}
+#[derive(Deserialize)]
+struct CommitNode {
+    commit: Commit,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Commit {
+    message: String,
+    committed_date: DateTime<Utc>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,10 +119,18 @@ fn parse_pages(text: &str) -> Result<Vec<PullRequest>> {
                 .chain(n.head_repository.as_ref())
                 .filter_map(|r| r.default_branch_ref.as_ref().map(|b| b.name.clone()))
                 .collect();
+            let stamps = n
+                .commits
+                .map(|c| c.nodes)
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|c| stamps::parse(&c.commit.message, c.commit.committed_date))
+                .collect();
             prs.push(PullRequest {
                 repo: repo.name_with_owner,
                 head_repo: n.head_repository.map(|r| r.name_with_owner),
                 default_branches,
+                stamps,
                 number,
                 title: n.title.unwrap_or_default(),
                 url: n.url.unwrap_or_default(),
@@ -122,7 +151,8 @@ mod tests {
         let text = r#"{"data":{"search":{"pageInfo":{"hasNextPage":true,"endCursor":"a"},"nodes":[
             {"number":1,"title":"One","url":"u1","headRefName":"feat","baseRefName":"main",
              "repository":{"nameWithOwner":"o/r","defaultBranchRef":{"name":"develop"}},
-             "headRepository":{"nameWithOwner":"me/r","defaultBranchRef":{"name":"main"}}},
+             "headRepository":{"nameWithOwner":"me/r","defaultBranchRef":{"name":"main"}},
+             "commits":{"nodes":[{"commit":{"message":"x\n\nAgent-Session: codex/t1\nAgent-Machine: mbp","committedDate":"2026-10-30T01:00:00Z"}}]}},
             {}]}}}
             {"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
             {"number":2,"title":"Two","url":"u2","headRefName":"fix","baseRefName":"main",
@@ -132,6 +162,9 @@ mod tests {
         assert_eq!(prs[0].head_repo.as_deref(), Some("me/r"));
         assert_eq!(prs[0].default_branches, ["develop", "main"]);
         assert!(prs[1].default_branches.is_empty());
+        assert_eq!(prs[0].stamps[0].session_id, "t1");
+        assert_eq!(prs[0].stamps[0].machine.as_deref(), Some("mbp"));
+        assert!(prs[1].stamps.is_empty());
         assert_eq!(prs[1].number, 2);
     }
 }

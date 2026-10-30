@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Harness {
     ClaudeCode,
@@ -37,7 +37,11 @@ pub struct Sighting {
     /// Repository URL recorded by the harness itself, when it records one (Codex).
     pub repo_url: Option<String>,
     pub last_seen: DateTime<Utc>,
-    pub log_path: PathBuf,
+    pub log_path: Option<PathBuf>,
+    /// Machine named by a commit stamp, for sessions not on this machine.
+    pub machine: Option<String>,
+    /// Link to the session, when it has one (Claude Code on the web).
+    pub url: Option<String>,
 }
 
 pub fn load_all(home: &Path) -> Vec<Sighting> {
@@ -122,7 +126,9 @@ fn read_claude_file(path: &Path) -> Vec<Sighting> {
                 branch,
                 repo_url: None,
                 last_seen: ts,
-                log_path: path.to_path_buf(),
+                log_path: Some(path.to_path_buf()),
+                machine: None,
+                url: None,
             });
     }
     seen.into_values().collect()
@@ -215,7 +221,9 @@ fn read_codex_file(path: &Path) -> Option<Sighting> {
         branch: git.branch?,
         repo_url: git.repository_url,
         last_seen,
-        log_path: path.to_path_buf(),
+        log_path: Some(path.to_path_buf()),
+        machine: None,
+        url: None,
     })
 }
 
