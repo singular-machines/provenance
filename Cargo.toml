@@ -2,6 +2,12 @@
 name = "provenance"
 version = "0.1.0"
 edition = "2024"
+description = "Find the coding-agent session behind each pull request"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/singular-machines/provenance"
+readme = "README.md"
+keywords = ["claude-code", "codex", "github", "pull-request", "agents"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
