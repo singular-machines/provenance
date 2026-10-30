@@ -4,9 +4,9 @@
 
 **Which agent session opened this PR, and is it still running?**
 
-[![CI](https://github.com/singular-machines/provenance/actions/workflows/ci.yml/badge.svg)](https://github.com/singular-machines/provenance/actions/workflows/ci.yml) ![Rust](https://img.shields.io/badge/Rust-2024-dea584?logo=rust&logoColor=white) ![Claude Code](https://img.shields.io/badge/Claude_Code-supported-d97757) ![Codex](https://img.shields.io/badge/Codex-supported-10a37f)
+[![CI](https://github.com/singular-machines/provenance/actions/workflows/ci.yml/badge.svg)](https://github.com/singular-machines/provenance/actions/workflows/ci.yml) ![Rust](https://img.shields.io/badge/Rust-2024-dea584?logo=rust&logoColor=white) ![Claude Code](https://img.shields.io/badge/Claude_Code-supported-d97757) ![Codex](https://img.shields.io/badge/Codex-supported-10a37f) [![License](https://img.shields.io/badge/license-MIT_or_Apache--2.0-blue)](#license)
 
-[Quick start](#quick-start) · [Reading the table](#reading-the-table) · [How it works](#how-it-works) · [Install hooks](#install-hooks) · [Privacy](#privacy) · [Roadmap](#roadmap)
+[Quick start](#quick-start) · [Reading the table](#reading-the-table) · [How it works](#how-it-works) · [Install hooks](#install-hooks) · [Privacy](#privacy) · [Roadmap](#roadmap) · [License](#license)
 
 <img src="docs/demo.svg" alt="provenance prs: open PRs grouped by repository, each showing the app, harness and ID of its session and whether it is running or waiting for you" width="860">
 
@@ -134,3 +134,9 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - [x] Commit stamps (including Claude Code on the web's) and live session status
 - [ ] `provenance show`, `go` (reopen the session) and `send` (steer it through Singular)
 - [ ] An MCP server exposing the same functions to agents
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
