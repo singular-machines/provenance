@@ -8,12 +8,12 @@ Example output (`STATE` appears once `provenance install` has been run):
 
 ```
 $ provenance prs
-REPO                        PR    TITLE                                   LAST SESSION                       MATCH  STATE      ACTIVE
-acme/storefront            #927  Add retry when checkout times out…       Claude Code · T3 Code · 4f2a91c0   repo   ● running  55m
-acme/chat-bot               #950  fix: remove unused exports from the …  Claude Code · web · 01Hq3xKe       stamp             7h
-acme/api                    #108  Resume interrupted jobs after a rest…  Codex · singular · 01a1c0de        repo   ◐ waiting  1d
-acme/api                    #68   Ask before rebuilding the local cache…  Claude Code · Conductor · 7be310aa path              3d
-example/web                 #41   Bump deps                               — no session found
+REPO             PR    TITLE                                   LAST SESSION                        MATCH  STATE      ACTIVE
+acme/storefront  #927  Add retry when checkout times out…      Claude Code · T3 Code · 4f2a91c0    repo   ● running  55m
+acme/chat-bot    #950  fix: remove unused exports from the …   Claude Code · web · 01Hq3xKe        stamp             7h
+acme/api         #108  Resume interrupted jobs after a rest…   Codex · singular · 01a1c0de         repo   ◐ waiting  1d
+acme/api         #68   Ask before rebuilding the local cache…  Claude Code · Conductor · 7be310aa  path              3d
+example/web      #41   Bump deps                               — no session found
 
 70 open PRs · 40 with a session (25 by stamp, 14 by repo, 1 by folder path) · 30 no session found
 ```
