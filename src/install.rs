@@ -140,7 +140,7 @@ pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
         ));
     }
 
-    done.extend(register_mcp(bin, dry_run)?);
+    done.extend(register_mcp(home, bin, dry_run)?);
 
     // Only where Pi has been used: its folder exists.
     if p.pi_agent.is_dir() {
@@ -186,11 +186,20 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
         ));
     }
     for (cli, label, remove) in MCP_CLIS {
-        if mcp_registered(cli) {
-            if !dry_run {
-                run_cli(cli, remove)?;
+        if !cli_installed(cli) {
+            continue;
+        }
+        match mcp_registration(home, cli)? {
+            Registration::Ours => {
+                if !dry_run {
+                    run_cli(cli, remove)?;
+                }
+                done.push(format!("{label}: removed the provenance MCP server"));
             }
-            done.push(format!("{label}: removed the provenance MCP server"));
+            Registration::Foreign(cmd) => done.push(format!(
+                "{label}: left the MCP server named provenance alone; it runs {cmd}, not `provenance mcp`"
+            )),
+            Registration::Absent => {}
         }
     }
     let ext = p.pi_extension();
@@ -214,17 +223,27 @@ const MCP_CLIS: [(&str, &str, &[&str]); 2] = [
 ];
 
 /// Register `provenance mcp` with each harness CLI that is installed, through
-/// the CLI's own command, so its config format is never edited by hand.
-fn register_mcp(bin: &Path, dry_run: bool) -> Result<Vec<String>> {
+/// the CLI's own command. A server already named provenance that runs
+/// something else is left alone.
+fn register_mcp(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
     let bin = bin.to_string_lossy();
     let mut done = Vec::new();
     for (cli, label, _) in MCP_CLIS {
-        if Command::new(cli).arg("--version").output().is_err() {
+        if !cli_installed(cli) {
             continue;
         }
-        if mcp_registered(cli) {
-            done.push(format!("{label}: provenance MCP server already registered"));
-            continue;
+        match mcp_registration(home, cli)? {
+            Registration::Ours => {
+                done.push(format!("{label}: provenance MCP server already registered"));
+                continue;
+            }
+            Registration::Foreign(cmd) => {
+                done.push(format!(
+                    "{label}: an MCP server named provenance already runs {cmd}; left it alone, so sessions won't get send and reply"
+                ));
+                continue;
+            }
+            Registration::Absent => {}
         }
         let scope: &[&str] = if cli == "claude" {
             &["--scope", "user"]
@@ -246,11 +265,73 @@ fn register_mcp(bin: &Path, dry_run: bool) -> Result<Vec<String>> {
     Ok(done)
 }
 
-fn mcp_registered(cli: &str) -> bool {
-    Command::new(cli)
-        .args(["mcp", "get", "provenance"])
+fn cli_installed(cli: &str) -> bool {
+    Command::new(cli).arg("--version").output().is_ok()
+}
+
+/// Whose MCP server is registered under the name provenance.
+#[derive(Debug, PartialEq)]
+enum Registration {
+    Absent,
+    Ours,
+    /// Someone else's, with the command it runs.
+    Foreign(String),
+}
+
+/// The provenance server entry: Claude Code's user scope in `~/.claude.json`,
+/// which `claude mcp add --scope user` writes, or `codex mcp get --json`.
+fn mcp_registration(home: &Path, cli: &str) -> Result<Registration> {
+    if cli == "claude" {
+        let doc = read_json(&home.join(".claude.json"))?;
+        return Ok(classify(doc.pointer("/mcpServers/provenance")));
+    }
+    let out = Command::new(cli)
+        .args(["mcp", "get", "provenance", "--json"])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .with_context(|| format!("running {cli}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("No MCP server named") {
+            return Ok(Registration::Absent);
+        }
+        bail!("`{cli} mcp get provenance` failed: {}", err.trim());
+    }
+    let doc: Value = serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("reading `{cli} mcp get provenance --json`"))?;
+    Ok(classify(doc.get("transport")))
+}
+
+/// Ours only if it runs a binary named provenance with the single argument `mcp`.
+fn classify(entry: Option<&Value>) -> Registration {
+    let Some(entry) = entry else {
+        return Registration::Absent;
+    };
+    let command = entry
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if Path::new(command)
+        .file_name()
+        .is_some_and(|n| n == "provenance")
+        && args == ["mcp"]
+    {
+        Registration::Ours
+    } else if command.is_empty() {
+        Registration::Foreign(
+            entry
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("a remote server")
+                .into(),
+        )
+    } else {
+        Registration::Foreign(command.into())
+    }
 }
 
 fn run_cli(cli: &str, args: &[&str]) -> Result<()> {
@@ -680,6 +761,26 @@ mod tests {
         ] {
             assert!(ext.contains(&format!("pi.on(\"{event}\"")), "{event}");
         }
+    }
+
+    #[test]
+    fn only_a_provenance_mcp_command_is_ours() {
+        assert_eq!(classify(None), Registration::Absent);
+        let ours =
+            json!({"type": "stdio", "command": "/home/u/.cargo/bin/provenance", "args": ["mcp"]});
+        assert_eq!(classify(Some(&ours)), Registration::Ours);
+        let other = json!({"command": "/unrelated/server", "args": ["mcp"]});
+        assert_eq!(
+            classify(Some(&other)),
+            Registration::Foreign("/unrelated/server".into())
+        );
+        let extra = json!({"command": "provenance", "args": ["mcp", "--other"]});
+        assert!(matches!(classify(Some(&extra)), Registration::Foreign(_)));
+        let remote = json!({"type": "http", "url": "https://example.com/mcp"});
+        assert_eq!(
+            classify(Some(&remote)),
+            Registration::Foreign("https://example.com/mcp".into())
+        );
     }
 
     #[test]

@@ -50,10 +50,7 @@ pub fn handle(line: &str, tools: &dyn Tools) -> Option<Value> {
         .unwrap_or_default()
     {
         "initialize" => json!({
-            "protocolVersion": params
-                .get("protocolVersion")
-                .cloned()
-                .unwrap_or(json!("2025-06-18")),
+            "protocolVersion": negotiate(params.get("protocolVersion").and_then(Value::as_str)),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "provenance", "version": env!("CARGO_PKG_VERSION")},
             "instructions": INSTRUCTIONS,
@@ -64,6 +61,19 @@ pub fn handle(line: &str, tools: &dyn Tools) -> Option<Value> {
         other => return Some(error(id, -32601, &format!("unknown method {other}"))),
     };
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+/// Protocol versions this server speaks, newest first. It uses only tools,
+/// which every version has.
+const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The client's version if supported, else the newest this server speaks,
+/// so the client can decide whether to go on.
+fn negotiate(requested: Option<&str>) -> &'static str {
+    VERSIONS
+        .into_iter()
+        .find(|v| Some(*v) == requested)
+        .unwrap_or(VERSIONS[0])
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
@@ -151,6 +161,8 @@ mod tests {
     fn initializes_with_the_client_version_and_instructions() {
         let r = ask(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#).unwrap();
         assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
+        let r = ask(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#).unwrap();
+        assert_eq!(r["result"]["protocolVersion"], VERSIONS[0]);
         assert_eq!(r["result"]["serverInfo"]["name"], "provenance");
         assert!(
             r["result"]["instructions"]

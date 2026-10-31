@@ -521,24 +521,14 @@ fn send_cmd(
 
 /// Record an answer to a message, and pass it to the session that sent it.
 fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String> {
-    let dir = send::mail_dir(home);
-    let Some((mailbox, send::Mail::Message { sender, .. })) = send::find_message(&dir, id) else {
-        anyhow::bail!("no message {id}");
-    };
-    send::append(
-        &mailbox,
-        &send::Mail::Reply {
-            id: id.to_string(),
-            text: text.to_string(),
-            at: Utc::now(),
-        },
-    )?;
+    let records = live::load_records(home);
+    let me = current_session(&records);
+    let sender = send::record_reply(&send::mail_dir(home), me.as_ref(), id, text)?;
     let Some(to) = sender else {
         return Ok(format!(
             "Reply to {id} saved for the terminal that sent it."
         ));
     };
-    let records = live::load_records(home);
     let alive = live::alive_pids(&records);
     let route = records
         .iter()
@@ -557,8 +547,7 @@ fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String>
             label(Some(&to))
         ));
     };
-    let from = label(current_session(&records).as_ref());
-    send::deliver(&route, &send::framed_reply(id, &from, text))?;
+    send::deliver(&route, &send::framed_reply(id, &label(me.as_ref()), text))?;
     Ok(format!("Reply to {id} sent to {}.", label(Some(&to))))
 }
 

@@ -262,19 +262,40 @@ pub fn read(path: &Path) -> Vec<Mail> {
         .collect()
 }
 
-/// The message with this ID and the mailbox holding it.
-pub fn find_message(dir: &Path, id: &str) -> Option<(PathBuf, Mail)> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .find_map(|p| {
-            let m = read(&p)
-                .into_iter()
-                .find(|m| matches!(m, Mail::Message { id: i, .. } if i == id))?;
-            Some((p, m))
-        })
+/// The message with this ID in one mailbox.
+pub fn find_message(path: &Path, id: &str) -> Option<Mail> {
+    read(path)
+        .into_iter()
+        .find(|m| matches!(m, Mail::Message { id: i, .. } if i == id))
+}
+
+/// Record `me`'s answer to a message sent to `me`, and return who sent it.
+/// Only the receiving session can answer, so a reply can't be forged by
+/// another session that knows the message ID.
+pub fn record_reply(
+    dir: &Path,
+    me: Option<&Sender>,
+    id: &str,
+    text: &str,
+) -> Result<Option<Sender>> {
+    let Some(me) = me else {
+        bail!(
+            "reply works only inside the session the message was sent to, with provenance's session hooks installed"
+        );
+    };
+    let path = mailbox(dir, me.harness, &me.session_id);
+    let Some(Mail::Message { sender, .. }) = find_message(&path, id) else {
+        bail!("no message {id} was sent to this session");
+    };
+    append(
+        &path,
+        &Mail::Reply {
+            id: id.to_string(),
+            text: text.to_string(),
+            at: Utc::now(),
+        },
+    )?;
+    Ok(sender)
 }
 
 /// The first reply to a message in a mailbox.
@@ -415,13 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn replies_are_matched_to_their_message() {
+    fn only_the_receiving_session_can_reply() {
         let dir = std::env::temp_dir().join(format!("prov-mail-{}", std::process::id()));
         let path = mailbox(&dir, Harness::Codex, "t/1");
         assert!(path.ends_with("codex-t1.jsonl"));
         let sender = Sender {
             harness: Harness::ClaudeCode,
             session_id: "s".into(),
+        };
+        let recipient = Sender {
+            harness: Harness::Codex,
+            session_id: "t/1".into(),
         };
         append(
             &path,
@@ -435,21 +460,16 @@ mod tests {
             },
         )
         .unwrap();
+        // The sender knows the ID, but it isn't the session the message went to.
+        assert!(record_reply(&dir, Some(&sender), "m-1", "forged").is_err());
+        assert!(record_reply(&dir, None, "m-1", "anonymous").is_err());
         assert_eq!(reply_to(&path, "m-1"), None);
-        let (found, m) = find_message(&dir, "m-1").unwrap();
-        assert_eq!(found, path);
-        assert!(matches!(m, Mail::Message { sender: Some(s), .. } if s == sender));
-        append(
-            &path,
-            &Mail::Reply {
-                id: "m-1".into(),
-                text: "done".into(),
-                at: Utc::now(),
-            },
-        )
-        .unwrap();
+        assert!(record_reply(&dir, Some(&recipient), "m-2", "no such").is_err());
+        assert_eq!(
+            record_reply(&dir, Some(&recipient), "m-1", "done").unwrap(),
+            Some(sender)
+        );
         assert_eq!(reply_to(&path, "m-1").as_deref(), Some("done"));
-        assert!(find_message(&dir, "m-2").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
