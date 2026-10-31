@@ -132,10 +132,12 @@ fn session_cells(m: &SessionMatch) -> Session<'_> {
         harness: match s.harness {
             Harness::ClaudeCode => "Claude",
             Harness::Codex => "Codex",
+            Harness::OpenCode => "OpenCode",
         },
         id: s
             .session_id
             .trim_start_matches("session_")
+            .trim_start_matches("ses_")
             .chars()
             .take(8)
             .collect(),

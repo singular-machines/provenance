@@ -1,5 +1,6 @@
-//! Reads Claude Code and Codex session logs into a flat list of sightings:
-//! "session S was in folder F on branch B, last seen at T".
+//! Reads Claude Code and Codex session logs, and OpenCode's session database,
+//! into a flat list of sightings: "session S was in folder F on branch B, last
+//! seen at T".
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,6 +16,20 @@ use serde::Deserialize;
 pub enum Harness {
     ClaudeCode,
     Codex,
+    #[serde(rename = "opencode")]
+    OpenCode,
+}
+
+impl Harness {
+    /// The harness a binary name belongs to, for walking up the process tree.
+    pub fn from_binary(name: &str) -> Option<Harness> {
+        match name {
+            "claude" => Some(Harness::ClaudeCode),
+            "codex" => Some(Harness::Codex),
+            "opencode" => Some(Harness::OpenCode),
+            _ => None,
+        }
+    }
 }
 
 /// One session seen on one branch in one folder.
@@ -87,6 +102,7 @@ pub fn load_all(home: &Path, cache_dir: Option<&Path>) -> Vec<Sighting> {
             let sightings = match harness {
                 Harness::ClaudeCode => read_claude_file(path),
                 Harness::Codex => read_codex_file(path).into_iter().collect(),
+                Harness::OpenCode => Vec::new(),
             };
             Some((
                 key,
@@ -313,9 +329,184 @@ pub fn codex_app(originator: Option<&str>, cwd: &str) -> String {
     }
 }
 
+// ---------- OpenCode ----------
+
+/// One row of OpenCode's `session_v2` table.
+#[derive(Deserialize, Debug, Clone)]
+pub struct OpenCodeSession {
+    pub id: String,
+    pub directory: String,
+    /// Milliseconds since the epoch, as are the other times.
+    pub time_updated: i64,
+    pub time_busy: Option<i64>,
+    pub time_idle: Option<i64>,
+    pub time_archived: Option<i64>,
+}
+
+impl OpenCodeSession {
+    /// Mid-turn: it went busy after it last went idle.
+    pub fn busy(&self) -> bool {
+        self.time_busy
+            .is_some_and(|b| self.time_idle.is_none_or(|i| b > i))
+    }
+}
+
+pub fn opencode_db(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("opencode/opencode.db")
+}
+
+/// Top-level sessions from OpenCode's database, read through the `sqlite3`
+/// command in read-only mode. Empty when OpenCode or `sqlite3` is missing.
+pub fn opencode_sessions(db: &Path) -> Vec<OpenCodeSession> {
+    if !db.is_file() {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("sqlite3")
+        .arg("-readonly")
+        .arg("-json")
+        .arg(db)
+        .arg(
+            "select id, directory, time_updated, time_busy, time_idle, time_archived \
+             from session_v2 where parent_id is null",
+        )
+        .output();
+    match out {
+        Ok(o) if o.status.success() => serde_json::from_slice(&o.stdout).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// OpenCode doesn't record git branches, so a session's branch is the one its
+/// folder has checked out now, given only to the folder's most recent session:
+/// older sessions there may have worked on other branches.
+pub fn opencode_sightings(
+    sessions: &[OpenCodeSession],
+    branch_of: impl Fn(&str) -> Option<String>,
+) -> Vec<Sighting> {
+    let mut latest: HashMap<&str, &OpenCodeSession> = HashMap::new();
+    for s in sessions {
+        let e = latest.entry(&s.directory).or_insert(s);
+        if s.time_updated > e.time_updated {
+            *e = s;
+        }
+    }
+    sessions
+        .iter()
+        .filter_map(|s| {
+            let last_seen = DateTime::from_timestamp_millis(s.time_updated)?;
+            let newest = latest
+                .get(s.directory.as_str())
+                .is_some_and(|l| l.id == s.id);
+            Some(Sighting {
+                harness: Harness::OpenCode,
+                session_id: s.id.clone(),
+                app: app_from_path(&s.directory).unwrap_or("OpenCode").into(),
+                cwd: s.directory.clone(),
+                branch: if newest {
+                    branch_of(&s.directory).unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                repo_url: None,
+                last_seen,
+                log_path: None,
+                machine: None,
+                url: None,
+            })
+        })
+        .collect()
+}
+
+/// The branch checked out in a folder, if it exists and isn't detached.
+pub fn current_branch(cwd: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", cwd, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !b.is_empty()).then_some(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oc(id: &str, dir: &str, updated: i64) -> OpenCodeSession {
+        OpenCodeSession {
+            id: id.into(),
+            directory: dir.into(),
+            time_updated: updated,
+            time_busy: Some(updated - 10),
+            time_idle: Some(updated),
+            time_archived: None,
+        }
+    }
+
+    #[test]
+    fn opencode_branch_goes_to_the_folders_latest_session_only() {
+        let sessions = [
+            oc("ses_old", "/r", 1_000),
+            oc("ses_new", "/r", 2_000),
+            oc("ses_x", "/x", 500),
+        ];
+        let got = opencode_sightings(&sessions, |d| (d == "/r").then(|| "feat".to_string()));
+        let branch = |id: &str| {
+            got.iter()
+                .find(|s| s.session_id == id)
+                .unwrap()
+                .branch
+                .clone()
+        };
+        assert_eq!(branch("ses_new"), "feat");
+        assert_eq!(branch("ses_old"), "");
+        assert_eq!(branch("ses_x"), "");
+        assert_eq!(got[1].last_seen.timestamp_millis(), 2_000);
+        assert!(
+            got.iter()
+                .all(|s| s.harness == Harness::OpenCode && s.app == "OpenCode")
+        );
+    }
+
+    #[test]
+    fn opencode_busy_means_busy_after_idle() {
+        let mut s = oc("a", "/r", 2_000);
+        assert!(!s.busy());
+        s.time_busy = Some(3_000);
+        assert!(s.busy());
+        s.time_idle = None;
+        assert!(s.busy());
+        s.time_busy = None;
+        assert!(!s.busy());
+    }
+
+    #[test]
+    fn reads_an_opencode_database() {
+        let dir = std::env::temp_dir().join(format!("prov-oc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let ok = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(concat!(
+                "create table session_v2 (id text, parent_id text, directory text, time_updated integer,",
+                " time_busy integer, time_idle integer, time_archived integer);",
+                "insert into session_v2 values ('ses_a', null, '/r', 2000, 1000, 1500, null);",
+                "insert into session_v2 values ('ses_child', 'ses_a', '/r', 2500, null, null, null);"
+            ))
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            let got = opencode_sessions(&db);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0].id, "ses_a");
+            assert!(!got[0].busy() && got[0].time_archived.is_none());
+        }
+        assert!(opencode_sessions(&dir.join("missing.db")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sdk_apps_are_named_from_their_worktree_path() {
