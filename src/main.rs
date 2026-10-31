@@ -159,17 +159,24 @@ fn prs(
     }
     let now = Utc::now();
     let cache_dir = cache::dir(home);
-    let (fetched, (mut sightings, records)) = rayon::join(
+    let (fetched, ((mut sightings, records), opencode)) = rayon::join(
         || github::open_prs(&search, &cache_dir, refresh, now),
         || {
-            (
-                sessions::load_all(home, Some(&cache_dir)),
-                live::load_records(home),
+            rayon::join(
+                || {
+                    (
+                        sessions::load_all(home, Some(&cache_dir)),
+                        live::load_records(home),
+                    )
+                },
+                || sessions::opencode_sessions(&sessions::opencode_db(home)),
             )
         },
     );
     let fetched = fetched?;
     sightings.extend(live::sightings(&records));
+    sightings.extend(sessions::opencode_sightings(&opencode));
+    sessions::give_folder_branches(&mut sightings, sessions::current_branch);
     let folders = matching::resolve_folders(&fetched.prs, &sightings);
     let mut rows = matching::match_prs_with(fetched.prs, &sightings, &folders);
 
@@ -181,6 +188,23 @@ fn prs(
     for m in rows.iter_mut().flat_map(|r| r.sessions.iter_mut()) {
         if let Some(rec) = by_id.get(&(m.sighting.harness, m.sighting.session_id.as_str())) {
             m.state = Some(live::state(rec, live::is_alive(rec, &alive)));
+        }
+    }
+    // OpenCode keeps its own busy and idle times, so it needs no hooks.
+    let matched_opencode = rows
+        .iter()
+        .flat_map(|r| &r.sessions)
+        .any(|m| m.sighting.harness == Harness::OpenCode);
+    if matched_opencode {
+        let running = live::opencode_running();
+        let by_id: HashMap<&str, &sessions::OpenCodeSession> =
+            opencode.iter().map(|s| (s.id.as_str(), s)).collect();
+        for m in rows.iter_mut().flat_map(|r| r.sessions.iter_mut()) {
+            if m.sighting.harness == Harness::OpenCode
+                && let Some(s) = by_id.get(m.sighting.session_id.as_str())
+            {
+                m.state = live::opencode_state(s, running);
+            }
         }
     }
 

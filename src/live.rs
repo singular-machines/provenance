@@ -12,7 +12,7 @@ use std::process::Command;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::sessions::{Harness, Sighting, claude_app, codex_app};
+use crate::sessions::{Harness, Sighting, app_from_path, claude_app, codex_app};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Record {
@@ -69,6 +69,7 @@ fn record_path(dir: &Path, harness: Harness, id: &str) -> PathBuf {
     let h = match harness {
         Harness::ClaudeCode => "claude-code",
         Harness::Codex => "codex",
+        Harness::OpenCode => "opencode",
     };
     // Session IDs are UUIDs; keep only safe characters in the file name.
     let safe: String = id
@@ -122,22 +123,9 @@ pub trait Probe {
 struct SystemProbe;
 
 impl Probe for SystemProbe {
-    /// The nearest ancestor that is a `claude` or `codex` binary (hooks run
-    /// through a shell, so it's usually the grandparent).
+    /// Hooks run through a shell, so it's usually the grandparent.
     fn harness_process(&self) -> Option<(u32, String)> {
-        let mut pid = std::os::unix::process::parent_id();
-        for _ in 0..8 {
-            let (ppid, started, comm) = ps_info(pid)?;
-            let name = Path::new(&comm).file_name()?.to_string_lossy().to_string();
-            if name == "claude" || name == "codex" {
-                return Some((pid, started));
-            }
-            if ppid <= 1 {
-                return None;
-            }
-            pid = ppid;
-        }
-        None
+        nearest_harness().map(|(_, pid, started)| (pid, started))
     }
 
     fn branch(&self, cwd: &str) -> Option<String> {
@@ -152,6 +140,48 @@ impl Probe for SystemProbe {
     fn env(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
     }
+}
+
+/// The nearest ancestor process that is a harness binary (`claude`, `codex`
+/// or `opencode`): its harness, PID and start time.
+pub fn nearest_harness() -> Option<(Harness, u32, String)> {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..12 {
+        let (ppid, started, comm) = ps_info(pid)?;
+        let name = Path::new(&comm).file_name()?.to_string_lossy().to_string();
+        if let Some(h) = Harness::from_binary(&name) {
+            return Some((h, pid, started));
+        }
+        if ppid <= 1 {
+            return None;
+        }
+        pid = ppid;
+    }
+    None
+}
+
+/// An OpenCode session's status from its database row. OpenCode leaves a
+/// session busy when its process dies mid-turn, and one background service can
+/// outlive it, so a running `opencode` doesn't prove this session is working:
+/// a busy session is stopped when no `opencode` runs, and unknown otherwise.
+/// Idle sessions count as waiting only while OpenCode runs, since its sessions
+/// never formally end.
+pub fn opencode_state(s: &crate::sessions::OpenCodeSession, running: bool) -> Option<State> {
+    match (s.time_archived.is_some(), s.busy(), running) {
+        (true, _, _) => Some(State::Ended),
+        (false, true, true) => None,
+        (false, true, false) => Some(State::Stopped),
+        (false, false, true) => Some(State::Waiting),
+        (false, false, false) => None,
+    }
+}
+
+/// Whether any `opencode` process is running.
+pub fn opencode_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "opencode"])
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// `(ppid, start time, command path)` for one process.
@@ -227,6 +257,7 @@ pub fn update(
             Harness::Codex => Some(codex_app(None, &cwd))
                 .filter(|a| a != "SDK")
                 .unwrap_or_default(),
+            Harness::OpenCode => app_from_path(&cwd).unwrap_or_default().into(),
         },
     };
     Record {
@@ -346,6 +377,34 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::cell::Cell;
+
+    #[test]
+    fn opencode_busy_is_never_claimed_running() {
+        use crate::sessions::OpenCodeSession;
+        let s = |busy: Option<i64>, idle: Option<i64>, archived: Option<i64>| OpenCodeSession {
+            id: "ses_a".into(),
+            directory: "/r".into(),
+            time_updated: 3,
+            time_busy: busy,
+            time_idle: idle,
+            time_archived: archived,
+        };
+        // Interrupted mid-turn while another OpenCode process (the service) survives.
+        assert_eq!(opencode_state(&s(Some(2), None, None), true), None);
+        assert_eq!(
+            opencode_state(&s(Some(2), None, None), false),
+            Some(State::Stopped)
+        );
+        assert_eq!(
+            opencode_state(&s(Some(1), Some(2), None), true),
+            Some(State::Waiting)
+        );
+        assert_eq!(opencode_state(&s(Some(1), Some(2), None), false), None);
+        assert_eq!(
+            opencode_state(&s(Some(1), Some(2), Some(3)), true),
+            Some(State::Ended)
+        );
+    }
 
     struct Fake {
         pid: u32,

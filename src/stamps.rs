@@ -1,7 +1,8 @@
 //! Session stamps in commit messages: writing them from a git hook, and
 //! reading them back from a PR's commits.
 //!
-//! provenance writes `Agent-Session: <harness>/<id>` and `Agent-Machine: <name>`.
+//! provenance writes `Agent-Session: <harness>/<id>` and `Agent-Machine: <name>`,
+//! where `<harness>` is `claude-code`, `codex` or `opencode`.
 //! Claude Code on the web already writes `Claude-Session: https://claude.ai/code/session_…`.
 
 use std::process::Command;
@@ -35,6 +36,7 @@ pub fn parse(message: &str, committed: DateTime<Utc>) -> Vec<Stamp> {
             let harness = match harness {
                 "claude-code" => Harness::ClaudeCode,
                 "codex" => Harness::Codex,
+                "opencode" => Harness::OpenCode,
                 _ => continue,
             };
             if !id.is_empty() && !id.contains(char::is_whitespace) {
@@ -70,6 +72,7 @@ pub fn sessions_from_env(get: impl Fn(&str) -> Option<String>) -> Vec<(Harness, 
     [
         (Harness::ClaudeCode, "CLAUDE_CODE_SESSION_ID"),
         (Harness::Codex, "CODEX_THREAD_ID"),
+        (Harness::OpenCode, "OPENCODE_SESSION_ID"),
     ]
     .into_iter()
     .filter_map(|(h, var)| get(var).filter(|v| !v.trim().is_empty()).map(|v| (h, v)))
@@ -80,8 +83,25 @@ pub fn trailer_value(harness: Harness, id: &str) -> String {
     let prefix = match harness {
         Harness::ClaudeCode => "claude-code",
         Harness::Codex => "codex",
+        Harness::OpenCode => "opencode",
     };
     format!("{prefix}/{id}")
+}
+
+/// A harness started from another one's shell inherits its session variable
+/// (OpenCode run from Claude Code sees `CLAUDE_CODE_SESSION_ID` too), so when
+/// several are set, the one whose process is nearest up the tree made the
+/// commit. With no harness process found, all are kept.
+pub fn innermost(
+    sessions: Vec<(Harness, String)>,
+    nearest: Option<Harness>,
+) -> Vec<(Harness, String)> {
+    match nearest {
+        Some(h) if sessions.len() > 1 && sessions.iter().any(|(s, _)| *s == h) => {
+            sessions.into_iter().filter(|(s, _)| *s == h).collect()
+        }
+        _ => sessions,
+    }
 }
 
 /// Name for this machine in stamps. Never the host name, which would publish
@@ -157,6 +177,11 @@ pub fn stamp_message_file(msg_file: &str) -> Result<()> {
     if sessions.is_empty() {
         return Ok(());
     }
+    let sessions = if sessions.len() > 1 {
+        innermost(sessions, crate::live::nearest_harness().map(|(h, _, _)| h))
+    } else {
+        sessions
+    };
     let mut cmd = Command::new("git");
     cmd.args([
         "interpret-trailers",
@@ -251,6 +276,27 @@ mod tests {
     }
 
     #[test]
+    fn nested_harness_stamps_only_its_own_session() {
+        let both = vec![
+            (Harness::ClaudeCode, "outer".to_string()),
+            (Harness::OpenCode, "ses_inner".to_string()),
+        ];
+        assert_eq!(
+            innermost(both.clone(), Some(Harness::OpenCode)),
+            [(Harness::OpenCode, "ses_inner".to_string())]
+        );
+        // Unknown process tree, or a nearest harness with no variable: keep all.
+        assert_eq!(innermost(both.clone(), None), both);
+        assert_eq!(innermost(both.clone(), Some(Harness::Codex)), both);
+        let parsed = parse("x\n\nAgent-Session: opencode/ses_e72\n", t());
+        assert_eq!(parsed[0].harness, Harness::OpenCode);
+        assert_eq!(
+            trailer_value(Harness::OpenCode, "ses_e72"),
+            "opencode/ses_e72"
+        );
+    }
+
+    #[test]
     fn stamps_a_message_file_once() {
         let dir = std::env::temp_dir().join(format!("prov-stamp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -261,6 +307,7 @@ mod tests {
             std::env::set_var("CODEX_THREAD_ID", "t1");
             std::env::set_var("PROVENANCE_MACHINE", "box");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("OPENCODE_SESSION_ID");
         }
         let p = f.to_str().unwrap();
         stamp_message_file(p).unwrap();
