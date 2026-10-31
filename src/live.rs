@@ -160,12 +160,16 @@ pub fn nearest_harness() -> Option<(Harness, u32, String)> {
     None
 }
 
-/// An OpenCode session's status from its database row. Idle sessions count as
-/// waiting only while OpenCode runs, since its sessions never formally end.
+/// An OpenCode session's status from its database row. OpenCode leaves a
+/// session busy when its process dies mid-turn, and one background service can
+/// outlive it, so a running `opencode` doesn't prove this session is working:
+/// a busy session is stopped when no `opencode` runs, and unknown otherwise.
+/// Idle sessions count as waiting only while OpenCode runs, since its sessions
+/// never formally end.
 pub fn opencode_state(s: &crate::sessions::OpenCodeSession, running: bool) -> Option<State> {
     match (s.time_archived.is_some(), s.busy(), running) {
         (true, _, _) => Some(State::Ended),
-        (false, true, true) => Some(State::Running),
+        (false, true, true) => None,
         (false, true, false) => Some(State::Stopped),
         (false, false, true) => Some(State::Waiting),
         (false, false, false) => None,
@@ -373,6 +377,34 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::cell::Cell;
+
+    #[test]
+    fn opencode_busy_is_never_claimed_running() {
+        use crate::sessions::OpenCodeSession;
+        let s = |busy: Option<i64>, idle: Option<i64>, archived: Option<i64>| OpenCodeSession {
+            id: "ses_a".into(),
+            directory: "/r".into(),
+            time_updated: 3,
+            time_busy: busy,
+            time_idle: idle,
+            time_archived: archived,
+        };
+        // Interrupted mid-turn while another OpenCode process (the service) survives.
+        assert_eq!(opencode_state(&s(Some(2), None, None), true), None);
+        assert_eq!(
+            opencode_state(&s(Some(2), None, None), false),
+            Some(State::Stopped)
+        );
+        assert_eq!(
+            opencode_state(&s(Some(1), Some(2), None), true),
+            Some(State::Waiting)
+        );
+        assert_eq!(opencode_state(&s(Some(1), Some(2), None), false), None);
+        assert_eq!(
+            opencode_state(&s(Some(1), Some(2), Some(3)), true),
+            Some(State::Ended)
+        );
+    }
 
     struct Fake {
         pid: u32,

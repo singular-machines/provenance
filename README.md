@@ -61,7 +61,7 @@ PRs are grouped by repository, live sessions first. Each row reads: status, PR, 
 | dimmed row | No live session |
 | `~` | Matched by branch, not by a commit stamp |
 
-Status marks need [`provenance install`](#install-hooks) for Claude Code and Codex. OpenCode sessions get them from OpenCode's own database, with nothing installed; an idle OpenCode session shows as waiting only while OpenCode is running. In a terminal, PR numbers are links to the PRs, and web session IDs link to the sessions. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
+Status marks need [`provenance install`](#install-hooks) for Claude Code and Codex. OpenCode sessions get them from OpenCode's own database, with nothing installed: an idle OpenCode session shows as waiting while OpenCode is running, and one left busy shows as stopped once no OpenCode process runs. OpenCode sessions never show as running, because a surviving OpenCode service can't tell provenance whether that session's turn is still going. In a terminal, PR numbers are links to the PRs, and web session IDs link to the sessions. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
 
 ## How it works
 
