@@ -258,6 +258,21 @@ fn record_commit_sets(prs: &mut [PullRequest], known: &mut StampCache, sets: Vec
     }
 }
 
+/// Whether `repo` (owner/name) exists for the `gh` account, or `None` if
+/// GitHub couldn't be asked. Private repos the account can't see count as missing.
+pub fn repo_exists(repo: &str) -> Option<bool> {
+    let output = Command::new("gh")
+        .args(["api", &format!("repos/{repo}"), "--silent"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    String::from_utf8_lossy(&output.stderr)
+        .contains("HTTP 404")
+        .then_some(false)
+}
+
 fn gh(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
         .args(args)
