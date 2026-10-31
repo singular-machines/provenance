@@ -225,6 +225,7 @@ pub fn run(action: Action) -> Result<()> {
                     argv.join(" ")
                 );
             }
+            eprintln!("Resuming in {}: {}", tilde(&cwd), argv.join(" "));
             let err = Command::new(&argv[0])
                 .args(&argv[1..])
                 .current_dir(&cwd)
@@ -232,6 +233,22 @@ pub fn run(action: Action) -> Result<()> {
             Err(err).with_context(|| format!("starting {}", argv[0]))
         }
         Action::Explain(why) => bail!("can't open this session: {why}"),
+    }
+}
+
+/// `path` with the home folder shown as `~`.
+fn tilde(path: &str) -> String {
+    tilde_in(path, std::env::var_os("HOME").as_deref())
+}
+
+fn tilde_in(path: &str, home: Option<&std::ffi::OsStr>) -> String {
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return path.to_string();
+    };
+    match Path::new(path).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_string(),
     }
 }
 
@@ -679,5 +696,19 @@ mod tests {
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(encode("thread:a%3Ab"), "thread%3Aa%253Ab");
         assert!(!safe_id("x' or 1=1 --"));
+    }
+
+    #[test]
+    fn home_is_shown_as_tilde() {
+        let t = |path: &str, home: &str| tilde_in(path, Some(std::ffi::OsStr::new(home)));
+        assert_eq!(t("/Users/t/code", "/Users/t"), "~/code");
+        assert_eq!(t("/Users/t", "/Users/t/"), "~");
+        assert_eq!(t("/Users/t2/code", "/Users/t"), "/Users/t2/code");
+        assert_eq!(t("/Users//t/code", "/Users/t"), "~/code");
+        assert_eq!(t("/Users/./t/code", "/Users/t"), "~/code");
+        assert_eq!(t("/Users/t", "/Users//t"), "~");
+        assert_eq!(t("/Users//é/code", "/Users/é"), "~/code");
+        assert_eq!(t("/tmp/x", ""), "/tmp/x");
+        assert_eq!(tilde_in("/tmp/x", None), "/tmp/x");
     }
 }
