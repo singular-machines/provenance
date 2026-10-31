@@ -31,7 +31,7 @@ TABLE = [
     heading("acme/storefront", "3 open · 1 running · 1 waiting"),
     row("●", GREEN, "#927", B, "Add retry when checkout times out", FG, "", "T3 Code", "Claude", "4f2a91c0", "~", "55m", GREEN, True),
     row("◐", YELLOW, "#931", B, "Show stock levels on the product page", FG, B, "CLI", "Codex", "01a1c0de", "", "1h", YELLOW, True, B),
-    row("", DIM, "#896", "", "fix: round totals before applying discounts", DIM, "", "CLI", "Claude", "d361dde1", "", "10h", DIM, False),
+    row("○", DIM, "#896", "", "fix: round totals before applying discounts", DIM, "", "CLI", "Claude", "d361dde1", "", "10h", DIM, False),
     [],
     heading("acme/api", "2 open"),
     row("", DIM, "#950", "", "fix: remove unused exports from the client", DIM, "", "web", "Claude", "01Hq3xKe", "", "7h", DIM, False),
@@ -41,7 +41,8 @@ TABLE = [
     row("", DIM, "#41", "", "Bump deps", DIM, "", None, None, None, None, None, None, False),
     [],
     [(0, "6 open PRs in 3 repos · 1 with no session found  ·  ", DIM, ""), (52, "●", GREEN, ""), (54, "running  ", DIM, ""),
-     (63, "◐", YELLOW, B), (65, "waiting for you  ~ matched by branch, not stamped", DIM, "")],
+     (63, "◐", YELLOW, B), (65, "waiting for you  ", DIM, ""), (82, "○", DIM, ""),
+     (84, "ended  ~ matched by branch, not stamped", DIM, "")],
 ]
 GO = "provenance go acme/storefront#896"
 GO_OUT = [
@@ -50,7 +51,7 @@ GO_OUT = [
 ]
 
 S = 2  # draw at 2x for sharp text when the README scales it down
-FS, LH, PADX, TOP, COLS = 14 * S, 22 * S, 24 * S, 52 * S, 115
+FS, LH, PADX, TOP, COLS = 14 * S, 22 * S, 24 * S, 52 * S, 124
 regular = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", FS, index=0)
 bold = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", FS, index=1)
 CW = regular.getlength("M")
