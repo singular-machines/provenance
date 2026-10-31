@@ -32,17 +32,29 @@ pub enum Action {
     Explain(String),
 }
 
+/// What is known about the process holding a session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Process {
+    /// The session's recorded process is still that process.
+    Live(u32),
+    /// Its recorded process has exited, or nothing could hold it.
+    Gone,
+    /// A process may hold it, but which one isn't known (OpenCode).
+    MaybeHeld,
+    /// No record of its process: hooks weren't installed when it ran.
+    Unknown,
+}
+
 /// Links into desktop apps, looked up from each app's own state.
 pub trait Links {
     fn t3(&self, session_id: &str) -> Option<String>;
     fn claude_desktop(&self, session_id: &str) -> Option<String>;
 }
 
-/// What `go` does for one session. `pid` is the session's process when it is
-/// still the same process; `machine` is this machine's name in stamps.
+/// What `go` does for one session; `machine` is this machine's name in stamps.
 pub fn plan(
     m: &SessionMatch,
-    pid: Option<u32>,
+    process: Process,
     machine: Option<&str>,
     links: &dyn Links,
 ) -> Action {
@@ -92,14 +104,13 @@ pub fn plan(
         _ => {}
     }
     let argv = resume_argv(s.harness, &s.session_id);
-    match (m.state, pid) {
-        (Some(State::Running | State::Waiting), Some(pid)) => Action::Focus {
+    match process {
+        Process::Live(pid) if m.state != Some(State::Ended) => Action::Focus {
             pid,
             cwd: s.cwd.clone(),
         },
-        // OpenCode reports waiting while some `opencode` runs, but not which one.
-        (Some(State::Running | State::Waiting), None) => Action::Explain(format!(
-            "it looks open in another window; switch to it there, or run `{}` in {} if it's closed",
+        Process::MaybeHeld => Action::Explain(format!(
+            "OpenCode is running and may have it open; switch to it there, or run `{}` in {} if it's closed",
             argv.join(" "),
             s.cwd
         )),
@@ -134,28 +145,29 @@ pub fn parse_pr(arg: &str) -> Result<(Option<String>, u64)> {
         .strip_prefix("https://github.com/")
         .or_else(|| arg.strip_prefix("github.com/"))
     {
-        let parts: Vec<&str> = rest.split('/').collect();
+        let path = rest.split(['?', '#']).next().unwrap_or_default();
+        let parts: Vec<&str> = path.split('/').collect();
         return match parts.as_slice() {
-            [owner, name, "pull", n, ..] => Ok((
-                Some(format!("{owner}/{name}")),
-                n.parse().map_err(|_| bad())?,
-            )),
+            [owner, name, "pull", n, ..] if !owner.is_empty() && !name.is_empty() => {
+                Ok((Some(format!("{owner}/{name}")), number(n).ok_or_else(bad)?))
+            }
             _ => Err(bad()),
         };
     }
     if let Some(n) = arg.strip_prefix('#') {
-        return Ok((None, n.parse().map_err(|_| bad())?));
+        return Ok((None, number(n).ok_or_else(bad)?));
     }
     if let Some((repo, n)) = arg.split_once('#') {
         if repo.split('/').count() != 2 || repo.split('/').any(str::is_empty) {
             return Err(bad());
         }
-        return Ok((Some(repo.to_string()), n.parse().map_err(|_| bad())?));
+        return Ok((Some(repo.to_string()), number(n).ok_or_else(bad)?));
     }
-    Ok((
-        None,
-        arg.trim_start_matches('#').parse().map_err(|_| bad())?,
-    ))
+    Ok((None, number(arg).ok_or_else(bad)?))
+}
+
+fn number(s: &str) -> Option<u64> {
+    s.parse().ok().filter(|&n| n > 0)
 }
 
 /// The current folder's GitHub repository, as `gh` sees it.
@@ -535,14 +547,37 @@ mod tests {
     fn a_live_session_is_focused_never_resumed() {
         let m = session(Harness::ClaudeCode, "CLI", Some(State::Waiting));
         assert_eq!(
-            plan(&m, Some(42), None, &NoLinks),
+            plan(&m, Process::Live(42), None, &NoLinks),
             Action::Focus {
                 pid: 42,
                 cwd: "/tmp/work".into()
             }
         );
-        let m = session(Harness::OpenCode, "OpenCode", Some(State::Waiting));
-        assert!(matches!(plan(&m, None, None, &NoLinks), Action::Explain(_)));
+        let m = session(Harness::OpenCode, "OpenCode", None);
+        assert!(matches!(
+            plan(&m, Process::MaybeHeld, None, &NoLinks),
+            Action::Explain(_)
+        ));
+    }
+
+    #[test]
+    fn a_session_whose_process_is_gone_resumes_even_if_it_looked_waiting() {
+        let m = session(Harness::ClaudeCode, "CLI", Some(State::Waiting));
+        assert!(matches!(
+            plan(&m, Process::Gone, None, &NoLinks),
+            Action::Resume { .. }
+        ));
+        let m = session(Harness::OpenCode, "OpenCode", Some(State::Stopped));
+        assert!(matches!(
+            plan(&m, Process::Gone, None, &NoLinks),
+            Action::Resume { .. }
+        ));
+        // A closed session whose process lingers is reopened, not focused.
+        let m = session(Harness::Codex, "CLI", Some(State::Ended));
+        assert!(matches!(
+            plan(&m, Process::Live(7), None, &NoLinks),
+            Action::Resume { .. }
+        ));
     }
 
     #[test]
@@ -555,7 +590,7 @@ mod tests {
         ] {
             let m = session(h, "CLI", Some(State::Ended));
             assert_eq!(
-                plan(&m, None, None, &NoLinks),
+                plan(&m, Process::Unknown, None, &NoLinks),
                 Action::Resume {
                     cwd: "/tmp/work".into(),
                     argv: cmd.split(' ').map(String::from).collect()
@@ -577,12 +612,12 @@ mod tests {
         }
         let m = session(Harness::Codex, "T3 Code", Some(State::Running));
         assert_eq!(
-            plan(&m, Some(1), None, &Some3),
+            plan(&m, Process::Live(1), None, &Some3),
             Action::Open("t3code://threads/e/abc-123".into())
         );
         let m = session(Harness::ClaudeCode, "Claude desktop", None);
         assert!(matches!(
-            plan(&m, None, None, &Some3),
+            plan(&m, Process::Unknown, None, &Some3),
             Action::App { name: "Claude", .. }
         ));
     }
@@ -592,17 +627,17 @@ mod tests {
         let mut m = session(Harness::ClaudeCode, "CLI", None);
         m.sighting.machine = Some("m-other".into());
         assert!(matches!(
-            plan(&m, None, Some("m-mine"), &NoLinks),
+            plan(&m, Process::Unknown, Some("m-mine"), &NoLinks),
             Action::Explain(_)
         ));
         m.sighting.machine = Some("m-mine".into());
         assert!(matches!(
-            plan(&m, None, Some("m-mine"), &NoLinks),
+            plan(&m, Process::Unknown, Some("m-mine"), &NoLinks),
             Action::Resume { .. }
         ));
         m.sighting.url = Some("https://claude.ai/code/session_1".into());
         assert_eq!(
-            plan(&m, None, None, &NoLinks),
+            plan(&m, Process::Unknown, None, &NoLinks),
             Action::Open("https://claude.ai/code/session_1".into())
         );
     }
@@ -616,6 +651,19 @@ mod tests {
             parse_pr("https://github.com/a/b/pull/9/files").unwrap(),
             (Some("a/b".into()), 9)
         );
+        for url in [
+            "https://github.com/a/b/pull/9",
+            "https://github.com/a/b/pull/9/",
+            "https://github.com/a/b/pull/9/commits",
+            "https://github.com/a/b/pull/9#issuecomment-1",
+            "https://github.com/a/b/pull/9?diff=split",
+            "github.com/a/b/pull/9",
+        ] {
+            assert_eq!(parse_pr(url).unwrap(), (Some("a/b".into()), 9), "{url}");
+        }
+        assert!(parse_pr("https://github.com//b/pull/9").is_err());
+        assert!(parse_pr("https://example.com/a/b/pull/9").is_err());
+        assert!(parse_pr("0").is_err());
         assert!(parse_pr("a#7").is_err());
         assert!(parse_pr("https://github.com/a/b/issues/9").is_err());
     }

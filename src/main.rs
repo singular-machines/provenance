@@ -165,7 +165,8 @@ struct Loaded {
     fetched: github::Fetched,
     rows: Vec<PrRow>,
     records: Vec<live::Record>,
-    alive: HashMap<u32, bool>,
+    alive: HashMap<u32, String>,
+    opencode: Vec<sessions::OpenCodeSession>,
 }
 
 fn load(
@@ -228,6 +229,7 @@ fn load(
         rows,
         records,
         alive,
+        opencode,
     })
 }
 
@@ -300,15 +302,34 @@ fn go(home: &std::path::Path, pr: &str, author: &str, print: bool) -> Result<()>
         anyhow::bail!("no session found for {repo}#{number}");
     };
     let s = &m.sighting;
-    let pid = loaded
-        .records
-        .iter()
-        .find(|r| r.harness == s.harness && r.session_id == s.session_id)
-        .filter(|r| live::is_alive(r, &loaded.alive))
-        .and_then(|r| r.pid);
+    let process = if s.harness == Harness::OpenCode {
+        // OpenCode doesn't say which process holds a session, so any running
+        // `opencode` might hold one that isn't archived.
+        let archived = loaded
+            .opencode
+            .iter()
+            .any(|o| o.id == s.session_id && o.time_archived.is_some());
+        if !archived && live::opencode_running() {
+            go::Process::MaybeHeld
+        } else {
+            go::Process::Gone
+        }
+    } else {
+        match loaded
+            .records
+            .iter()
+            .find(|r| r.harness == s.harness && r.session_id == s.session_id)
+        {
+            Some(r) if live::is_alive(r, &loaded.alive) => {
+                r.pid.map_or(go::Process::Unknown, go::Process::Live)
+            }
+            Some(r) if r.pid.is_some() => go::Process::Gone,
+            _ => go::Process::Unknown,
+        }
+    };
     let action = go::plan(
         m,
-        pid,
+        process,
         stamps::machine_name().as_deref(),
         &go::AppLinks {
             home: home.to_path_buf(),
