@@ -204,7 +204,7 @@ pub fn opencode_running() -> bool {
 }
 
 /// `(ppid, start time, command path)` for one process.
-fn ps_info(pid: u32) -> Option<(u32, String, String)> {
+pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
     let out = Command::new("ps")
         .args([
             "-o",

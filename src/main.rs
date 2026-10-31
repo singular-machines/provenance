@@ -1,5 +1,6 @@
 mod cache;
 mod github;
+mod go;
 mod install;
 mod live;
 mod matching;
@@ -44,6 +45,17 @@ enum Cmd {
         /// Also show how many sessions were matched by stamp, repo and folder path.
         #[arg(long, short)]
         verbose: bool,
+    },
+    /// Open the session behind a PR: switch to it if it's running, else resume it.
+    Go {
+        /// PR number (in this folder's repository), owner/name#number or PR URL.
+        pr: String,
+        /// GitHub author of the PR.
+        #[arg(long, default_value = "@me")]
+        author: String,
+        /// Print what would be run instead of running it.
+        #[arg(long)]
+        print: bool,
     },
     /// Install the commit-stamp git hook and the Claude Code and Codex session hooks.
     Install {
@@ -97,6 +109,7 @@ fn main() -> Result<()> {
             refresh,
             verbose,
         } => prs(&home()?, repo, &author, json, refresh, verbose),
+        Cmd::Go { pr, author, print } => go(&home()?, &pr, &author, print),
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
             report(install::install(&home()?, &bin, dry_run)?, dry_run);
@@ -147,22 +160,23 @@ fn report(lines: Vec<String>, dry_run: bool) {
     }
 }
 
-fn prs(
+/// Open PRs matched to sessions, with session states filled in.
+struct Loaded {
+    fetched: github::Fetched,
+    rows: Vec<PrRow>,
+    records: Vec<live::Record>,
+    alive: HashMap<u32, bool>,
+}
+
+fn load(
     home: &std::path::Path,
-    repo: Option<String>,
-    author: &str,
-    json: bool,
+    search: &str,
     refresh: bool,
-    verbose: bool,
-) -> Result<()> {
-    let mut search = format!("author:{author}");
-    if let Some(r) = &repo {
-        search.push_str(&format!(" repo:{r}"));
-    }
-    let now = Utc::now();
+    now: chrono::DateTime<Utc>,
+) -> Result<Loaded> {
     let cache_dir = cache::dir(home);
     let (fetched, ((mut sightings, records), opencode)) = rayon::join(
-        || github::open_prs(&search, &cache_dir, refresh, now),
+        || github::open_prs(search, &cache_dir, refresh, now),
         || {
             rayon::join(
                 || {
@@ -175,12 +189,12 @@ fn prs(
             )
         },
     );
-    let fetched = fetched?;
+    let mut fetched = fetched?;
     sightings.extend(live::sightings(&records));
     sightings.extend(sessions::opencode_sightings(&opencode));
     sessions::give_folder_branches(&mut sightings, sessions::current_branch);
     let folders = matching::resolve_folders(&fetched.prs, &sightings);
-    let mut rows = matching::match_prs_with(fetched.prs, &sightings, &folders);
+    let mut rows = matching::match_prs_with(std::mem::take(&mut fetched.prs), &sightings, &folders);
 
     let alive = live::alive_pids(&records);
     let by_id: HashMap<(Harness, &str), &live::Record> = records
@@ -209,6 +223,30 @@ fn prs(
             }
         }
     }
+    Ok(Loaded {
+        fetched,
+        rows,
+        records,
+        alive,
+    })
+}
+
+fn prs(
+    home: &std::path::Path,
+    repo: Option<String>,
+    author: &str,
+    json: bool,
+    refresh: bool,
+    verbose: bool,
+) -> Result<()> {
+    let mut search = format!("author:{author}");
+    if let Some(r) = &repo {
+        search.push_str(&format!(" repo:{r}"));
+    }
+    let now = Utc::now();
+    let Loaded {
+        fetched, mut rows, ..
+    } = load(home, &search, refresh, now)?;
 
     rows.sort_by(|a, b| {
         let last = |r: &PrRow| r.sessions.first().map(|m| m.sighting.last_seen);
@@ -241,4 +279,57 @@ fn prs(
         );
     }
     Ok(())
+}
+
+fn go(home: &std::path::Path, pr: &str, author: &str, print: bool) -> Result<()> {
+    let (repo, number) = go::parse_pr(pr)?;
+    let repo = match repo {
+        Some(r) => r,
+        None => go::current_repo()?,
+    };
+    let search = format!("author:{author} repo:{repo}");
+    let mut loaded = load(home, &search, false, Utc::now())?;
+    // A PR opened in the last two minutes may be missing from a cached list.
+    if !loaded.rows.iter().any(|r| r.pr.number == number) && loaded.fetched.from_cache {
+        loaded = load(home, &search, true, Utc::now())?;
+    }
+    let Some(row) = loaded.rows.iter().find(|r| r.pr.number == number) else {
+        anyhow::bail!("{repo}#{number} isn't an open PR by {author} (try --author)");
+    };
+    let Some(m) = render::pick(row) else {
+        anyhow::bail!("no session found for {repo}#{number}");
+    };
+    let s = &m.sighting;
+    let pid = loaded
+        .records
+        .iter()
+        .find(|r| r.harness == s.harness && r.session_id == s.session_id)
+        .filter(|r| live::is_alive(r, &loaded.alive))
+        .and_then(|r| r.pid);
+    let action = go::plan(
+        m,
+        pid,
+        stamps::machine_name().as_deref(),
+        &go::AppLinks {
+            home: home.to_path_buf(),
+        },
+    );
+    if print {
+        println!("{}", go::describe(&action));
+        return Ok(());
+    }
+    eprintln!(
+        "{repo}#{number} → {} session {} ({}{})",
+        render::harness_name(s.harness),
+        s.session_id,
+        if s.app.is_empty() {
+            "unknown app"
+        } else {
+            &s.app
+        },
+        m.state
+            .map(|st| format!(", {}", render::state_word(st)))
+            .unwrap_or_default()
+    );
+    go::run(action)
 }

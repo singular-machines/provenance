@@ -98,7 +98,7 @@ fn rank(s: Option<State>) -> u8 {
 
 /// The session a row shows: a live one if any (running, then waiting), else
 /// the most recent. `sessions` is newest first, which `--json` keeps.
-fn pick(r: &PrRow) -> Option<&SessionMatch> {
+pub fn pick(r: &PrRow) -> Option<&SessionMatch> {
     r.sessions
         .iter()
         .min_by_key(|m| (rank(m.state), std::cmp::Reverse(m.sighting.last_seen)))
@@ -129,12 +129,7 @@ fn session_cells(m: &SessionMatch) -> Session<'_> {
             ("", None) => "?".into(),
             (app, _) => app.into(),
         },
-        harness: match s.harness {
-            Harness::ClaudeCode => "Claude",
-            Harness::Codex => "Codex",
-            Harness::OpenCode => "OpenCode",
-            Harness::Pi => "Pi",
-        },
+        harness: harness_name(s.harness),
         id: s
             .session_id
             .trim_start_matches("session_")
@@ -292,6 +287,24 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
     out.push('\n');
     out.push_str(&footer(rows, groups.len(), style, cached));
     out
+}
+
+pub fn harness_name(h: Harness) -> &'static str {
+    match h {
+        Harness::ClaudeCode => "Claude",
+        Harness::Codex => "Codex",
+        Harness::OpenCode => "OpenCode",
+        Harness::Pi => "Pi",
+    }
+}
+
+pub fn state_word(s: State) -> &'static str {
+    match s {
+        State::Running => "running",
+        State::Waiting => "waiting for you",
+        State::Stopped => "stopped mid-turn",
+        State::Ended => "ended",
+    }
 }
 
 fn footer(rows: &[PrRow], repos: usize, style: &Style, cached: Option<&str>) -> String {
