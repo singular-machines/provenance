@@ -52,6 +52,10 @@ provenance install      # optional: exact stamps and live status
 
 ### Where `go` takes you
 
+<p align="center">
+<img src="docs/demo-go.gif" alt="In one terminal tab, provenance go acme/storefront#931 names the PR's Codex session, waiting for you, and switches to the tab where that session runs" width="860">
+</p>
+
 | Session | What `go` does |
 |---|---|
 | Running or waiting in a terminal | Switches to its tab: by tty in Terminal and iTerm2, by folder in Ghostty, otherwise brings the terminal app forward. Never starts a second copy. |

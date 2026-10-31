@@ -1,10 +1,14 @@
-# Draws docs/demo.gif: typing `provenance prs`, the table, then `provenance go`
-# reopening a session. Uses the renderer's colours and layout, on fictional data.
-# Run: python3 docs/demo_gif.py docs/demo.gif   (needs Pillow)
+# Draws the README's animations from fictional data, with the renderer's
+# colours and layout:
+#   docs/demo.gif     typing `provenance prs`, the table, then `go` resuming a session
+#   docs/demo-go.gif  `go` switching to the terminal tab where a session waits
+# Run: python3 docs/demo_gif.py docs   (needs Pillow)
+import os
 import sys
 from PIL import Image, ImageDraw, ImageFont
 
 FG, DIM, GREEN, YELLOW, BG, BAR = "#e6edf3", "#7d8590", "#3fb950", "#d29922", "#0d1117", "#161b22"
+CYAN, TAB = "#79c0ff", "#21262d"
 B = "bold"
 
 
@@ -50,65 +54,99 @@ GO_OUT = [
     [(0, "Resuming in ~/code/storefront: claude --resume d361dde1-7a0c-4e1b-9f42-5c8d2e6b1a37", FG, "")],
 ]
 
+# What the second animation shows: `go` from one tab switches to the tab where
+# the session waits. The Codex screen is a sketch, not Codex's real layout.
+SWITCH = "provenance go acme/storefront#931"
+SWITCH_OUT = [[(0, "acme/storefront#931 → Codex session 01a1c0de-3b5e-7f21-9c4d-8e2a6b0f5d13 (CLI, waiting for you)", FG, "")]]
+CODEX = [
+    [(0, "›", CYAN, B), (2, "Show stock levels on the product page", FG, "")],
+    [],
+    [(0, "•", DIM, ""), (2, "Added a stock badge to the product page, with tests.", FG, "")],
+    [(2, "Opened acme/storefront#931. Waiting for your review.", FG, "")],
+    [],
+]
+TABS = ["~/code/api", "codex · ~/code/storefront"]
+
 S = 2  # draw at 2x for sharp text when the README scales it down
 FS, LH, PADX, TOP, COLS = 14 * S, 22 * S, 24 * S, 52 * S, 124
 regular = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", FS, index=0)
 bold = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", FS, index=1)
 CW = regular.getlength("M")
-ROWS = 2 + len(TABLE) + 1 + 1 + len(GO_OUT)
-W, H = int(PADX * 2 + COLS * CW), int(TOP + LH * ROWS + 10 * S)
+BUTTONS = ["#ff5f57", "#febc2e", "#28c840"]
+# Colours too small on screen to win a palette slot by themselves.
+SWATCHES = BUTTONS + [CYAN]
 
 
-def frame(lines, cursor=None):
-    img = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, W, 34 * S], fill=BAR)
-    for i, c in enumerate(["#ff5f57", "#febc2e", "#28c840"]):
-        x = (20 + 20 * i) * S
-        d.ellipse([x - 6 * S, 11 * S, x + 6 * S, 23 * S], fill=c)
-    for i, line in enumerate(lines):
-        y = TOP + i * LH - FS
-        for col, text, colour, weight in line:
-            if text:
-                d.text((PADX + col * CW, y), text, fill=colour, font=bold if weight else regular)
-    if cursor is not None:
-        row, col = cursor
-        y = TOP + row * LH - FS
-        d.rectangle([PADX + col * CW, y + 2 * S, PADX + (col + 1) * CW - 2 * S, y + FS + 4 * S], fill=FG)
-    return img
+class Gif:
+    def __init__(self, rows, cols=COLS, tabs=None):
+        self.w, self.h = int(PADX * 2 + cols * CW), int(TOP + LH * rows + 10 * S)
+        self.tabs = tabs
+        self.frames, self.durations = [], []
+
+    def frame(self, lines, cursor=None, active=0):
+        img = Image.new("RGB", (self.w, self.h), BG)
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, self.w, 34 * S], fill=BAR)
+        for i, c in enumerate(BUTTONS):
+            x = (20 + 20 * i) * S
+            d.ellipse([x - 6 * S, 11 * S, x + 6 * S, 23 * S], fill=c)
+        for i, name in enumerate(self.tabs or []):
+            x0 = 90 * S + i * 300 * S
+            if i == active:
+                d.rounded_rectangle([x0, 5 * S, x0 + 290 * S, 29 * S], radius=5 * S, fill=TAB)
+            d.text((x0 + 12 * S, 17 * S - FS // 2 - 2 * S), name, fill=FG if i == active else DIM, font=regular)
+        for i, line in enumerate(lines):
+            y = TOP + i * LH - FS
+            for col, text, colour, weight in line:
+                if text:
+                    d.text((PADX + col * CW, y), text, fill=colour, font=bold if weight else regular)
+        if cursor is not None:
+            row, col = cursor
+            y = TOP + row * LH - FS
+            d.rectangle([PADX + col * CW, y + 2 * S, PADX + (col + 1) * CW - 2 * S, y + FS + 4 * S], fill=FG)
+        return img
+
+    def add(self, lines, ms, cursor=None, active=0):
+        self.frames.append(self.frame(lines, cursor, active))
+        self.durations.append(ms)
+
+    def typed(self, before, cmd):
+        """Frames typing `cmd` on the line after `before`."""
+        row = len(before)
+        for _ in range(2):
+            self.add(before + [prompt("")], 400, (row, 2))
+            self.add(before + [prompt("")], 300)
+        for n in range(1, len(cmd) + 1):
+            self.add(before + [prompt(cmd[:n])], 55, (row, 2 + n))
+        self.add(before + [prompt(cmd)], 500, (row, 2 + len(cmd)))
+
+    def save(self, path):
+        # One palette from the fullest frame keeps the colours steady across
+        # frames, with swatches of the colours that are only a few pixels.
+        sample = self.frames[-1].copy()
+        for i, c in enumerate(SWATCHES):
+            sample.paste(c, (i * 40 * S, self.h - 10 * S, (i + 1) * 40 * S, self.h))
+        palette = sample.quantize(colors=64, method=Image.Quantize.MEDIANCUT)
+        frames = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in self.frames]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=self.durations, loop=0, optimize=True)
 
 
-frames, durations = [], []
+out = sys.argv[1]
 
-
-def add(lines, ms, cursor=None):
-    frames.append(frame(lines, cursor))
-    durations.append(ms)
-
-
-def typed(before, row, cmd):
-    """Frames typing `cmd` at `row` under `before`."""
-    for blink in range(2):
-        add(before + [prompt("")], 400, (row, 2))
-        add(before + [prompt("")], 300)
-    for n in range(1, len(cmd) + 1):
-        add(before + [prompt(cmd[:n])], 55, (row, 2 + n))
-    add(before + [prompt(cmd)], 500, (row, 2 + len(cmd)))
-
-
-typed([], 0, "provenance prs")
+g = Gif(2 + len(TABLE) + 1 + 1 + len(GO_OUT))
+g.typed([], "provenance prs")
 screen = [prompt("provenance prs"), []] + TABLE + [[]]
-add(screen, 3800)
-typed(screen, len(screen), GO)
+g.add(screen, 3800)
+g.typed(screen, GO)
 screen += [prompt(GO)]
-add(screen + GO_OUT[:1], 700)
-add(screen + GO_OUT, 3500)
+g.add(screen + GO_OUT[:1], 700)
+g.add(screen + GO_OUT, 3500)
+g.save(os.path.join(out, "demo.gif"))
 
-# One palette from the fullest frame keeps the colours steady across frames.
-# Swatches of the window buttons' colours, too small otherwise to win a slot.
-sample = frames[-1].copy()
-for i, c in enumerate(["#ff5f57", "#febc2e", "#28c840"]):
-    sample.paste(c, (i * 40 * S, H - 10 * S, (i + 1) * 40 * S, H))
-palette = sample.quantize(colors=64, method=Image.Quantize.MEDIANCUT)
-frames = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
-frames[0].save(sys.argv[1], save_all=True, append_images=frames[1:], duration=durations, loop=0, optimize=True)
+g = Gif(7, 96, TABS)
+g.typed([], SWITCH)
+g.add([prompt(SWITCH)] + SWITCH_OUT, 900)
+g.add(CODEX + [[(0, "›", CYAN, B)]], 3500, (len(CODEX), 2), active=1)
+g.add(CODEX + [[(0, "›", CYAN, B)]], 500, None, active=1)
+g.add(CODEX + [[(0, "›", CYAN, B)]], 1500, (len(CODEX), 2), active=1)
+g.save(os.path.join(out, "demo-go.gif"))
