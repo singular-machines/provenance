@@ -1,6 +1,7 @@
 //! `provenance install` / `uninstall`: a git hook that stamps agent commits,
-//! Claude Code and Codex hooks that keep live session records, and a Pi
-//! extension that does both jobs for Pi.
+//! Claude Code and Codex hooks that keep live session records, a Pi
+//! extension that does both jobs for Pi, and the `provenance mcp` server in
+//! Claude Code and Codex.
 //!
 //! The git hook is a config-defined hook (`hook.provenance.*` in the global
 //! git config), which git runs alongside each repository's own hooks, so
@@ -139,6 +140,8 @@ pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
         ));
     }
 
+    done.extend(register_mcp(bin, dry_run)?);
+
     // Only where Pi has been used: its folder exists.
     if p.pi_agent.is_dir() {
         let path = p.pi_extension();
@@ -182,6 +185,14 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
             file.display()
         ));
     }
+    for (cli, label, remove) in MCP_CLIS {
+        if mcp_registered(cli) {
+            if !dry_run {
+                run_cli(cli, remove)?;
+            }
+            done.push(format!("{label}: removed the provenance MCP server"));
+        }
+    }
     let ext = p.pi_extension();
     if pi_extension_owner(&ext)? == Owner::Ours {
         if !dry_run {
@@ -190,6 +201,71 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
         done.push(format!("Pi: removed extension {}", ext.display()));
     }
     Ok(done)
+}
+
+/// Each harness CLI that registers MCP servers, and its remove command.
+const MCP_CLIS: [(&str, &str, &[&str]); 2] = [
+    (
+        "claude",
+        "Claude Code",
+        &["mcp", "remove", "--scope", "user", "provenance"],
+    ),
+    ("codex", "Codex", &["mcp", "remove", "provenance"]),
+];
+
+/// Register `provenance mcp` with each harness CLI that is installed, through
+/// the CLI's own command, so its config format is never edited by hand.
+fn register_mcp(bin: &Path, dry_run: bool) -> Result<Vec<String>> {
+    let bin = bin.to_string_lossy();
+    let mut done = Vec::new();
+    for (cli, label, _) in MCP_CLIS {
+        if Command::new(cli).arg("--version").output().is_err() {
+            continue;
+        }
+        if mcp_registered(cli) {
+            done.push(format!("{label}: provenance MCP server already registered"));
+            continue;
+        }
+        let scope: &[&str] = if cli == "claude" {
+            &["--scope", "user"]
+        } else {
+            &[]
+        };
+        let args: Vec<&str> = ["mcp", "add"]
+            .into_iter()
+            .chain(scope.iter().copied())
+            .chain(["provenance", "--", &bin, "mcp"])
+            .collect();
+        if !dry_run {
+            run_cli(cli, &args)?;
+        }
+        done.push(format!(
+            "{label}: provenance MCP server registered (send and reply tools)"
+        ));
+    }
+    Ok(done)
+}
+
+fn mcp_registered(cli: &str) -> bool {
+    Command::new(cli)
+        .args(["mcp", "get", "provenance"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn run_cli(cli: &str, args: &[&str]) -> Result<()> {
+    let out = Command::new(cli)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {cli}"))?;
+    if !out.status.success() {
+        bail!(
+            "`{cli} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
