@@ -80,6 +80,7 @@ enum Cmd {
 enum HarnessArg {
     ClaudeCode,
     Codex,
+    Pi,
 }
 
 fn main() -> Result<()> {
@@ -130,6 +131,7 @@ fn main() -> Result<()> {
             let h = match harness {
                 HarnessArg::ClaudeCode => Harness::ClaudeCode,
                 HarnessArg::Codex => Harness::Codex,
+                HarnessArg::Pi => Harness::Pi,
             };
             if let Ok(home) = home() {
                 live::run_hook(h, &home);

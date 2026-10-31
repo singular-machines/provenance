@@ -70,6 +70,7 @@ fn record_path(dir: &Path, harness: Harness, id: &str) -> PathBuf {
         Harness::ClaudeCode => "claude-code",
         Harness::Codex => "codex",
         Harness::OpenCode => "opencode",
+        Harness::Pi => "pi",
     };
     // Session IDs are UUIDs; keep only safe characters in the file name.
     let safe: String = id
@@ -142,13 +143,20 @@ impl Probe for SystemProbe {
     }
 }
 
-/// The nearest ancestor process that is a harness binary (`claude`, `codex`
-/// or `opencode`): its harness, PID and start time.
+/// The nearest ancestor process that is a harness (`claude`, `codex`,
+/// `opencode` or `pi`): its harness, PID and start time.
 pub fn nearest_harness() -> Option<(Harness, u32, String)> {
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..12 {
         let (ppid, started, comm) = ps_info(pid)?;
         let name = Path::new(&comm).file_name()?.to_string_lossy().to_string();
+        // Pi runs on Node or Bun and names itself through its process title,
+        // which shows in the command line rather than the executable.
+        let name = if matches!(name.as_str(), "node" | "bun") {
+            process_title(pid).unwrap_or(name)
+        } else {
+            name
+        };
         if let Some(h) = Harness::from_binary(&name) {
             return Some((h, pid, started));
         }
@@ -174,6 +182,17 @@ pub fn opencode_state(s: &crate::sessions::OpenCodeSession, running: bool) -> Op
         (false, false, true) => Some(State::Waiting),
         (false, false, false) => None,
     }
+}
+
+/// First word of a process's command line, which a process title replaces.
+fn process_title(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let first = line.split_whitespace().next()?;
+    Some(Path::new(first).file_name()?.to_string_lossy().to_string())
 }
 
 /// Whether any `opencode` process is running.
@@ -258,6 +277,7 @@ pub fn update(
                 .filter(|a| a != "SDK")
                 .unwrap_or_default(),
             Harness::OpenCode => app_from_path(&cwd).unwrap_or_default().into(),
+            Harness::Pi => app_from_path(&cwd).unwrap_or("CLI").into(),
         },
     };
     Record {

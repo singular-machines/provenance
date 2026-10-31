@@ -1,5 +1,6 @@
 //! `provenance install` / `uninstall`: a git hook that stamps agent commits,
-//! and Claude Code and Codex hooks that keep live session records.
+//! Claude Code and Codex hooks that keep live session records, and a Pi
+//! extension that does both jobs for Pi.
 //!
 //! The git hook is a config-defined hook (`hook.provenance.*` in the global
 //! git config), which git runs alongside each repository's own hooks, so
@@ -22,6 +23,7 @@ const SESSION_EVENTS: &[&str] = &[
 pub struct Paths {
     pub claude_settings: PathBuf,
     pub codex_hooks: PathBuf,
+    pub pi_agent: PathBuf,
 }
 
 impl Paths {
@@ -29,8 +31,56 @@ impl Paths {
         Paths {
             claude_settings: home.join(".claude/settings.json"),
             codex_hooks: home.join(".codex/hooks.json"),
+            pi_agent: crate::sessions::pi_agent_dir(home),
         }
     }
+
+    fn pi_extension(&self) -> PathBuf {
+        self.pi_agent.join("extensions/provenance.ts")
+    }
+}
+
+/// First line of the Pi extension, so `uninstall` only removes its own file.
+const PI_MARKER: &str = "// provenance: managed file, removed by `provenance uninstall`.";
+
+/// Pi passes no session ID to the commands it runs and has no hook config, so
+/// this extension sets `PI_SESSION_ID` for commit stamps and reports session
+/// events to `provenance hook pi`, as the other harnesses' hooks do.
+pub fn pi_extension(bin: &Path) -> String {
+    let bin = serde_json::to_string(&bin.to_string_lossy()).unwrap_or_default();
+    format!(
+        r#"{PI_MARKER}
+// Gives commands Pi runs the session ID (PI_SESSION_ID) for commit stamps,
+// and records session events for `provenance prs`.
+import {{ spawn }} from "node:child_process";
+
+const BIN = {bin};
+
+export default function (pi: any) {{
+  const send = (event: string, ctx: any) => {{
+    const id = ctx?.sessionManager?.getSessionId?.();
+    if (!id) return;
+    process.env.PI_SESSION_ID = id;
+    try {{
+      const child = spawn(BIN, ["hook", "pi"], {{ stdio: ["pipe", "ignore", "ignore"] }});
+      child.on("error", () => {{}});
+      child.stdin.on("error", () => {{}});
+      child.stdin.end(JSON.stringify({{
+        session_id: id,
+        cwd: ctx.cwd,
+        hook_event_name: event,
+        transcript_path: ctx.sessionManager.getSessionFile?.(),
+      }}));
+    }} catch {{}}
+  }};
+  pi.on("session_start", (_e: any, ctx: any) => send("SessionStart", ctx));
+  pi.on("agent_start", (_e: any, ctx: any) => send("UserPromptSubmit", ctx));
+  pi.on("tool_execution_end", (_e: any, ctx: any) => send("PostToolUse", ctx));
+  pi.on("agent_end", (_e: any, ctx: any) => send("Stop", ctx));
+  pi.on("session_shutdown", (_e: any, ctx: any) => send("SessionEnd", ctx));
+}}
+"#
+    )
 }
 
 pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
@@ -70,6 +120,36 @@ pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
             file.display()
         ));
     }
+
+    // Only where Pi has been used: its folder exists.
+    if p.pi_agent.is_dir() {
+        let path = p.pi_extension();
+        let wanted = pi_extension(bin);
+        let current = std::fs::read_to_string(&path).ok();
+        if let Some(c) = &current
+            && !c.starts_with(PI_MARKER)
+        {
+            bail!(
+                "{} exists and isn't provenance's; leaving it alone",
+                path.display()
+            );
+        }
+        let fresh = current.as_deref() == Some(wanted.as_str());
+        if !fresh && !dry_run {
+            std::fs::create_dir_all(path.parent().context("extension folder")?)?;
+            std::fs::write(&path, &wanted)
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        done.push(format!(
+            "Pi: extension {} {}",
+            path.display(),
+            if fresh {
+                "already up to date"
+            } else {
+                "written (session ID for stamps, live status)"
+            }
+        ));
+    }
     Ok(done)
 }
 
@@ -98,6 +178,13 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
             "{label}: {removed} hook entries removed from {}",
             file.display()
         ));
+    }
+    let ext = p.pi_extension();
+    if std::fs::read_to_string(&ext).is_ok_and(|c| c.starts_with(PI_MARKER)) {
+        if !dry_run {
+            std::fs::remove_file(&ext).with_context(|| format!("removing {}", ext.display()))?;
+        }
+        done.push(format!("Pi: removed extension {}", ext.display()));
     }
     Ok(done)
 }
@@ -397,6 +484,25 @@ mod tests {
             0o600
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pi_extension_is_marked_and_quotes_the_binary() {
+        let ext = pi_extension(Path::new("/Users/o'neil/bin/provenance"));
+        assert!(ext.starts_with(PI_MARKER));
+        assert!(
+            ext.contains(r#"const BIN = "/Users/o'neil/bin/provenance";"#),
+            "{ext}"
+        );
+        for event in [
+            "session_start",
+            "agent_start",
+            "tool_execution_end",
+            "agent_end",
+            "session_shutdown",
+        ] {
+            assert!(ext.contains(&format!("pi.on(\"{event}\"")), "{event}");
+        }
     }
 
     #[test]
