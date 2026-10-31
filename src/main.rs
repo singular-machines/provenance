@@ -217,6 +217,15 @@ fn prs(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        // GitHub search finds nothing for a repo that doesn't exist, so check.
+        if let Some(r) = &repo
+            && github::repo_exists(r) == Some(false)
+        {
+            anyhow::bail!("no repository {r} on GitHub (or `gh` can't see it)");
+        }
+        let place = repo.map(|r| format!(" in {r}")).unwrap_or_default();
+        println!("No open PRs by {author}{place}.");
     } else {
         let cached = fetched
             .from_cache
