@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Bump when any cached shape changes, so old files are ignored.
-const VERSION: &str = "v1";
+/// Bump when any cached shape changes, or when parsing changes what a cached
+/// value would hold (stamps are cached parsed), so old files are ignored.
+const VERSION: &str = "v2";
 
 pub fn dir(home: &Path) -> PathBuf {
     home.join(".cache/provenance")
