@@ -1,5 +1,6 @@
 //! `provenance install` / `uninstall`: a git hook that stamps agent commits,
-//! and Claude Code and Codex hooks that keep live session records.
+//! Claude Code and Codex hooks that keep live session records, and a Pi
+//! extension that does both jobs for Pi.
 //!
 //! The git hook is a config-defined hook (`hook.provenance.*` in the global
 //! git config), which git runs alongside each repository's own hooks, so
@@ -22,6 +23,7 @@ const SESSION_EVENTS: &[&str] = &[
 pub struct Paths {
     pub claude_settings: PathBuf,
     pub codex_hooks: PathBuf,
+    pub pi_agent: PathBuf,
 }
 
 impl Paths {
@@ -29,8 +31,74 @@ impl Paths {
         Paths {
             claude_settings: home.join(".claude/settings.json"),
             codex_hooks: home.join(".codex/hooks.json"),
+            pi_agent: crate::sessions::pi_agent_dir(home),
         }
     }
+
+    fn pi_extension(&self) -> PathBuf {
+        self.pi_agent.join("extensions/provenance.ts")
+    }
+}
+
+/// First line of the Pi extension, so `uninstall` only removes its own file.
+const PI_MARKER: &str = "// provenance: managed file, removed by `provenance uninstall`.";
+
+/// Pi passes no session ID to the commands it runs and has no hook config, so
+/// this extension sets `PI_SESSION_ID` for commit stamps and reports session
+/// events to `provenance hook pi`, as the other harnesses' hooks do.
+pub fn pi_extension(bin: &Path) -> String {
+    let bin = serde_json::to_string(&bin.to_string_lossy()).unwrap_or_default();
+    format!(
+        r#"{PI_MARKER}
+// Gives commands Pi runs the session ID (PI_SESSION_ID) for commit stamps,
+// and records session events for `provenance prs`.
+import {{ spawn }} from "node:child_process";
+
+const BIN = {bin};
+
+export default function (pi: any) {{
+  // Events go out one at a time, in order, so a slow hook can't let an older
+  // event overwrite a newer one. Each waits at most 3 seconds.
+  let queue: Promise<void> = Promise.resolve();
+  const deliver = (payload: string) =>
+    new Promise<void>((resolve) => {{
+      try {{
+        const child = spawn(BIN, ["hook", "pi"], {{ stdio: ["pipe", "ignore", "ignore"] }});
+        const timer = setTimeout(() => {{
+          try {{ child.kill(); }} catch {{}}
+          resolve();
+        }}, 3000);
+        const done = () => {{ clearTimeout(timer); resolve(); }};
+        child.on("close", done);
+        child.on("error", done);
+        child.stdin.on("error", () => {{}});
+        child.stdin.end(payload);
+      }} catch {{
+        resolve();
+      }}
+    }});
+  const send = (event: string, ctx: any): Promise<void> => {{
+    const id = ctx?.sessionManager?.getSessionId?.();
+    if (!id) return queue;
+    process.env.PI_SESSION_ID = id;
+    const payload = JSON.stringify({{
+      session_id: id,
+      cwd: ctx.cwd,
+      hook_event_name: event,
+      transcript_path: ctx.sessionManager.getSessionFile?.(),
+    }});
+    queue = queue.then(() => deliver(payload));
+    return queue;
+  }};
+  pi.on("session_start", (_e: any, ctx: any) => send("SessionStart", ctx));
+  pi.on("agent_start", (_e: any, ctx: any) => send("UserPromptSubmit", ctx));
+  pi.on("tool_execution_end", (_e: any, ctx: any) => send("PostToolUse", ctx));
+  pi.on("agent_end", (_e: any, ctx: any) => send("Stop", ctx));
+  // Returned promises let Pi wait for delivery, including at shutdown.
+  pi.on("session_shutdown", (_e: any, ctx: any) => send("SessionEnd", ctx));
+}}
+"#
+    )
 }
 
 pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
@@ -70,6 +138,21 @@ pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
             file.display()
         ));
     }
+
+    // Only where Pi has been used: its folder exists.
+    if p.pi_agent.is_dir() {
+        let path = p.pi_extension();
+        let fresh = write_pi_extension(&path, &pi_extension(bin), dry_run)?;
+        done.push(format!(
+            "Pi: extension {} {}",
+            path.display(),
+            if fresh {
+                "already up to date"
+            } else {
+                "written (session ID for stamps, live status)"
+            }
+        ));
+    }
     Ok(done)
 }
 
@@ -99,7 +182,75 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
             file.display()
         ));
     }
+    let ext = p.pi_extension();
+    if pi_extension_owner(&ext)? == Owner::Ours {
+        if !dry_run {
+            std::fs::remove_file(&ext).with_context(|| format!("removing {}", ext.display()))?;
+        }
+        done.push(format!("Pi: removed extension {}", ext.display()));
+    }
     Ok(done)
+}
+
+#[derive(Debug, PartialEq)]
+enum Owner {
+    Absent,
+    Ours,
+    NotOurs,
+}
+
+/// Whose file is at `path`: ours only if it's a regular file (not a symlink)
+/// whose first line is exactly the marker. Read errors other than "not found"
+/// are errors, never permission to write.
+fn pi_extension_owner(path: &Path) -> Result<Owner> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Owner::Absent),
+        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
+    };
+    if !meta.file_type().is_file() {
+        return Ok(Owner::NotOurs);
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let first = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+    Ok(if first == PI_MARKER.as_bytes() {
+        Owner::Ours
+    } else {
+        Owner::NotOurs
+    })
+}
+
+/// Writes the extension unless an identical copy is there; returns whether it
+/// was already up to date. Refuses anything that isn't ours, and replaces by
+/// renaming a new file over the path, so a symlink is never followed.
+fn write_pi_extension(path: &Path, content: &str, dry_run: bool) -> Result<bool> {
+    match pi_extension_owner(path)? {
+        Owner::NotOurs => bail!(
+            "{} exists and isn't provenance's; leaving it alone",
+            path.display()
+        ),
+        Owner::Ours if std::fs::read(path)? == content.as_bytes() => return Ok(true),
+        _ => {}
+    }
+    if dry_run {
+        return Ok(false);
+    }
+    let dir = path.parent().context("extension folder")?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".provenance.ts.{}", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    use std::io::Write;
+    let written = f.write_all(content.as_bytes()).and_then(|_| f.sync_all());
+    drop(f);
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(false)
 }
 
 /// Append one hook group per event, after any existing groups: Codex keys its
@@ -397,6 +548,62 @@ mod tests {
             0o600
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pi_extension_is_only_written_over_our_own_regular_file() {
+        let dir = std::env::temp_dir().join(format!("prov-piext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("provenance.ts");
+        let ours = pi_extension(Path::new("/bin/provenance"));
+
+        assert!(!write_pi_extension(&path, &ours, false).unwrap());
+        assert!(
+            write_pi_extension(&path, &ours, false).unwrap(),
+            "identical copy"
+        );
+        assert_eq!(pi_extension_owner(&path).unwrap(), Owner::Ours);
+
+        // Someone else's file, including one that mentions the marker later or
+        // isn't UTF-8: refused and left untouched.
+        for other in [
+            b"export default 1;\n".to_vec(),
+            format!("x\n{PI_MARKER}\n").into_bytes(),
+            vec![0xff, 0xfe, b'\n'],
+        ] {
+            std::fs::write(&path, &other).unwrap();
+            assert!(write_pi_extension(&path, &ours, false).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), other);
+        }
+
+        // A symlink, even a dangling one, is never followed or replaced.
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.join("elsewhere.ts");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(pi_extension_owner(&path).unwrap(), Owner::NotOurs);
+        assert!(write_pi_extension(&path, &ours, false).is_err());
+        assert!(!target.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pi_extension_is_marked_and_quotes_the_binary() {
+        let ext = pi_extension(Path::new("/Users/o'neil/bin/provenance"));
+        assert!(ext.starts_with(PI_MARKER));
+        assert!(
+            ext.contains(r#"const BIN = "/Users/o'neil/bin/provenance";"#),
+            "{ext}"
+        );
+        for event in [
+            "session_start",
+            "agent_start",
+            "tool_execution_end",
+            "agent_end",
+            "session_shutdown",
+        ] {
+            assert!(ext.contains(&format!("pi.on(\"{event}\"")), "{event}");
+        }
     }
 
     #[test]

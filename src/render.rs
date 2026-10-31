@@ -133,6 +133,7 @@ fn session_cells(m: &SessionMatch) -> Session<'_> {
             Harness::ClaudeCode => "Claude",
             Harness::Codex => "Codex",
             Harness::OpenCode => "OpenCode",
+            Harness::Pi => "Pi",
         },
         id: s
             .session_id

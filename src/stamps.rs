@@ -2,7 +2,7 @@
 //! reading them back from a PR's commits.
 //!
 //! provenance writes `Agent-Session: <harness>/<id>` and `Agent-Machine: <name>`,
-//! where `<harness>` is `claude-code`, `codex` or `opencode`.
+//! where `<harness>` is `claude-code`, `codex`, `opencode` or `pi`.
 //! Claude Code on the web already writes `Claude-Session: https://claude.ai/code/session_…`.
 
 use std::process::Command;
@@ -37,6 +37,7 @@ pub fn parse(message: &str, committed: DateTime<Utc>) -> Vec<Stamp> {
                 "claude-code" => Harness::ClaudeCode,
                 "codex" => Harness::Codex,
                 "opencode" => Harness::OpenCode,
+                "pi" => Harness::Pi,
                 _ => continue,
             };
             if !id.is_empty() && !id.contains(char::is_whitespace) {
@@ -73,6 +74,8 @@ pub fn sessions_from_env(get: impl Fn(&str) -> Option<String>) -> Vec<(Harness, 
         (Harness::ClaudeCode, "CLAUDE_CODE_SESSION_ID"),
         (Harness::Codex, "CODEX_THREAD_ID"),
         (Harness::OpenCode, "OPENCODE_SESSION_ID"),
+        // Set by the Pi extension that `provenance install` adds.
+        (Harness::Pi, "PI_SESSION_ID"),
     ]
     .into_iter()
     .filter_map(|(h, var)| get(var).filter(|v| !v.trim().is_empty()).map(|v| (h, v)))
@@ -84,6 +87,7 @@ pub fn trailer_value(harness: Harness, id: &str) -> String {
         Harness::ClaudeCode => "claude-code",
         Harness::Codex => "codex",
         Harness::OpenCode => "opencode",
+        Harness::Pi => "pi",
     };
     format!("{prefix}/{id}")
 }
@@ -308,6 +312,7 @@ mod tests {
             std::env::set_var("PROVENANCE_MACHINE", "box");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("OPENCODE_SESSION_ID");
+            std::env::remove_var("PI_SESSION_ID");
         }
         let p = f.to_str().unwrap();
         stamp_message_file(p).unwrap();

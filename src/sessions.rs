@@ -1,4 +1,4 @@
-//! Reads Claude Code and Codex session logs, and OpenCode's session database,
+//! Reads Claude Code, Codex and Pi session logs, and OpenCode's session database,
 //! into a flat list of sightings: "session S was in folder F on branch B, last
 //! seen at T".
 
@@ -18,6 +18,7 @@ pub enum Harness {
     Codex,
     #[serde(rename = "opencode")]
     OpenCode,
+    Pi,
 }
 
 impl Harness {
@@ -27,6 +28,7 @@ impl Harness {
             "claude" => Some(Harness::ClaudeCode),
             "codex" => Some(Harness::Codex),
             "opencode" => Some(Harness::OpenCode),
+            "pi" => Some(Harness::Pi),
             _ => None,
         }
     }
@@ -74,6 +76,9 @@ pub fn load_all(home: &Path, cache_dir: Option<&Path>) -> Vec<Sighting> {
         jsonl_files(&root, &mut codex);
     }
     files.extend(codex.into_iter().map(|p| (p, Harness::Codex)));
+    let mut pi = Vec::new();
+    jsonl_files(&pi_sessions_dir(home), &mut pi);
+    files.extend(pi.into_iter().map(|p| (p, Harness::Pi)));
 
     let index_path = cache_dir.map(|d| crate::cache::path(d, "logs"));
     let old: HashMap<String, Indexed> = index_path
@@ -102,6 +107,7 @@ pub fn load_all(home: &Path, cache_dir: Option<&Path>) -> Vec<Sighting> {
             let sightings = match harness {
                 Harness::ClaudeCode => read_claude_file(path),
                 Harness::Codex => read_codex_file(path).into_iter().collect(),
+                Harness::Pi => read_pi_file(path).into_iter().collect(),
                 Harness::OpenCode => Vec::new(),
             };
             Some((
@@ -329,6 +335,58 @@ pub fn codex_app(originator: Option<&str>, cwd: &str) -> String {
     }
 }
 
+// ---------- Pi ----------
+
+/// Pi's config folder: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub fn pi_agent_dir(home: &Path) -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".pi/agent"))
+}
+
+fn pi_sessions_dir(home: &Path) -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| pi_agent_dir(home).join("sessions"))
+}
+
+#[derive(Deserialize)]
+struct PiHeader {
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    cwd: String,
+    timestamp: Option<String>,
+}
+
+/// Pi's first line is a `session` header with the session's ID and folder.
+/// Pi records no git branch; [`give_folder_branches`] fills it in.
+fn read_pi_file(path: &Path) -> Option<Sighting> {
+    let mut first = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut first)
+        .ok()?;
+    let header: PiHeader = serde_json::from_str(&first).ok()?;
+    if header.kind != "session" {
+        return None;
+    }
+    let started = header.timestamp.as_deref().and_then(parse_ts);
+    Some(Sighting {
+        harness: Harness::Pi,
+        session_id: header.id,
+        app: app_from_path(&header.cwd).unwrap_or("CLI").into(),
+        cwd: header.cwd,
+        branch: String::new(),
+        repo_url: None,
+        last_seen: last_logged_time(path).or(started)?,
+        log_path: Some(path.to_path_buf()),
+        machine: None,
+        url: None,
+    })
+}
+
 // ---------- OpenCode ----------
 
 /// One row of OpenCode's `session_v2` table.
@@ -403,7 +461,7 @@ pub fn opencode_sightings(sessions: &[OpenCodeSession]) -> Vec<Sighting> {
 
 /// Harnesses whose sessions record no git branch.
 fn records_no_branch(h: Harness) -> bool {
-    matches!(h, Harness::OpenCode)
+    matches!(h, Harness::OpenCode | Harness::Pi)
 }
 
 /// For sessions of harnesses that record no git branch: the folder's current
@@ -499,6 +557,36 @@ mod tests {
                 .iter()
                 .all(|s| s.harness == Harness::OpenCode && s.app == "OpenCode")
         );
+    }
+
+    #[test]
+    fn reads_a_pi_session_file() {
+        let dir = std::env::temp_dir().join(format!("prov-pi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-31T00-00-00-000Z_abc.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-1","timestamp":"2026-10-31T00:00:00.000Z","cwd":"/r"}"#, "\n",
+                r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-10-31T00:05:00.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let s = read_pi_file(&path).unwrap();
+        assert_eq!(
+            (
+                s.harness,
+                s.session_id.as_str(),
+                s.cwd.as_str(),
+                s.app.as_str()
+            ),
+            (Harness::Pi, "pi-1", "/r", "CLI")
+        );
+        assert_eq!(s.last_seen.to_rfc3339(), "2026-10-31T00:05:00+00:00");
+        assert!(s.branch.is_empty());
+        std::fs::write(&path, r#"{"type":"message"}"#).unwrap();
+        assert!(read_pi_file(&path).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
