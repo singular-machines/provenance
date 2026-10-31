@@ -1,6 +1,7 @@
 //! `provenance install` / `uninstall`: a git hook that stamps agent commits,
-//! Claude Code and Codex hooks that keep live session records, and a Pi
-//! extension that does both jobs for Pi.
+//! Claude Code and Codex hooks that keep live session records, a Pi
+//! extension that does both jobs for Pi, and the `provenance mcp` server in
+//! Claude Code and Codex.
 //!
 //! The git hook is a config-defined hook (`hook.provenance.*` in the global
 //! git config), which git runs alongside each repository's own hooks, so
@@ -139,6 +140,8 @@ pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
         ));
     }
 
+    done.extend(register_mcp(home, bin, dry_run)?);
+
     // Only where Pi has been used: its folder exists.
     if p.pi_agent.is_dir() {
         let path = p.pi_extension();
@@ -182,6 +185,23 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
             file.display()
         ));
     }
+    for (cli, label, remove) in MCP_CLIS {
+        if !cli_installed(cli) {
+            continue;
+        }
+        match mcp_registration(home, cli)? {
+            Registration::Ours => {
+                if !dry_run {
+                    run_cli(cli, remove)?;
+                }
+                done.push(format!("{label}: removed the provenance MCP server"));
+            }
+            Registration::Foreign(cmd) => done.push(format!(
+                "{label}: left the MCP server named provenance alone; it runs {cmd}, not `provenance mcp`"
+            )),
+            Registration::Absent => {}
+        }
+    }
     let ext = p.pi_extension();
     if pi_extension_owner(&ext)? == Owner::Ours {
         if !dry_run {
@@ -190,6 +210,143 @@ pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
         done.push(format!("Pi: removed extension {}", ext.display()));
     }
     Ok(done)
+}
+
+/// Each harness CLI that registers MCP servers, and its remove command.
+const MCP_CLIS: [(&str, &str, &[&str]); 2] = [
+    (
+        "claude",
+        "Claude Code",
+        &["mcp", "remove", "--scope", "user", "provenance"],
+    ),
+    ("codex", "Codex", &["mcp", "remove", "provenance"]),
+];
+
+/// Register `provenance mcp` with each harness CLI that is installed, through
+/// the CLI's own command. A server already named provenance that runs
+/// something else is left alone.
+fn register_mcp(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
+    let bin = bin.to_string_lossy();
+    let mut done = Vec::new();
+    for (cli, label, _) in MCP_CLIS {
+        if !cli_installed(cli) {
+            continue;
+        }
+        match mcp_registration(home, cli)? {
+            Registration::Ours => {
+                done.push(format!("{label}: provenance MCP server already registered"));
+                continue;
+            }
+            Registration::Foreign(cmd) => {
+                done.push(format!(
+                    "{label}: an MCP server named provenance already runs {cmd}; left it alone, so sessions won't get send and reply"
+                ));
+                continue;
+            }
+            Registration::Absent => {}
+        }
+        let scope: &[&str] = if cli == "claude" {
+            &["--scope", "user"]
+        } else {
+            &[]
+        };
+        let args: Vec<&str> = ["mcp", "add"]
+            .into_iter()
+            .chain(scope.iter().copied())
+            .chain(["provenance", "--", &bin, "mcp"])
+            .collect();
+        if !dry_run {
+            run_cli(cli, &args)?;
+        }
+        done.push(format!(
+            "{label}: provenance MCP server registered (send and reply tools)"
+        ));
+    }
+    Ok(done)
+}
+
+fn cli_installed(cli: &str) -> bool {
+    Command::new(cli).arg("--version").output().is_ok()
+}
+
+/// Whose MCP server is registered under the name provenance.
+#[derive(Debug, PartialEq)]
+enum Registration {
+    Absent,
+    Ours,
+    /// Someone else's, with the command it runs.
+    Foreign(String),
+}
+
+/// The provenance server entry: Claude Code's user scope in `~/.claude.json`,
+/// which `claude mcp add --scope user` writes, or `codex mcp get --json`.
+fn mcp_registration(home: &Path, cli: &str) -> Result<Registration> {
+    if cli == "claude" {
+        let doc = read_json(&home.join(".claude.json"))?;
+        return Ok(classify(doc.pointer("/mcpServers/provenance")));
+    }
+    let out = Command::new(cli)
+        .args(["mcp", "get", "provenance", "--json"])
+        .output()
+        .with_context(|| format!("running {cli}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("No MCP server named") {
+            return Ok(Registration::Absent);
+        }
+        bail!("`{cli} mcp get provenance` failed: {}", err.trim());
+    }
+    let doc: Value = serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("reading `{cli} mcp get provenance --json`"))?;
+    Ok(classify(doc.get("transport")))
+}
+
+/// Ours only if it runs a binary named provenance with the single argument `mcp`.
+fn classify(entry: Option<&Value>) -> Registration {
+    let Some(entry) = entry else {
+        return Registration::Absent;
+    };
+    let command = entry
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if Path::new(command)
+        .file_name()
+        .is_some_and(|n| n == "provenance")
+        && args == ["mcp"]
+    {
+        Registration::Ours
+    } else if command.is_empty() {
+        Registration::Foreign(
+            entry
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("a remote server")
+                .into(),
+        )
+    } else {
+        Registration::Foreign(command.into())
+    }
+}
+
+fn run_cli(cli: &str, args: &[&str]) -> Result<()> {
+    let out = Command::new(cli)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {cli}"))?;
+    if !out.status.success() {
+        bail!(
+            "`{cli} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -604,6 +761,26 @@ mod tests {
         ] {
             assert!(ext.contains(&format!("pi.on(\"{event}\"")), "{event}");
         }
+    }
+
+    #[test]
+    fn only_a_provenance_mcp_command_is_ours() {
+        assert_eq!(classify(None), Registration::Absent);
+        let ours =
+            json!({"type": "stdio", "command": "/home/u/.cargo/bin/provenance", "args": ["mcp"]});
+        assert_eq!(classify(Some(&ours)), Registration::Ours);
+        let other = json!({"command": "/unrelated/server", "args": ["mcp"]});
+        assert_eq!(
+            classify(Some(&other)),
+            Registration::Foreign("/unrelated/server".into())
+        );
+        let extra = json!({"command": "provenance", "args": ["mcp", "--other"]});
+        assert!(matches!(classify(Some(&extra)), Registration::Foreign(_)));
+        let remote = json!({"type": "http", "url": "https://example.com/mcp"});
+        assert_eq!(
+            classify(Some(&remote)),
+            Registration::Foreign("https://example.com/mcp".into())
+        );
     }
 
     #[test]

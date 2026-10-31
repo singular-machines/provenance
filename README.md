@@ -14,7 +14,7 @@
 
 You run Claude Code, Codex, OpenCode and Pi in lots of apps: the terminal, Claude desktop, Codex desktop, T3 Code, Conductor, the web. They all open PRs. On GitHub you can't tell which session opened a PR, or whether that session is still alive.
 
-`provenance prs` lists your open PRs with the session behind each one: the app it runs in, when it was last active, and whether it's running or waiting for you.
+`provenance prs` lists your open PRs with the session behind each one: the app it runs in, when it was last active, and whether it's running or waiting for you. `provenance go` opens that session, and `provenance send` messages it.
 
 ## Highlights
 
@@ -47,7 +47,10 @@ provenance install      # optional: exact stamps and live status
 | `provenance prs --refresh` | Search GitHub now instead of using the 2-minute cache |
 | `provenance go <PR>` | Open the session behind a PR (`123`, `owner/name#123` or a PR URL) |
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
-| `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks |
+| `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
+| `provenance send <PR> "message" --wait` | Also wait for its reply (default up to 300 seconds) |
+| `provenance send <PR> "message" --resume` | If the session isn't running, resume it headless to answer |
+| `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks and the MCP server |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
 
 ### Where `go` takes you
@@ -65,6 +68,19 @@ provenance install      # optional: exact stamps and live status
 | Claude Code on the web | Opens its claude.ai link |
 | Conductor, Codex desktop | Brings the app forward; neither has a link to one session |
 | Another machine | Says which machine it ran on |
+
+### Messaging the session behind a PR
+
+`provenance send` delivers a message into a running session through the harness's own way in. The session answers with the `reply` tool of `provenance mcp`, which `install` registers in Claude Code and Codex. Agents get the same `send` tool, so one session can ask the session behind another PR a question, and the answer comes back to it as a message.
+
+| Session | How the message gets in |
+|---|---|
+| Claude Code, running | Its inbox socket, named in `~/.claude/sessions/<pid>.json`. An idle session starts a turn; a busy one reads it between tool calls. Claude Code labels it as a message from another session, which can't approve prompts or change settings. |
+| Codex, running | `codex queue --thread <id>`. An idle session starts a turn; a busy one takes it after its current turn. |
+| Not running | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its folder. |
+| OpenCode, Pi, the web, another machine | Not supported yet. |
+
+Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed.
 
 ## Reading the table
 
@@ -116,7 +132,8 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 <summary><b>What <code>install</code> changes</b></summary>
 
 1. **A git hook that stamps agent commits.** It adds `hook.provenance` to your global git config: a config-defined `prepare-commit-msg` hook, which git runs alongside each repository's own hooks (including repositories with their own `core.hooksPath`), so nothing is displaced. When a commit is made inside a Claude Code, Codex, OpenCode or Pi session (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID` or `PI_SESSION_ID` is set), it adds `Agent-Session` and `Agent-Machine` trailers. Commits you make yourself are left alone. When one harness runs inside another's shell and both variables are set, the stamp names the harness whose process is nearest up the process tree, not the outer one. Needs a git that supports hooks defined in config (`hook.<name>.command`, as in git 2.56); `install` checks and refuses otherwise.
-2. **Session hooks for Claude Code and Codex** (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`) in `~/.claude/settings.json` and `~/.codex/hooks.json`, appended after your existing hooks; a backup is written first and the file keeps its permissions. `uninstall` removes only provenance's own commands. In Codex, which keys hook approvals by position, a removed group that has later groups after it keeps a no-op `true` command so those later hooks keep their approvals. Each event updates `~/.local/state/provenance/live/<harness>-<id>.json`: the harness process ID and its start time, the last event, and every folder and branch the session has been on. That gives the status marks described in [Reading the table](#reading-the-table).
+2. **The `provenance mcp` server in Claude Code and Codex**, registered with `claude mcp add --scope user` and `codex mcp add`, so each session gets the `send` and `reply` tools. `uninstall` removes it with `claude mcp remove` and `codex mcp remove`.
+3. **Session hooks for Claude Code and Codex** (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`) in `~/.claude/settings.json` and `~/.codex/hooks.json`, appended after your existing hooks; a backup is written first and the file keeps its permissions. `uninstall` removes only provenance's own commands. In Codex, which keys hook approvals by position, a removed group that has later groups after it keeps a no-op `true` command so those later hooks keep their approvals. Each event updates `~/.local/state/provenance/live/<harness>-<id>.json`: the harness process ID and its start time, the last event, and every folder and branch the session has been on. That gives the status marks described in [Reading the table](#reading-the-table).
 
 </details>
 
@@ -149,6 +166,9 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - **Stamps only cover commits made after install.**
 - **`go` and open OpenCode sessions.** OpenCode doesn't say which window holds a session, so `go` prints the resume command instead of switching to it.
 - **`go` in Ghostty** picks the terminal by folder, so with several terminals in one folder it picks the first.
+- **The Claude Code inbox socket's message format isn't documented.** `send` writes the line Claude Code's own debug hint shows, so a Claude Code update could change it.
+- **`send` reaches only CLI sessions that keep a process.** A Claude Code session whose process has moved to another session (`/clear`, `/resume`) is refused, and desktop apps that start a process per turn have no socket between turns.
+- **Codex may ask you to approve the provenance tools** the first time a session calls them.
 - **OpenCode and Pi record no git branch.** Without a stamp (or, for Pi, the extension's live records), a session is matched only on the branch its folder has checked out now, and only if it's the most recent session in that folder by any harness.
 
 ## Roadmap
@@ -156,8 +176,9 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - [x] `provenance prs` from existing session logs
 - [x] Commit stamps (including Claude Code on the web's) and live session status
 - [x] `provenance go`: switch to or reopen the session behind a PR
-- [ ] `provenance show` and `send` (steer a session through Singular)
-- [ ] An MCP server exposing the same functions to agents
+- [x] `provenance send` and an MCP server with `send` and `reply` tools (Claude Code and Codex)
+- [ ] `send` to OpenCode and Pi sessions
+- [ ] `provenance show`: a session's recent turns
 
 ## License
 
