@@ -225,6 +225,7 @@ pub fn run(action: Action) -> Result<()> {
                     argv.join(" ")
                 );
             }
+            eprintln!("Resuming in {}: {}", tilde(&cwd), argv.join(" "));
             let err = Command::new(&argv[0])
                 .args(&argv[1..])
                 .current_dir(&cwd)
@@ -232,6 +233,16 @@ pub fn run(action: Action) -> Result<()> {
             Err(err).with_context(|| format!("starting {}", argv[0]))
         }
         Action::Explain(why) => bail!("can't open this session: {why}"),
+    }
+}
+
+/// `path` with the home folder shown as `~`.
+fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && Path::new(path).starts_with(&home) => {
+            format!("~{}", &path[home.trim_end_matches('/').len()..])
+        }
+        _ => path.to_string(),
     }
 }
 

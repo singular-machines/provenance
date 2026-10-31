@@ -8,7 +8,7 @@
 
 [Quick start](#quick-start) · [Reading the table](#reading-the-table) · [How it works](#how-it-works) · [Install hooks](#install-hooks) · [Privacy](#privacy) · [Roadmap](#roadmap) · [License](#license)
 
-<img src="docs/demo.svg" alt="provenance prs: open PRs grouped by repository, each showing the app, harness and ID of its session and whether it is running or waiting for you" width="860">
+<img src="docs/demo.gif" alt="Typing provenance prs lists open PRs grouped by repository, each with the app, harness and ID of its session and whether it is running or waiting for you; then provenance go acme/storefront#896 resumes that PR's ended Claude Code session in its folder" width="860">
 
 </div>
 
