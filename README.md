@@ -79,7 +79,7 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 |---|---|---|
 | Claude Code | `~/.claude/projects/**/*.jsonl` | `gitBranch` and `cwd` on every message; `entrypoint` (`cli`, `claude-desktop`, `sdk-ts`) |
 | Codex | `~/.codex/sessions/**/*.jsonl` | `git.branch` and `git.repository_url` once, when the session starts; `originator` (`T3 Code`, `Codex Desktop`, `codex-tui`, …) |
-| OpenCode | `~/.local/share/opencode/opencode.db` (read with `sqlite3`, read-only) | The session's folder and its busy and idle times, but no git branch. A session is given the branch its folder has checked out now, and only if it's that folder's most recent session. |
+| OpenCode | `~/.local/share/opencode/opencode.db` (read with `sqlite3`, read-only) | The session's folder and its busy and idle times, but no git branch. A session is given the branch its folder has checked out now, and only if it's the most recent session in that folder by any harness. |
 
 - PRs whose head branch is a repository's configured default branch, `main`, `master` or the PR's own base are never branch-matched, because many unrelated sessions share those branches. Stamps still count.
 - The time at the end of each row is the session's last logged event, or the stamped commit's time for sessions not on this machine.
@@ -128,7 +128,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - **A repository's own `prepare-commit-msg` runs after provenance's.** One that rewrites the whole message would drop the stamp.
 - **Desktop apps start a new harness process per turn** (Conductor does; others may), so between turns a waiting session has no process of its own. The status relies on the last event for that reason.
 - **Stamps only cover commits made after install.**
-- **OpenCode records no git branch.** Without a stamp, an OpenCode session is matched only on the branch its folder has checked out now, and only if it's that folder's most recent session.
+- **OpenCode records no git branch.** Without a stamp, an OpenCode session is matched only on the branch its folder has checked out now, and only if it's the most recent session in that folder by any harness.
 
 ## Roadmap
 

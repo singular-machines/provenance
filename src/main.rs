@@ -175,10 +175,8 @@ fn prs(
     );
     let fetched = fetched?;
     sightings.extend(live::sightings(&records));
-    sightings.extend(sessions::opencode_sightings(
-        &opencode,
-        sessions::current_branch,
-    ));
+    sightings.extend(sessions::opencode_sightings(&opencode));
+    sessions::give_folder_branches(&mut sightings, sessions::current_branch);
     let folders = matching::resolve_folders(&fetched.prs, &sightings);
     let mut rows = matching::match_prs_with(fetched.prs, &sightings, &folders);
 

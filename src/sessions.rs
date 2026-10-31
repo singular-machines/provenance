@@ -380,45 +380,59 @@ pub fn opencode_sessions(db: &Path) -> Vec<OpenCodeSession> {
     }
 }
 
-/// OpenCode doesn't record git branches, so a session's branch is the one its
-/// folder has checked out now, given only to the folder's most recent session:
-/// older sessions there may have worked on other branches.
-pub fn opencode_sightings(
-    sessions: &[OpenCodeSession],
-    branch_of: impl Fn(&str) -> Option<String>,
-) -> Vec<Sighting> {
-    let mut latest: HashMap<&str, &OpenCodeSession> = HashMap::new();
-    for s in sessions {
-        let e = latest.entry(&s.directory).or_insert(s);
-        if s.time_updated > e.time_updated {
-            *e = s;
-        }
-    }
+/// OpenCode records no git branch; [`give_folder_branches`] fills it in.
+pub fn opencode_sightings(sessions: &[OpenCodeSession]) -> Vec<Sighting> {
     sessions
         .iter()
         .filter_map(|s| {
-            let last_seen = DateTime::from_timestamp_millis(s.time_updated)?;
-            let newest = latest
-                .get(s.directory.as_str())
-                .is_some_and(|l| l.id == s.id);
             Some(Sighting {
                 harness: Harness::OpenCode,
                 session_id: s.id.clone(),
                 app: app_from_path(&s.directory).unwrap_or("OpenCode").into(),
                 cwd: s.directory.clone(),
-                branch: if newest {
-                    branch_of(&s.directory).unwrap_or_default()
-                } else {
-                    String::new()
-                },
+                branch: String::new(),
                 repo_url: None,
-                last_seen,
+                last_seen: DateTime::from_timestamp_millis(s.time_updated)?,
                 log_path: None,
                 machine: None,
                 url: None,
             })
         })
         .collect()
+}
+
+/// Harnesses whose sessions record no git branch.
+fn records_no_branch(h: Harness) -> bool {
+    matches!(h, Harness::OpenCode)
+}
+
+/// For sessions of harnesses that record no git branch: the folder's current
+/// branch, given only when that session is the most recent activity in the
+/// folder by any harness. An older session, or one followed by another
+/// harness's session in the same folder, may have worked on another branch.
+pub fn give_folder_branches(
+    sightings: &mut [Sighting],
+    branch_of: impl Fn(&str) -> Option<String>,
+) {
+    let mut latest: HashMap<&str, usize> = HashMap::new();
+    for (i, s) in sightings.iter().enumerate() {
+        if s.cwd.is_empty() {
+            continue;
+        }
+        let e = latest.entry(&s.cwd).or_insert(i);
+        if s.last_seen > sightings[*e].last_seen {
+            *e = i;
+        }
+    }
+    let give: Vec<usize> = latest
+        .into_values()
+        .filter(|&i| records_no_branch(sightings[i].harness) && sightings[i].branch.is_empty())
+        .collect();
+    for i in give {
+        if let Some(b) = branch_of(&sightings[i].cwd) {
+            sightings[i].branch = b;
+        }
+    }
 }
 
 /// The branch checked out in a folder, if it exists and isn't detached.
@@ -447,13 +461,22 @@ mod tests {
     }
 
     #[test]
-    fn opencode_branch_goes_to_the_folders_latest_session_only() {
+    fn folder_branch_goes_to_the_folders_latest_session_only() {
         let sessions = [
             oc("ses_old", "/r", 1_000),
             oc("ses_new", "/r", 2_000),
             oc("ses_x", "/x", 500),
+            oc("ses_y", "/y", 500),
         ];
-        let got = opencode_sightings(&sessions, |d| (d == "/r").then(|| "feat".to_string()));
+        let mut got = opencode_sightings(&sessions);
+        // Another harness worked in /y after the OpenCode session there.
+        let mut later = got[3].clone();
+        later.harness = Harness::ClaudeCode;
+        later.session_id = "claude".into();
+        later.branch = "other".into();
+        later.last_seen = DateTime::from_timestamp_millis(900).unwrap();
+        got.push(later);
+        give_folder_branches(&mut got, |_| Some("feat".to_string()));
         let branch = |id: &str| {
             got.iter()
                 .find(|s| s.session_id == id)
@@ -463,10 +486,17 @@ mod tests {
         };
         assert_eq!(branch("ses_new"), "feat");
         assert_eq!(branch("ses_old"), "");
-        assert_eq!(branch("ses_x"), "");
+        assert_eq!(branch("ses_x"), "feat");
+        assert_eq!(
+            branch("ses_y"),
+            "",
+            "a later session by another harness in /y"
+        );
+        assert_eq!(branch("claude"), "other");
         assert_eq!(got[1].last_seen.timestamp_millis(), 2_000);
         assert!(
-            got.iter()
+            got[..4]
+                .iter()
                 .all(|s| s.harness == Harness::OpenCode && s.app == "OpenCode")
         );
     }
