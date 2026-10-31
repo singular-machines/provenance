@@ -45,8 +45,22 @@ provenance install      # optional: exact stamps and live status
 | `provenance prs --verbose` | Also count matches by stamp, repo and folder path |
 | `provenance prs --json` | Every matching session per PR, for scripts and agents |
 | `provenance prs --refresh` | Search GitHub now instead of using the 2-minute cache |
+| `provenance go <PR>` | Open the session behind a PR (`123`, `owner/name#123` or a PR URL) |
+| `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
+
+### Where `go` takes you
+
+| Session | What `go` does |
+|---|---|
+| Running or waiting in a terminal | Switches to its tab: by tty in Terminal and iTerm2, by folder in Ghostty, otherwise brings the terminal app forward. Never starts a second copy. |
+| Ended, stopped or unknown, from a CLI | Resumes it in its folder: `claude --resume`, `codex resume`, `opencode -s` or `pi --session` |
+| T3 Code | Opens the thread in T3 Code |
+| Claude desktop | Opens the session in the Claude app with `claude://code/continue` (untested; archived sessions can't be opened this way) |
+| Claude Code on the web | Opens its claude.ai link |
+| Conductor, Codex desktop | Brings the app forward; neither has a link to one session |
+| Another machine | Says which machine it ran on |
 
 ## Reading the table
 
@@ -129,13 +143,16 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - **A repository's own `prepare-commit-msg` runs after provenance's.** One that rewrites the whole message would drop the stamp.
 - **Desktop apps start a new harness process per turn** (Conductor does; others may), so between turns a waiting session has no process of its own. The status relies on the last event for that reason.
 - **Stamps only cover commits made after install.**
+- **`go` and open OpenCode sessions.** OpenCode doesn't say which window holds a session, so `go` prints the resume command instead of switching to it.
+- **`go` in Ghostty** picks the terminal by folder, so with several terminals in one folder it picks the first.
 - **OpenCode and Pi record no git branch.** Without a stamp (or, for Pi, the extension's live records), a session is matched only on the branch its folder has checked out now, and only if it's the most recent session in that folder by any harness.
 
 ## Roadmap
 
 - [x] `provenance prs` from existing session logs
 - [x] Commit stamps (including Claude Code on the web's) and live session status
-- [ ] `provenance show`, `go` (reopen the session) and `send` (steer it through Singular)
+- [x] `provenance go`: switch to or reopen the session behind a PR
+- [ ] `provenance show` and `send` (steer a session through Singular)
 - [ ] An MCP server exposing the same functions to agents
 
 ## License

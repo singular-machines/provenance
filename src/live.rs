@@ -204,7 +204,7 @@ pub fn opencode_running() -> bool {
 }
 
 /// `(ppid, start time, command path)` for one process.
-fn ps_info(pid: u32) -> Option<(u32, String, String)> {
+pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
     let out = Command::new("ps")
         .args([
             "-o",
@@ -326,18 +326,19 @@ pub fn load_records(home: &Path) -> Vec<Record> {
         .collect()
 }
 
-/// Which recorded processes are still the same process: one `ps` call.
-pub fn alive_pids(records: &[Record]) -> HashMap<u32, bool> {
+/// Start times of the recorded processes that still exist, by PID: one `ps`
+/// call. A record's process is alive only if its own start time matches, so a
+/// reused PID never vouches for an older record.
+pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
     let pids: Vec<String> = records
         .iter()
         .filter_map(|r| r.pid)
         .map(|p| p.to_string())
         .collect();
-    let mut alive: HashMap<u32, bool> = HashMap::new();
     if pids.is_empty() {
-        return alive;
+        return HashMap::new();
     }
-    let started: HashMap<u32, String> = Command::new("ps")
+    Command::new("ps")
         .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
         .output()
         .map(|o| {
@@ -350,17 +351,14 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, bool> {
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    for r in records {
-        if let (Some(pid), Some(want)) = (r.pid, &r.pid_started) {
-            alive.insert(pid, started.get(&pid) == Some(want));
-        }
-    }
-    alive
+        .unwrap_or_default()
 }
 
-pub fn is_alive(r: &Record, alive: &HashMap<u32, bool>) -> bool {
-    r.pid.and_then(|p| alive.get(&p).copied()).unwrap_or(false)
+pub fn is_alive(r: &Record, started: &HashMap<u32, String>) -> bool {
+    match (r.pid, &r.pid_started) {
+        (Some(pid), Some(want)) => started.get(&pid) == Some(want),
+        _ => false,
+    }
 }
 
 /// Branch sightings from live records: these cover branches a session moved
@@ -550,5 +548,28 @@ mod tests {
                 ("/b".to_string(), "other-feature".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn a_reused_pid_vouches_only_for_its_own_record() {
+        let rec = |started: &str| Record {
+            harness: Harness::ClaudeCode,
+            session_id: started.into(),
+            app: "CLI".into(),
+            cwd: "/tmp".into(),
+            pid: Some(42),
+            pid_started: Some(started.into()),
+            last_event: "UserPromptSubmit".into(),
+            updated: Utc::now(),
+            branches: Vec::new(),
+            transcript_path: None,
+        };
+        let (old, new) = (
+            rec("Mon Oct 26 10:00:00 2026"),
+            rec("Sat Oct 31 10:00:00 2026"),
+        );
+        let started = HashMap::from([(42, "Sat Oct 31 10:00:00 2026".to_string())]);
+        assert!(is_alive(&new, &started));
+        assert!(!is_alive(&old, &started));
     }
 }
