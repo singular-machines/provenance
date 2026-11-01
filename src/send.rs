@@ -193,6 +193,67 @@ fn run(cmd: &mut Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The session to message among a PR's matched sessions (newest first): the
+/// newest one that can take a message now; failing that, with `resume`, the
+/// newest one that can be resumed. `plan` gives each session's delivery for a
+/// given `resume`. On failure, says why each session was passed over.
+pub fn choose<'a>(
+    sessions: &'a [SessionMatch],
+    resume: bool,
+    plan: &dyn Fn(&SessionMatch, bool) -> Delivery,
+) -> std::result::Result<(&'a SessionMatch, Delivery), String> {
+    let mut why = Vec::new();
+    for m in sessions {
+        match plan(m, false) {
+            Delivery::Refuse(reason) => why.push((m, reason)),
+            d => return Ok((m, d)),
+        }
+    }
+    if resume
+        && let Some((m, d)) = sessions
+            .iter()
+            .map(|m| (m, plan(m, true)))
+            .find(|(_, d)| matches!(d, Delivery::Resume { .. }))
+    {
+        return Ok((m, d));
+    }
+    if why.is_empty() {
+        return Err("no session found".into());
+    }
+    let lines: Vec<String> = why
+        .iter()
+        .map(|(m, reason)| {
+            let s = &m.sighting;
+            format!(
+                "  {} session {} ({}{}): {reason}",
+                harness_name(s.harness),
+                s.session_id,
+                if s.app.is_empty() {
+                    "unknown app"
+                } else {
+                    &s.app
+                },
+                m.state
+                    .map(|st| format!(", {}", crate::render::state_word(st)))
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    let resumable = !resume
+        && sessions
+            .iter()
+            .any(|m| matches!(plan(m, true), Delivery::Resume { .. }));
+    Err(format!(
+        "no matched session can take a message now:\n{}{}",
+        lines.join("\n"),
+        if resumable {
+            "\n(add --resume to resume one headless)"
+        } else {
+            ""
+        }
+    ))
+}
+
 /// How the delivery is described to the sender.
 pub fn describe(d: &Delivery) -> &'static str {
     match d {
@@ -414,6 +475,44 @@ mod tests {
             plan(&far, Process::Live(7), true, Some("here"), &a_socket),
             Delivery::Refuse(_)
         ));
+    }
+
+    #[test]
+    fn the_newest_deliverable_session_is_chosen() {
+        let mut opencode = session(Harness::OpenCode, Some(State::Waiting));
+        opencode.sighting.session_id = "oc".into();
+        let mut ended = session(Harness::ClaudeCode, Some(State::Ended));
+        ended.sighting.session_id = "old".into();
+        let mut live = session(Harness::Codex, Some(State::Waiting));
+        live.sighting.session_id = "live".into();
+        // Newest first: a guessed-waiting OpenCode session doesn't win over a live Codex one.
+        let sessions = [ended.clone(), opencode.clone(), live];
+        let fake = |m: &SessionMatch, resume: bool| match m.sighting.session_id.as_str() {
+            "live" => Delivery::CodexQueue("live".into()),
+            "old" if resume => Delivery::Resume {
+                cwd: "/w".into(),
+                argv: vec![],
+            },
+            _ => Delivery::Refuse("not now".into()),
+        };
+        let (m, d) = choose(&sessions, false, &fake).unwrap();
+        assert_eq!(m.sighting.session_id, "live");
+        assert_eq!(d, Delivery::CodexQueue("live".into()));
+
+        let none_live = [ended, opencode];
+        let err = choose(&none_live, false, &fake).unwrap_err();
+        assert!(err.contains("Claude session old (Terminal, ended): not now"));
+        assert!(err.contains("OpenCode session oc"));
+        assert!(err.ends_with("(add --resume to resume one headless)"));
+        let only_opencode = [none_live[1].clone()];
+        assert!(
+            !choose(&only_opencode, false, &fake)
+                .unwrap_err()
+                .contains("--resume")
+        );
+        let (m, _) = choose(&none_live, true, &fake).unwrap();
+        assert_eq!(m.sighting.session_id, "old");
+        assert_eq!(choose(&[], true, &fake).unwrap_err(), "no session found");
     }
 
     #[test]

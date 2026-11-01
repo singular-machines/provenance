@@ -441,28 +441,32 @@ fn send_message(
     author: &str,
 ) -> Result<Sent> {
     let (repo, number, loaded, row) = resolve(home, pr, author)?;
-    let Some(m) = render::pick(&loaded.rows[row]) else {
-        anyhow::bail!("no session found for {repo}#{number}");
+    let sender = current_session(&loaded.records);
+    let machine = stamps::machine_name();
+    let plan = |m: &matching::SessionMatch, resume: bool| {
+        let s = &m.sighting;
+        if sender
+            .as_ref()
+            .is_some_and(|me| me.harness == s.harness && me.session_id == s.session_id)
+        {
+            return send::Delivery::Refuse("it's this session".into());
+        }
+        send::plan(
+            m,
+            process_of(&loaded, m),
+            resume,
+            machine.as_deref(),
+            &|pid, id| send::claude_socket(home, pid, id),
+        )
     };
+    let (m, delivery) = send::choose(&loaded.rows[row].sessions, resume, &plan).map_err(|why| {
+        anyhow::anyhow!("can't message the session behind {repo}#{number}: {why}")
+    })?;
     let s = &m.sighting;
     let target = send::Sender {
         harness: s.harness,
         session_id: s.session_id.clone(),
     };
-    let sender = current_session(&loaded.records);
-    if sender.as_ref() == Some(&target) {
-        anyhow::bail!("{repo}#{number} belongs to this session");
-    }
-    let delivery = send::plan(
-        m,
-        process_of(&loaded, m),
-        resume,
-        stamps::machine_name().as_deref(),
-        &|pid, id| send::claude_socket(home, pid, id),
-    );
-    if let send::Delivery::Refuse(why) = &delivery {
-        anyhow::bail!("can't message the session behind {repo}#{number}: {why}");
-    }
     let id = send::new_id();
     let pr = format!("{repo}#{number}");
     let from = label(sender.as_ref());
