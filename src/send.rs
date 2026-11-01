@@ -209,13 +209,16 @@ pub fn choose<'a>(
             d => return Ok((m, d)),
         }
     }
-    if resume
-        && let Some((m, d)) = sessions
-            .iter()
-            .map(|m| (m, plan(m, true)))
-            .find(|(_, d)| matches!(d, Delivery::Resume { .. }))
-    {
-        return Ok((m, d));
+    if resume {
+        // Passed over for resuming too: give those reasons, not "add --resume".
+        why.clear();
+        for m in sessions {
+            match plan(m, true) {
+                d @ Delivery::Resume { .. } => return Ok((m, d)),
+                Delivery::Refuse(reason) => why.push((m, reason)),
+                _ => {}
+            }
+        }
     }
     if why.is_empty() {
         return Err("no session found".into());
@@ -513,6 +516,20 @@ mod tests {
         let (m, _) = choose(&none_live, true, &fake).unwrap();
         assert_eq!(m.sighting.session_id, "old");
         assert_eq!(choose(&[], true, &fake).unwrap_err(), "no session found");
+
+        // With --resume and nothing resumable, the reasons are the resume ones.
+        let resume_reasons = |_: &SessionMatch, resume: bool| {
+            Delivery::Refuse(
+                if resume {
+                    "its folder isn't known"
+                } else {
+                    "add --resume"
+                }
+                .into(),
+            )
+        };
+        let err = choose(&none_live, true, &resume_reasons).unwrap_err();
+        assert!(err.contains("its folder isn't known") && !err.contains("--resume"));
     }
 
     #[test]

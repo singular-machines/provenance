@@ -19,10 +19,12 @@ You run Claude Code, Codex, OpenCode and Pi in lots of apps: the terminal, Claud
 | | Claude Code | Codex | OpenCode | Pi |
 |---|---|---|---|---|
 | `prs`: the session behind each PR | Yes | Yes | Yes | Yes |
-| Live status | With `install` | With `install` | Yes, from its database | With `install` |
-| `go`: switch to a running session | Yes | Yes | No: prints the resume command | Yes |
+| Live status | With `install` | With `install` | From its database, guessing "waiting" while any `opencode` runs | With `install` |
+| `go`: switch to a running session | With `install` | With `install` | No: prints the resume command | With `install` |
 | `go`: resume an ended session | Yes | Yes | Yes | Yes |
-| `send`: message the session | Yes | Yes | Not yet | Not yet |
+| `send`: message the session | With `install` | With `install` | Not yet | Not yet |
+
+Without `install`, provenance can't tell that a session is running, so `go` resumes it (a second copy) and `send` refuses it.
 
 ## Highlights
 
