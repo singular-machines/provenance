@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthStr;
 
+use crate::github::PrState;
 use crate::live::State;
 use crate::matching::{MatchKind, PrRow, SessionMatch};
 use crate::sessions::Harness;
@@ -210,7 +211,7 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
             .iter()
             .filter(|r| state(r) == Some(State::Waiting))
             .count();
-        let mut counts = vec![format!("{} open", group.len())];
+        let mut counts = state_counts(group);
         if running > 0 {
             counts.push(format!("{running} running"));
         }
@@ -235,7 +236,11 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
                 style.link(&r.pr.url, &style.paint(if live { BOLD } else { "" }, &num)),
                 " ".repeat(num_w - num.len())
             );
-            let title = pad(&truncate(&r.pr.title, title_w), title_w);
+            let title = match r.pr.state {
+                PrState::Open => r.pr.title.clone(),
+                done => format!("[{}] {}", state_name(done), r.pr.title),
+            };
+            let title = pad(&truncate(&title, title_w), title_w);
             let title = match st {
                 Some(State::Waiting) => style.paint(BOLD, &title),
                 _ if live => title,
@@ -307,6 +312,25 @@ pub fn state_word(s: State) -> &'static str {
     }
 }
 
+fn state_name(s: PrState) -> &'static str {
+    match s {
+        PrState::Open => "open",
+        PrState::Merged => "merged",
+        PrState::Closed => "closed",
+    }
+}
+
+/// "3 open", or "2 merged · 1 open" when a list mixes states.
+fn state_counts(group: &[&PrRow]) -> Vec<String> {
+    [PrState::Open, PrState::Merged, PrState::Closed]
+        .iter()
+        .filter_map(|&s| {
+            let n = group.iter().filter(|r| r.pr.state == s).count();
+            (n > 0).then(|| format!("{n} {}", state_name(s)))
+        })
+        .collect()
+}
+
 fn footer(rows: &[PrRow], repos: usize, style: &Style, cached: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     for (s, text) in [
@@ -330,8 +354,13 @@ fn footer(rows: &[PrRow], repos: usize, style: &Style, cached: Option<&str>) -> 
     if repos > 1 {
         let none = rows.len() - matched.len();
         let total = format!(
-            "{} open PRs in {repos} repos{}",
+            "{} {}PRs in {repos} repos{}",
             rows.len(),
+            if rows.iter().all(|r| r.pr.state == PrState::Open) {
+                "open "
+            } else {
+                ""
+            },
             if none > 0 {
                 format!(" · {none} with no session found")
             } else {
@@ -433,6 +462,7 @@ mod tests {
                 repo: repo.into(),
                 head_repo: None,
                 number,
+                state: PrState::Open,
                 title: title.into(),
                 url: format!("https://github.com/{repo}/pull/{number}"),
                 head_branch: "feat".into(),
@@ -535,6 +565,19 @@ example/web                                                                     
 5 open PRs in 3 repos · 1 with no session found  ·  ● running  ◐ waiting for you  ~ matched by branch, not stamped  ·  cached 9s ago (--refresh)
 ";
         assert_eq!(got, want, "\n{got}");
+    }
+
+    #[test]
+    fn marks_merged_and_closed_prs() {
+        let mut rows = sample();
+        rows[0].pr.state = PrState::Merged;
+        rows[1].pr.state = PrState::Closed;
+        let out = render(&rows, now(), &plain(None), None);
+        assert!(out.contains("[merged] Ask before rebuilding"), "{out}");
+        assert!(out.contains("[closed] "), "{out}");
+        assert!(out.contains("1 merged"), "{out}");
+        assert!(out.contains("2 open · 1 closed"), "{out}");
+        assert!(!out.contains("open PRs in"), "{out}");
     }
 
     #[test]

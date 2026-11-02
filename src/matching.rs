@@ -297,6 +297,7 @@ mod tests {
             repo: repo.into(),
             head_repo: head_repo.map(Into::into),
             number: 1,
+            state: crate::github::PrState::Open,
             title: "t".into(),
             url: "u".into(),
             head_branch: branch.into(),
@@ -346,6 +347,27 @@ mod tests {
         assert!(is_default_branch(&p));
         p.head_branch = "nazreen/feat".into();
         assert!(!is_default_branch(&p));
+    }
+
+    #[test]
+    fn merged_pr_with_deleted_branch_still_matches_by_branch() {
+        let mut p = pr("o/r", None, "nazreen/feat");
+        p.state = crate::github::PrState::Merged;
+        assert!(
+            !is_default_branch(&p),
+            "a merged PR's branch still identifies it"
+        );
+        let rows = match_prs(
+            vec![p],
+            &[sighting(
+                "s1",
+                "nazreen/feat",
+                Some("https://github.com/o/r"),
+                1,
+            )],
+        );
+        assert_eq!(rows[0].sessions.len(), 1);
+        assert_eq!(rows[0].sessions[0].sighting.session_id, "s1");
     }
 
     #[test]

@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List open PRs with the last known session that worked on each.
+    /// List PRs (open by default) with the last known session that worked on each.
     Prs {
         /// Only this repository (owner/name).
         #[arg(long)]
@@ -38,6 +38,9 @@ enum Cmd {
         /// GitHub author to search for.
         #[arg(long, default_value = "@me")]
         author: String,
+        /// Which PRs to list. Merged, closed and all show the newest 100.
+        #[arg(long, value_enum, default_value = "open")]
+        state: github::StateFilter,
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -48,13 +51,10 @@ enum Cmd {
         #[arg(long, short)]
         verbose: bool,
     },
-    /// Open the session behind a PR: switch to it if it's running, else resume it.
+    /// Open the session behind a PR (open, merged or closed): switch to it if it's running, else resume it.
     Go {
         /// PR number (in this folder's repository), owner/name#number or PR URL.
         pr: String,
-        /// GitHub author of the PR.
-        #[arg(long, default_value = "@me")]
-        author: String,
         /// Print what would be run instead of running it.
         #[arg(long)]
         print: bool,
@@ -68,9 +68,6 @@ enum Cmd {
         pr: String,
         /// The message.
         message: String,
-        /// GitHub author of the PR.
-        #[arg(long, default_value = "@me")]
-        author: String,
         /// If the session isn't running, resume it headless to answer.
         #[arg(long)]
         resume: bool,
@@ -128,18 +125,18 @@ fn main() -> Result<()> {
         Cmd::Prs {
             repo,
             author,
+            state,
             json,
             refresh,
             verbose,
-        } => prs(&home()?, repo, &author, json, refresh, verbose),
-        Cmd::Go { pr, author, print } => go(&home()?, &pr, &author, print),
+        } => prs(&home()?, repo, &author, state, json, refresh, verbose),
+        Cmd::Go { pr, print } => go(&home()?, &pr, print),
         Cmd::Send {
             pr,
             message,
-            author,
             resume,
             wait,
-        } => send_cmd(&home()?, &pr, &message, &author, resume, wait),
+        } => send_cmd(&home()?, &pr, &message, resume, wait),
         Cmd::Mcp => mcp::serve(&McpTools { home: home()? }),
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
@@ -191,7 +188,7 @@ fn report(lines: Vec<String>, dry_run: bool) {
     }
 }
 
-/// Open PRs matched to sessions, with session states filled in.
+/// PRs matched to sessions, with session states filled in.
 struct Loaded {
     fetched: github::Fetched,
     rows: Vec<PrRow>,
@@ -202,13 +199,11 @@ struct Loaded {
 
 fn load(
     home: &std::path::Path,
-    search: &str,
-    refresh: bool,
-    now: chrono::DateTime<Utc>,
+    fetch: impl FnOnce(&std::path::Path) -> Result<github::Fetched> + Send,
 ) -> Result<Loaded> {
     let cache_dir = cache::dir(home);
     let (fetched, ((mut sightings, records), opencode)) = rayon::join(
-        || github::open_prs(search, &cache_dir, refresh, now),
+        || fetch(&cache_dir),
         || {
             rayon::join(
                 || {
@@ -268,6 +263,7 @@ fn prs(
     home: &std::path::Path,
     repo: Option<String>,
     author: &str,
+    state: github::StateFilter,
     json: bool,
     refresh: bool,
     verbose: bool,
@@ -279,7 +275,12 @@ fn prs(
     let now = Utc::now();
     let Loaded {
         fetched, mut rows, ..
-    } = load(home, &search, refresh, now)?;
+    } = load(home, |dir| {
+        github::list_prs(&search, state, dir, refresh, now)
+    })?;
+    if state != github::StateFilter::Open && rows.len() >= github::HISTORY_LIMIT {
+        eprintln!("showing the newest {} PRs", github::HISTORY_LIMIT);
+    }
 
     rows.sort_by(|a, b| {
         let last = |r: &PrRow| r.sessions.first().map(|m| m.sighting.last_seen);
@@ -296,7 +297,13 @@ fn prs(
             anyhow::bail!("no repository {r} on GitHub (or `gh` can't see it)");
         }
         let place = repo.map(|r| format!(" in {r}")).unwrap_or_default();
-        println!("No open PRs by {author}{place}.");
+        let kind = match state {
+            github::StateFilter::All => "",
+            github::StateFilter::Open => "open ",
+            github::StateFilter::Merged => "merged ",
+            github::StateFilter::Closed => "closed ",
+        };
+        println!("No {kind}PRs by {author}{place}.");
     } else {
         let cached = fetched
             .from_cache
@@ -314,21 +321,17 @@ fn prs(
     Ok(())
 }
 
-/// The open PR named by `pr`, with sessions loaded: its repo, number and row.
-fn resolve(home: &std::path::Path, pr: &str, author: &str) -> Result<(String, u64, Loaded, usize)> {
+/// The PR named by `pr`, in any state and by any author, with sessions
+/// loaded: its repo, number and row.
+fn resolve(home: &std::path::Path, pr: &str) -> Result<(String, u64, Loaded, usize)> {
     let (repo, number) = go::parse_pr(pr)?;
     let repo = match repo {
         Some(r) => r,
         None => go::current_repo()?,
     };
-    let search = format!("author:{author} repo:{repo}");
-    let mut loaded = load(home, &search, false, Utc::now())?;
-    // A PR opened in the last two minutes may be missing from a cached list.
-    if !loaded.rows.iter().any(|r| r.pr.number == number) && loaded.fetched.from_cache {
-        loaded = load(home, &search, true, Utc::now())?;
-    }
+    let loaded = load(home, |dir| github::one_pr(&repo, number, dir, Utc::now()))?;
     let Some(row) = loaded.rows.iter().position(|r| r.pr.number == number) else {
-        anyhow::bail!("{repo}#{number} isn't an open PR by {author} (try --author)");
+        anyhow::bail!("no PR {repo}#{number}");
     };
     Ok((repo, number, loaded, row))
 }
@@ -362,8 +365,8 @@ fn process_of(loaded: &Loaded, m: &matching::SessionMatch) -> go::Process {
     }
 }
 
-fn go(home: &std::path::Path, pr: &str, author: &str, print: bool) -> Result<()> {
-    let (repo, number, loaded, row) = resolve(home, pr, author)?;
+fn go(home: &std::path::Path, pr: &str, print: bool) -> Result<()> {
+    let (repo, number, loaded, row) = resolve(home, pr)?;
     let Some(m) = render::pick(&loaded.rows[row]) else {
         anyhow::bail!("no session found for {repo}#{number}");
     };
@@ -433,14 +436,8 @@ struct Sent {
     from_session: bool,
 }
 
-fn send_message(
-    home: &std::path::Path,
-    pr: &str,
-    text: &str,
-    resume: bool,
-    author: &str,
-) -> Result<Sent> {
-    let (repo, number, loaded, row) = resolve(home, pr, author)?;
+fn send_message(home: &std::path::Path, pr: &str, text: &str, resume: bool) -> Result<Sent> {
+    let (repo, number, loaded, row) = resolve(home, pr)?;
     let sender = current_session(&loaded.records);
     let machine = stamps::machine_name();
     let plan = |m: &matching::SessionMatch, resume: bool| {
@@ -498,11 +495,10 @@ fn send_cmd(
     home: &std::path::Path,
     pr: &str,
     text: &str,
-    author: &str,
     resume: bool,
     wait: Option<u64>,
 ) -> Result<()> {
-    let sent = send_message(home, pr, text, resume, author)?;
+    let sent = send_message(home, pr, text, resume)?;
     println!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
     if !sent.output.is_empty() {
         println!("{}", sent.output);
@@ -561,8 +557,8 @@ struct McpTools {
 }
 
 impl mcp::Tools for McpTools {
-    fn send(&self, pr: &str, text: &str, resume: bool, author: &str) -> Result<String> {
-        let sent = send_message(&self.home, pr, text, resume, author)?;
+    fn send(&self, pr: &str, text: &str, resume: bool) -> Result<String> {
+        let sent = send_message(&self.home, pr, text, resume)?;
         let mut out = format!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
         out.push_str(if sent.from_session {
             " Its answer will arrive in this session as a \"[provenance] Reply\" message."
