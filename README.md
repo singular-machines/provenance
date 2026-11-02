@@ -52,10 +52,11 @@ provenance install      # optional: exact stamps and live status
 | `provenance prs` | Your open PRs across GitHub |
 | `provenance prs --repo owner/name` | One repository |
 | `provenance prs --author someone` | Someone else's PRs |
+| `provenance prs --state merged` | Merged PRs instead (`closed` or `all` too; the newest 100) |
 | `provenance prs --verbose` | Also count matches by stamp, repo and folder path |
 | `provenance prs --json` | Every matching session per PR, for scripts and agents |
 | `provenance prs --refresh` | Search GitHub now instead of using the 2-minute cache |
-| `provenance go <PR>` | Open the session behind a PR (`123`, `owner/name#123` or a PR URL) |
+| `provenance go <PR>` | Open the session behind a PR (`123`, `owner/name#123` or a PR URL), open or merged, by anyone |
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
 | `provenance send <PR> "message" --wait` | Also wait for its reply (default up to 300 seconds) |
@@ -105,11 +106,11 @@ PRs are grouped by repository, live sessions first. Each row reads: status, PR, 
 | dimmed row | No live session |
 | `~` | Matched by branch, not by a commit stamp |
 
-Status marks need [`provenance install`](#install-hooks) for Claude Code, Codex and Pi. OpenCode sessions get them from OpenCode's own database, with nothing installed: an idle OpenCode session shows as waiting while OpenCode is running, and one left busy shows as stopped once no OpenCode process runs. OpenCode sessions never show as running, because a surviving OpenCode service can't tell provenance whether that session's turn is still going. In a terminal, PR numbers are links to the PRs, and web session IDs link to the sessions. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
+Status marks need [`provenance install`](#install-hooks) for Claude Code, Codex and Pi. OpenCode sessions get them from OpenCode's own database, with nothing installed: an idle OpenCode session shows as waiting while OpenCode is running, and one left busy shows as stopped once no OpenCode process runs. OpenCode sessions never show as running, because a surviving OpenCode service can't tell provenance whether that session's turn is still going. In a terminal, PR numbers are links to the PRs, and web session IDs link to the sessions. Merged and closed PRs are tagged `[merged]` or `[closed]`, and `--json` gives each PR's `state`. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
 
 ## How it works
 
-`provenance prs` lists your open PRs through `gh` and links each one to sessions in three ways, strongest first. The table marks `repo` and `path` matches with `~`; `--json` gives the `kind` of every match.
+`provenance prs` lists your open PRs through `gh` (or merged or closed ones with `--state`) and links each one to sessions in three ways, strongest first. The table marks `repo` and `path` matches with `~`; `--json` gives the `kind` of every match.
 
 | Match | How |
 |---|---|
