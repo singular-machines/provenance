@@ -147,6 +147,17 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 
 </details>
 
+### Without commit stamps
+
+The git hook is the only part of `install` that writes to git history. To keep live status, `go` and `send` without stamping, remove it after installing:
+
+```sh
+provenance install
+git config --global --remove-section hook.provenance
+```
+
+PRs are then matched by branch only (marked `~`), with the [Known gaps](#known-gaps) that stamps would cover. Running `install` again adds the hook back. `install` still needs a git that runs hooks defined in config, even if you remove the hook afterwards.
+
 ## Privacy
 
 > [!NOTE]
@@ -154,7 +165,7 @@ Branch matches come from the harnesses' own session logs, so they work with noth
 
 - `provenance machine <alias>` sets a name of your choice (letters, digits, `.`, `-`, `_`). `provenance machine` shows the current one.
 - `PROVENANCE_MACHINE` overrides it for one shell.
-- Stamps are part of commit history. On public repositories they publish the session ID and this machine name.
+- Stamps are part of commit history. On public repositories they publish the session ID and this machine name. The git hook is global, so it applies to every repository you commit to. To install without it, see [Without commit stamps](#without-commit-stamps).
 - Everything else stays on your machine: session logs are read locally, and nothing is sent anywhere except `gh` queries to GitHub.
 
 ## Speed
