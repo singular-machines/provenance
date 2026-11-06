@@ -183,6 +183,12 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
         .filter_map(|r| last_seen(r).map(|t| ago(t, now).len()))
         .max()
         .unwrap_or(0);
+    let opened_w = rows
+        .iter()
+        .map(|r| ago(r.pr.created_at, now).len())
+        .max()
+        .unwrap_or(0)
+        + 11;
     let longest_title = rows.iter().map(|r| width(&r.pr.title)).max().unwrap_or(0);
     // "  ● #927  " + title + "  " + place + "  " + harness + " " + id + " ~" + " " + ago
     let session_w = if sessions.iter().any(Option::is_some) {
@@ -190,7 +196,7 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
     } else {
         width("— no session found")
     };
-    let fixed = 2 + 1 + 1 + num_w + 2 + 2 + session_w + 1 + ago_w;
+    let fixed = 2 + 1 + 1 + num_w + 2 + 2 + session_w + 1 + ago_w + 2 + opened_w;
     let title_w = match style.width {
         Some(w) => w.saturating_sub(fixed).max(TITLE_MIN),
         None => TITLE_MAX,
@@ -276,10 +282,18 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
                     String::new(),
                 ),
             };
+            let opened = style.paint(
+                DIM,
+                &format!(
+                    "{:>opened_w$}",
+                    format!("opened {} ago", ago(r.pr.created_at, now))
+                ),
+            );
             let line = format!(
-                "  {} {}  {}  {} {}",
+                "  {} {}  {}  {}  {} {}",
                 style.paint(glyph_color(st), glyph(st)),
                 num,
+                opened,
                 title,
                 session,
                 when
@@ -463,6 +477,7 @@ mod tests {
                 head_repo: None,
                 number,
                 state: PrState::Open,
+                created_at: now() - Duration::days(2),
                 title: title.into(),
                 url: format!("https://github.com/{repo}/pull/{number}"),
                 head_branch: "feat".into(),
@@ -551,20 +566,38 @@ mod tests {
     fn groups_by_repo_with_live_sessions_first() {
         let got = render(&sample(), now(), &plain(Some(100)), Some("9s"));
         let want = "\
-acme/storefront                                            3 open · 1 running · 1 waiting
-  ● #927  docs: Release 3.1 (RC pinned before go)        T3 Code    Claude 7157cbf5    0s
-  ◐ #946  docs(releases): add release process explainer  T3 Code    Codex  01a17e4f    6m
-    #896  release: ledger hotfix                         T3 Code    Claude d361dde1 ~ 10h
+acme/storefront                                                       3 open · 1 running · 1 waiting
+  ● #927  opened 2d ago  docs: Release 3.1 (RC pinned before go)    T3 Code    Claude 7157cbf5    0s
+  ◐ #946  opened 2d ago  docs(releases): add release process expl…  T3 Code    Codex  01a17e4f    6m
+    #896  opened 2d ago  release: ledger hotfix                     T3 Code    Claude d361dde1 ~ 10h
 
-acme/api                                                                           1 open
-    #68   Ask before rebuilding the local cache          Conductor  Claude 7be310aa ~  3d
+acme/api                                                                                      1 open
+    #68   opened 2d ago  Ask before rebuilding the local cache      Conductor  Claude 7be310aa ~  3d
 
-example/web                                                                        1 open
-    #41   Bump deps                                      — no session found
+example/web                                                                                   1 open
+    #41   opened 2d ago  Bump deps                                  — no session found
 
 5 open PRs in 3 repos · 1 with no session found  ·  ● running  ◐ waiting for you  ~ matched by branch, not stamped  ·  cached 9s ago (--refresh)
 ";
         assert_eq!(got, want, "\n{got}");
+    }
+
+    #[test]
+    fn opened_age_is_independent_of_session_activity_and_survives_json() {
+        let mut rows = sample();
+        rows[2].pr.created_at = now() - Duration::hours(5);
+        let out = render(&rows, now(), &plain(None), None);
+        let line = out.lines().find(|l| l.contains("#927")).unwrap();
+        assert!(line.contains("opened 5h ago"), "{line}");
+        assert!(line.ends_with("0s"), "{line}");
+        assert!(
+            out.lines()
+                .find(|l| l.contains("#41"))
+                .unwrap()
+                .contains("opened 2d ago")
+        );
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[2]["created_at"], "2026-10-30T07:00:00Z");
     }
 
     #[test]
@@ -589,10 +622,7 @@ example/web                                                                     
                 .all(|l| l.chars().count() <= 80),
             "{got}"
         );
-        assert!(
-            got.contains("docs(releases): add release process…"),
-            "{got}"
-        );
+        assert!(got.contains("docs(releases): add …"), "{got}");
     }
 
     #[test]
@@ -648,6 +678,11 @@ example/web                                                                     
 
     #[test]
     fn formats_relative_time_and_truncates_by_char() {
+        assert_eq!(ago(now(), now()), "0s");
+        assert_eq!(ago(now() + Duration::hours(1), now()), "0s");
+        assert_eq!(ago(now() - Duration::seconds(59), now()), "59s");
+        assert_eq!(ago(now() - Duration::seconds(60), now()), "1m");
+        assert_eq!(ago(now() - Duration::hours(5), now()), "5h");
         assert_eq!(ago(now() - Duration::minutes(3), now()), "3m");
         assert_eq!(ago(now() - Duration::days(2), now()), "2d");
         assert_eq!(truncate("héllo world", 6), "héllo…");

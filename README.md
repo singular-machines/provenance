@@ -95,7 +95,15 @@ Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per
 
 ## Reading the table
 
-PRs are grouped by repository, live sessions first. Each row reads: status, PR, title, app, harness and session ID, then when the session was last active.
+PRs are grouped by repository, live sessions first. Each row reads: status, PR, when the PR was opened, title, app, harness and session ID, then when the session was last active. The opening age uses GitHub’s creation time and the same compact seconds/minutes/hours/days format as session activity (for example, `opened 0s ago`, `opened 5h ago`, or `opened 3d ago`).
+
+```text
+acme/storefront
+  ● #927  opened 2d ago  docs: Release 3.1  T3 Code  Claude 7157cbf5    0s
+    #941  opened 5h ago  Bump deps          — no session found
+```
+
+With `--json`, each row’s `created_at` contains the raw UTC timestamp (for example, `"2026-10-28T12:00:00Z"`). Older PR caches without creation times are fetched again automatically.
 
 | Mark | Meaning |
 |---|---|
