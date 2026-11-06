@@ -298,6 +298,7 @@ mod tests {
             head_repo: head_repo.map(Into::into),
             number: 1,
             state: crate::github::PrState::Open,
+            created_at: Utc::now(),
             title: "t".into(),
             url: "u".into(),
             head_branch: branch.into(),

@@ -75,6 +75,8 @@ pub struct PullRequest {
     /// Absent in lists cached before PR states were tracked: those were all open.
     #[serde(default)]
     pub state: PrState,
+    /// When GitHub opened the PR. Required so older caches are fetched again.
+    pub created_at: DateTime<Utc>,
     pub title: String,
     pub url: String,
     pub head_branch: String,
@@ -91,7 +93,7 @@ query($q: String!, $endCursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        id number state title url headRefName headRefOid baseRefName baseRefOid
+        id number state createdAt title url headRefName headRefOid baseRefName baseRefOid
         repository { nameWithOwner defaultBranchRef { name } }
         headRepository { nameWithOwner defaultBranchRef { name } }
       }
@@ -104,7 +106,7 @@ const PR_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number state title url headRefName headRefOid baseRefName baseRefOid
+      id number state createdAt title url headRefName headRefOid baseRefName baseRefOid
       repository { nameWithOwner defaultBranchRef { name } }
       headRepository { nameWithOwner defaultBranchRef { name } }
     }
@@ -157,6 +159,7 @@ struct Node {
     base_ref_oid: Option<String>,
     number: Option<u64>,
     state: Option<PrState>,
+    created_at: Option<DateTime<Utc>>,
     title: Option<String>,
     url: Option<String>,
     head_ref_name: Option<String>,
@@ -496,6 +499,7 @@ fn pull_request(n: Node) -> Option<PullRequest> {
         stamps: Vec::new(),
         number,
         state: n.state.unwrap_or_default(),
+        created_at: n.created_at?,
         title: n.title.unwrap_or_default(),
         url: n.url.unwrap_or_default(),
         head_branch: head,
@@ -511,16 +515,17 @@ mod tests {
     #[test]
     fn parses_concatenated_pages_and_skips_non_prs() {
         let text = r#"{"data":{"search":{"pageInfo":{"hasNextPage":true,"endCursor":"a"},"nodes":[
-            {"id":"PR_1","number":1,"title":"One","url":"u1","headRefName":"feat","headRefOid":"aaa","baseRefName":"main",
+            {"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","title":"One","url":"u1","headRefName":"feat","headRefOid":"aaa","baseRefName":"main",
              "repository":{"nameWithOwner":"o/r","defaultBranchRef":{"name":"develop"}},
              "headRepository":{"nameWithOwner":"me/r","defaultBranchRef":{"name":"main"}}},
             {}]}}}
             {"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-            {"id":"PR_2","number":2,"title":"Two","url":"u2","headRefName":"fix","headRefOid":"bbb","baseRefName":"main",
+            {"id":"PR_2","number":2,"createdAt":"2026-10-28T12:00:00Z","title":"Two","url":"u2","headRefName":"fix","headRefOid":"bbb","baseRefName":"main",
              "repository":{"nameWithOwner":"o/r"},"headRepository":null}]}}}"#;
         let prs = parse_pages(text).unwrap();
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].id, "PR_1");
+        assert_eq!(prs[0].created_at.to_rfc3339(), "2026-10-28T12:00:00+00:00");
         assert_eq!(prs[0].head_sha, "aaa");
         assert_eq!(prs[0].head_repo.as_deref(), Some("me/r"));
         assert_eq!(prs[0].default_branches, ["develop", "main"]);
@@ -551,7 +556,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
         let search = "author:@me";
         let pr = parse_pages(
-            r#"{"data":{"search":{"nodes":[{"id":"PR_1","number":1,"headRefName":"f","headRefOid":"a",
+            r#"{"data":{"search":{"nodes":[{"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","headRefName":"f","headRefOid":"a",
                "repository":{"nameWithOwner":"o/r"}}]}}}"#,
         )
         .unwrap();
@@ -574,15 +579,18 @@ mod tests {
     fn parses_pr_state_and_defaults_old_caches_to_open() {
         let prs = parse_pages(
             r#"{"data":{"search":{"nodes":[
-            {"id":"PR_1","number":1,"state":"MERGED","headRefName":"f","repository":{"nameWithOwner":"o/r"}},
-            {"id":"PR_2","number":2,"state":"CLOSED","headRefName":"g","repository":{"nameWithOwner":"o/r"}},
-            {"id":"PR_3","number":3,"headRefName":"h","repository":{"nameWithOwner":"o/r"}}]}}}"#,
+            {"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","state":"MERGED","headRefName":"f","repository":{"nameWithOwner":"o/r"}},
+            {"id":"PR_2","number":2,"createdAt":"2026-10-28T12:00:00Z","state":"CLOSED","headRefName":"g","repository":{"nameWithOwner":"o/r"}},
+            {"id":"PR_3","number":3,"createdAt":"2026-10-28T12:00:00Z","headRefName":"h","repository":{"nameWithOwner":"o/r"}}]}}}"#,
         )
         .unwrap();
         let states: Vec<PrState> = prs.iter().map(|p| p.state).collect();
         assert_eq!(states, [PrState::Merged, PrState::Closed, PrState::Open]);
         let json = serde_json::to_string(&prs[0]).unwrap();
         assert!(json.contains(r#""state":"merged""#));
+        assert!(json.contains(r#""created_at":"2026-10-28T12:00:00Z""#));
+        let without_creation = json.replace(r#""created_at":"2026-10-28T12:00:00Z","#, "");
+        assert!(serde_json::from_str::<PullRequest>(&without_creation).is_err());
         let old = json.replace(r#""state":"merged","#, "");
         let back: PullRequest = serde_json::from_str(&old).unwrap();
         assert_eq!(back.state, PrState::Open, "caches from before states");
@@ -590,7 +598,7 @@ mod tests {
 
     #[test]
     fn parses_one_pr_in_any_state() {
-        let text = r#"{"data":{"repository":{"pullRequest":{"id":"PR_9","number":9,"state":"MERGED",
+        let text = r#"{"data":{"repository":{"pullRequest":{"id":"PR_9","number":9,"createdAt":"2026-10-28T12:00:00Z","state":"MERGED",
             "headRefName":"gone","headRefOid":"abc","repository":{"nameWithOwner":"o/r"}}}}}"#;
         let prs = parse_one(text).unwrap();
         assert_eq!((prs[0].number, prs[0].state), (9, PrState::Merged));
@@ -638,7 +646,7 @@ mod tests {
     #[test]
     fn head_moved_between_queries_keeps_stamps() {
         let mut prs = parse_pages(
-            r#"{"data":{"search":{"nodes":[{"id":"PR_1","number":1,"headRefName":"f","headRefOid":"old",
+            r#"{"data":{"search":{"nodes":[{"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","headRefName":"f","headRefOid":"old",
                "baseRefOid":"b","repository":{"nameWithOwner":"o/r"}}]}}}"#,
         )
         .unwrap();
