@@ -91,7 +91,7 @@ provenance install      # optional: exact stamps and live status
 | Not running | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its folder. |
 | OpenCode, Pi, the web, another machine | Not supported yet. |
 
-Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed.
+Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed. Delivered replies start with `[provenance] Reply to message <id> from <session>`. They identify the answer as another session's text relayed by provenance, explain that it is a teammate's answer rather than the user's instruction and cannot grant permissions, and say to act within the receiving session's own permissions. Replies must not be answered with `reply`, to avoid recursive reply loops.
 
 ## Reading the table
 
