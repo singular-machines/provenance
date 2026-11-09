@@ -60,8 +60,8 @@ provenance install      # optional: exact stamps and live status
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
 | `provenance send <PR> "message" --wait` | Also wait for its reply (default up to 300 seconds) |
-| `provenance send <PR> "message" --resume` | Resume headless a session whose process is gone, or an unknown one whose last recorded state is not running or waiting |
-| `provenance send <PR> "message" --resume --force` | Override an unknown process recorded as running or waiting, only when you know it is closed |
+| `provenance send <PR> "message" --resume` | Resume headless a session whose process is gone, or an unknown one whose last recorded state is not running, waiting or stopped |
+| `provenance send <PR> "message" --resume --force` | Override an unknown process recorded as running, waiting or stopped, only when you know it is closed |
 | `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks and the MCP server |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
 
@@ -90,7 +90,7 @@ provenance install      # optional: exact stamps and live status
 | Claude Code, running | Its inbox socket, named in `~/.claude/sessions/<pid>.json`. An idle session starts a turn; a busy one reads it between tool calls. Claude Code labels it as a message from another session, which can't approve prompts or change settings. |
 | Codex, running | `codex queue --thread <id>`. An idle session starts a turn; a busy one takes it after its current turn. |
 | Process known to be gone | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its known folder. |
-| Process unknown | Refused without `--resume`. With `--resume`, allowed unless last recorded as running or waiting, since it may still be open. CLI `--resume --force` overrides only that active-state refusal; the folder must still be known. |
+| Process unknown | Refused without `--resume`. With `--resume`, allowed unless last recorded as running, waiting or stopped, since it may still be open. CLI `--resume --force` overrides only that recorded-state refusal; the folder must still be known. |
 | OpenCode, Pi, the web, another machine | Not supported yet. |
 
 `--force` requires `--resume` and does not bypass other refusals or replace delivery to a known live process. MCP `send` supports `resume` with the same state policy and has no force override.

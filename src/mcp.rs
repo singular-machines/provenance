@@ -94,7 +94,7 @@ fn tool_list() -> Value {
                 "properties": {
                     "pr": {"type": "string", "description": "PR number in this folder's repository, owner/name#number, or PR URL"},
                     "text": {"type": "string", "description": "The message"},
-                    "resume": {"type": "boolean", "description": "Resume headless if no live process is known, the folder is known, and an unknown process is not recorded as running or waiting. No force override. Default false."}
+                    "resume": {"type": "boolean", "description": "Resume headless if no live process is known, the folder is known, and an unknown process is not recorded as running, waiting or stopped. No force override. Default false."}
                 },
                 "required": ["pr", "text"]
             }

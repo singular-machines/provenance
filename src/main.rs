@@ -71,7 +71,7 @@ enum Cmd {
         /// Resume headless when no live process is known and the recorded state allows it.
         #[arg(long)]
         resume: bool,
-        /// Override an unknown process recorded as running or waiting, only if closed.
+        /// Override an unknown process recorded as running, waiting or stopped, only if closed.
         #[arg(long, requires = "resume")]
         force: bool,
         /// Wait for its reply, up to this many seconds (default 300).

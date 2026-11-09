@@ -93,9 +93,12 @@ fn plan_delivery(
     if s.cwd.is_empty() {
         return Delivery::Refuse(format!("{status}, and its folder isn't known"));
     }
-    // Unknown+Stopped remains resumable; active recorded states are gated here.
+    // Without a PID, a session still open mid-turn can read as Stopped.
     if matches!(process, Process::Unknown | Process::MaybeHeld)
-        && matches!(m.state, Some(State::Running | State::Waiting))
+        && matches!(
+            m.state,
+            Some(State::Running | State::Waiting | State::Stopped)
+        )
         && !(resume && force)
     {
         return Delivery::Refuse(format!(
@@ -472,7 +475,7 @@ mod tests {
     #[test]
     fn mcp_advice_never_offers_force() {
         for harness in [Harness::ClaudeCode, Harness::Codex] {
-            for state in [State::Running, State::Waiting] {
+            for state in [State::Running, State::Waiting, State::Stopped] {
                 for resume in [false, true] {
                     let sessions = [session(harness, Some(state))];
                     let planner = |m: &SessionMatch, resume| {
@@ -480,11 +483,12 @@ mod tests {
                     };
                     let reason = choose(&sessions, resume, &planner).unwrap_err();
                     assert!(reason.contains("may still be open"));
+                    assert!(reason.contains(crate::render::state_word(state)));
                     assert!(!reason.contains("--force"));
                     assert!(!reason.contains("add --resume"));
                 }
             }
-            let sessions = [session(harness, Some(State::Stopped))];
+            let sessions = [session(harness, Some(State::Ended))];
             let planner = |m: &SessionMatch, resume| {
                 plan(m, Process::Unknown, resume, Caller::Mcp, None, &no_socket)
             };
@@ -500,52 +504,54 @@ mod tests {
     #[test]
     fn mixed_candidates_choose_the_newest_allowed_resume() {
         for harness in [Harness::ClaudeCode, Harness::Codex] {
-            let newest = session(harness, Some(State::Waiting));
-            let mut older = session(harness, Some(State::Ended));
-            older.sighting.session_id = "older".into();
-            let sessions = [newest, older];
-            for (resume, force) in [(false, false), (true, false), (true, true)] {
-                let planner = |m: &SessionMatch, resume| {
-                    plan(
-                        m,
-                        if m.sighting.session_id == "older" {
-                            Process::Gone
-                        } else {
-                            Process::Unknown
-                        },
-                        resume,
-                        Caller::Cli { force },
-                        None,
-                        &no_socket,
-                    )
-                };
-                let result = choose(&sessions, resume, &planner);
-                if !resume {
-                    let reason = result.unwrap_err();
-                    let lines: Vec<_> = reason.lines().collect();
-                    assert!(lines[1].contains("--resume --force"));
-                    assert!(lines[2].contains(
-                        "add --resume to resume it headless, or open it with `provenance go`"
-                    ));
-                    assert_eq!(lines.len(), 3);
-                } else {
-                    let (chosen, delivery) = result.unwrap();
-                    assert!(matches!(delivery, Delivery::Resume { .. }));
-                    assert_eq!(
-                        chosen.sighting.session_id,
-                        if force { "abc" } else { "older" }
-                    );
-                    assert_eq!(
-                        resume_note(&sessions, chosen),
-                        if force {
-                            None
-                        } else {
-                            Some(
-                                "Skipped 1 newer matched session(s) that could not be resumed."
-                                    .into(),
-                            )
-                        }
-                    );
+            for state in [State::Waiting, State::Stopped] {
+                let newest = session(harness, Some(state));
+                let mut older = session(harness, Some(State::Ended));
+                older.sighting.session_id = "older".into();
+                let sessions = [newest, older];
+                for (resume, force) in [(false, false), (true, false), (true, true)] {
+                    let planner = |m: &SessionMatch, resume| {
+                        plan(
+                            m,
+                            if m.sighting.session_id == "older" {
+                                Process::Gone
+                            } else {
+                                Process::Unknown
+                            },
+                            resume,
+                            Caller::Cli { force },
+                            None,
+                            &no_socket,
+                        )
+                    };
+                    let result = choose(&sessions, resume, &planner);
+                    if !resume {
+                        let reason = result.unwrap_err();
+                        let lines: Vec<_> = reason.lines().collect();
+                        assert!(lines[1].contains("--resume --force"));
+                        assert!(lines[2].contains(
+                            "add --resume to resume it headless, or open it with `provenance go`"
+                        ));
+                        assert_eq!(lines.len(), 3);
+                    } else {
+                        let (chosen, delivery) = result.unwrap();
+                        assert!(matches!(delivery, Delivery::Resume { .. }));
+                        assert_eq!(
+                            chosen.sighting.session_id,
+                            if force { "abc" } else { "older" }
+                        );
+                        assert_eq!(
+                            resume_note(&sessions, chosen),
+                            if force {
+                                None
+                            } else {
+                                Some(
+                                    "Skipped 1 newer matched session(s) that could not be resumed."
+                                        .into(),
+                                )
+                            }
+                        );
+                    }
                 }
             }
         }
@@ -604,7 +610,10 @@ mod tests {
                 Some(State::Ended),
                 None,
             ] {
-                let active = matches!(state, Some(State::Running | State::Waiting));
+                let active = matches!(
+                    state,
+                    Some(State::Running | State::Waiting | State::Stopped)
+                );
                 for (resume, force) in [(false, false), (true, false), (true, true)] {
                     for folder in [true, false] {
                         let mut m = session(harness, state);
