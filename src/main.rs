@@ -435,6 +435,7 @@ struct Sent {
     id: String,
     to: String,
     how: &'static str,
+    note: Option<String>,
     mailbox: PathBuf,
     output: String,
     from_session: bool,
@@ -445,7 +446,7 @@ fn send_message(
     pr: &str,
     text: &str,
     resume: bool,
-    force: bool,
+    caller: send::Caller,
 ) -> Result<Sent> {
     let (repo, number, loaded, row) = resolve(home, pr)?;
     let sender = current_session(&loaded.records);
@@ -462,7 +463,7 @@ fn send_message(
             m,
             process_of(&loaded, m),
             resume,
-            force,
+            caller,
             machine.as_deref(),
             &|pid, id| send::claude_socket(home, pid, id),
         )
@@ -496,6 +497,11 @@ fn send_message(
         id,
         to: format!("{pr}'s {}", label(Some(&target))),
         how: send::describe(&delivery),
+        note: if matches!(delivery, send::Delivery::Resume { .. }) {
+            send::resume_note(&loaded.rows[row].sessions, m)
+        } else {
+            None
+        },
         mailbox,
         output,
         from_session: sender.is_some(),
@@ -510,8 +516,11 @@ fn send_cmd(
     force: bool,
     wait: Option<u64>,
 ) -> Result<()> {
-    let sent = send_message(home, pr, text, resume, force)?;
+    let sent = send_message(home, pr, text, resume, send::Caller::Cli { force })?;
     println!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
+    if let Some(note) = &sent.note {
+        println!("{note}");
+    }
     if !sent.output.is_empty() {
         println!("{}", sent.output);
     }
@@ -570,8 +579,11 @@ struct McpTools {
 
 impl mcp::Tools for McpTools {
     fn send(&self, pr: &str, text: &str, resume: bool) -> Result<String> {
-        let sent = send_message(&self.home, pr, text, resume, false)?;
+        let sent = send_message(&self.home, pr, text, resume, send::Caller::Mcp)?;
         let mut out = format!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
+        if let Some(note) = &sent.note {
+            out.push_str(&format!("\n{note}"));
+        }
         out.push_str(if sent.from_session {
             " Its answer will arrive in this session as a \"[provenance] Reply\" message."
         } else {

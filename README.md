@@ -60,7 +60,7 @@ provenance install      # optional: exact stamps and live status
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
 | `provenance send <PR> "message" --wait` | Also wait for its reply (default up to 300 seconds) |
-| `provenance send <PR> "message" --resume` | Resume headless when no live process is known and the recorded state allows it |
+| `provenance send <PR> "message" --resume` | Resume headless a session whose process is gone, or an unknown one whose last recorded state is not running or waiting |
 | `provenance send <PR> "message" --resume --force` | Override an unknown process recorded as running or waiting, only when you know it is closed |
 | `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks and the MCP server |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
