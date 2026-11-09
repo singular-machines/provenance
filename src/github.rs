@@ -576,6 +576,21 @@ mod tests {
     }
 
     #[test]
+    fn cached_search_without_created_at_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("prov-old-gh-{}", std::process::id()));
+        let path = cache::path(&dir, &search_cache_name("author:@me", StateFilter::Open));
+        let old_cache = r#"{"fetched_at":"2026-10-31T11:59:30Z","prs":[{"id":"PR_1","head_sha":"a","base_sha":"b","repo":"o/r","head_repo":null,"number":1,"state":"open","title":"One","url":"u","head_branch":"f","base_branch":"main","default_branches":[],"stamps":[]}]}"#;
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, old_cache).unwrap();
+
+        // list_prs uses this typed cache read before falling through to gh;
+        // a missing required created_at makes the complete search cache miss.
+        assert!(cache::read::<CachedSearch>(&path).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn parses_pr_state_and_defaults_old_caches_to_open() {
         let prs = parse_pages(
             r#"{"data":{"search":{"nodes":[
