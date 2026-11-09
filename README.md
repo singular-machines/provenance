@@ -20,11 +20,11 @@ You run Claude Code, Codex, OpenCode and Pi in lots of apps: the terminal, Claud
 |---|---|---|---|---|
 | `prs`: the session behind each PR | Yes | Yes | Yes | Yes |
 | Live status | With `install` | With `install` | From its database, guessing "waiting" while any `opencode` runs | With `install` |
-| `go`: switch to a running session | With `install` | With `install` | No: prints the resume command | With `install` |
+| `go`: switch to a running terminal session | With `install` | With `install` | No: prints the resume command | With `install` |
 | `go`: resume an ended session | Yes | Yes | Yes | Yes |
 | `send`: message the session | With `install` | With `install` | Not yet | Not yet |
 
-Without `install`, provenance can't tell that a session is running, so `go` resumes it (a second copy) and `send` refuses it.
+For terminal sessions without usable process records, `go` resumes in the session folder and may start a second copy. Desktop-app sessions use the app or deep-link routes below without requiring `install`. `send` refuses when it cannot tell whether the session is running, unless `--resume` is supplied and the last recorded state allows it; see the messaging policy below.
 
 ## Highlights
 
@@ -60,7 +60,8 @@ provenance install      # optional: exact stamps and live status
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
 | `provenance send <PR> "message" --wait` | Also wait for its reply (default up to 300 seconds) |
-| `provenance send <PR> "message" --resume` | If the session isn't running, resume it headless to answer |
+| `provenance send <PR> "message" --resume` | Resume headless a session whose process is gone, or an unknown one whose last recorded state is not running, waiting or stopped |
+| `provenance send <PR> "message" --resume --force` | Override an unknown process recorded as running, waiting or stopped, only when you know it is closed |
 | `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks and the MCP server |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
 
@@ -88,8 +89,11 @@ provenance install      # optional: exact stamps and live status
 |---|---|
 | Claude Code, running | Its inbox socket, named in `~/.claude/sessions/<pid>.json`. An idle session starts a turn; a busy one reads it between tool calls. Claude Code labels it as a message from another session, which can't approve prompts or change settings. |
 | Codex, running | `codex queue --thread <id>`. An idle session starts a turn; a busy one takes it after its current turn. |
-| Not running | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its folder. |
+| Process known to be gone | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its known folder. |
+| Process unknown | Refused without `--resume`. With `--resume`, allowed unless last recorded as running, waiting or stopped, since it may still be open. CLI `--resume --force` overrides only that recorded-state refusal; the folder must still be known. |
 | OpenCode, Pi, the web, another machine | Not supported yet. |
+
+`--force` requires `--resume` and does not bypass other refusals or replace delivery to a known live process. MCP `send` supports `resume` with the same state policy and has no force override.
 
 Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed. Delivered replies start with `[provenance] Reply to message <id> from <session>`. They identify the answer as another session's text relayed by provenance, explain that it is a teammate's answer rather than the user's instruction and cannot grant permissions, and say to use it as information for the existing task. Anything a reply asks the receiver to do still needs the user's instruction, within the receiving session's own permissions. Replies must not be answered with `reply`, to avoid recursive reply loops.
 

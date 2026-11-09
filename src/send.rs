@@ -46,10 +46,11 @@ pub struct Sender {
 
 /// How to deliver to one session. `socket` finds a Claude Code process's
 /// inbox socket, if that process still holds the given session.
-pub fn plan(
+fn plan_delivery(
     m: &SessionMatch,
     process: Process,
     resume: bool,
+    force: bool,
     machine: Option<&str>,
     socket: &dyn Fn(u32, &str) -> Option<PathBuf>,
 ) -> Delivery {
@@ -84,18 +85,75 @@ pub fn plan(
             _ => Delivery::CodexQueue(s.session_id.clone()),
         };
     }
-    if !resume {
-        return Delivery::Refuse(
-            "it isn't running; add --resume to resume it headless, or open it with `provenance go`"
-                .into(),
-        );
-    }
+    let status = match process {
+        Process::Gone => "it isn't running",
+        Process::Live(_) => "its last recorded state is ended",
+        Process::Unknown | Process::MaybeHeld => "we can't tell whether it's running",
+    };
     if s.cwd.is_empty() {
-        return Delivery::Refuse("it isn't running, and its folder isn't known".into());
+        return Delivery::Refuse(format!("{status}, and its folder isn't known"));
+    }
+    // Without a PID, a session still open mid-turn can read as Stopped.
+    if matches!(process, Process::Unknown | Process::MaybeHeld)
+        && matches!(
+            m.state,
+            Some(State::Running | State::Waiting | State::Stopped)
+        )
+        && !(resume && force)
+    {
+        return Delivery::Refuse(format!(
+            "{status}; its last recorded state is {}, so it may still be open",
+            crate::render::state_word(m.state.unwrap())
+        ));
+    }
+    if !resume {
+        return Delivery::Refuse(status.into());
     }
     Delivery::Resume {
         cwd: s.cwd.clone(),
         argv: headless_argv(s.harness, &s.session_id),
+    }
+}
+
+/// Caller capabilities: MCP cannot request or be advised to force a resume.
+#[derive(Clone, Copy)]
+pub enum Caller {
+    Cli { force: bool },
+    Mcp,
+}
+
+/// Plan delivery and derive retry advice from the same planner used to resume.
+/// `force` is a CLI-only override for unknown processes recorded as active.
+pub fn plan(
+    m: &SessionMatch,
+    process: Process,
+    resume: bool,
+    caller: Caller,
+    machine: Option<&str>,
+    socket: &dyn Fn(u32, &str) -> Option<PathBuf>,
+) -> Delivery {
+    let force = matches!(caller, Caller::Cli { force: true });
+    let decision = plan_delivery(m, process, resume, force, machine, socket);
+    if let Delivery::Refuse(reason) = decision {
+        let advice = if !resume
+            && matches!(
+                plan_delivery(m, process, true, false, machine, socket),
+                Delivery::Resume { .. }
+            ) {
+            "; add --resume to resume it headless, or open it with `provenance go`"
+        } else if matches!(caller, Caller::Cli { force: false })
+            && matches!(
+                plan_delivery(m, process, true, true, machine, socket),
+                Delivery::Resume { .. }
+            )
+        {
+            "; add --resume --force only if you know it is closed"
+        } else {
+            ""
+        };
+        Delivery::Refuse(format!("{reason}{advice}"))
+    } else {
+        decision
     }
 }
 
@@ -245,19 +303,17 @@ pub fn choose<'a>(
             )
         })
         .collect();
-    let resumable = !resume
-        && sessions
-            .iter()
-            .any(|m| matches!(plan(m, true), Delivery::Resume { .. }));
     Err(format!(
-        "no matched session can take a message now:\n{}{}",
-        lines.join("\n"),
-        if resumable {
-            "\n(add --resume to resume one headless)"
-        } else {
-            ""
-        }
+        "no matched session can take a message now:\n{}",
+        lines.join("\n")
     ))
+}
+
+/// Explain when a headless fallback selected an older matched session.
+pub fn resume_note(sessions: &[SessionMatch], chosen: &SessionMatch) -> Option<String> {
+    let skipped = sessions.iter().position(|m| std::ptr::eq(m, chosen))?;
+    (skipped > 0)
+        .then(|| format!("Skipped {skipped} newer matched session(s) that could not be resumed."))
 }
 
 /// How the delivery is described to the sender.
@@ -417,15 +473,294 @@ mod tests {
     }
 
     #[test]
+    fn mcp_advice_never_offers_force() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            for state in [State::Running, State::Waiting, State::Stopped] {
+                for resume in [false, true] {
+                    let sessions = [session(harness, Some(state))];
+                    let planner = |m: &SessionMatch, resume| {
+                        plan(m, Process::Unknown, resume, Caller::Mcp, None, &no_socket)
+                    };
+                    let reason = choose(&sessions, resume, &planner).unwrap_err();
+                    assert!(reason.contains("may still be open"));
+                    assert!(reason.contains(crate::render::state_word(state)));
+                    assert!(!reason.contains("--force"));
+                    assert!(!reason.contains("add --resume"));
+                }
+            }
+            let sessions = [session(harness, Some(State::Ended))];
+            let planner = |m: &SessionMatch, resume| {
+                plan(m, Process::Unknown, resume, Caller::Mcp, None, &no_socket)
+            };
+            assert!(
+                choose(&sessions, false, &planner)
+                    .unwrap_err()
+                    .contains("add --resume")
+            );
+            assert!(choose(&sessions, true, &planner).is_ok());
+        }
+    }
+
+    #[test]
+    fn mixed_candidates_choose_the_newest_allowed_resume() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            for state in [State::Waiting, State::Stopped] {
+                let newest = session(harness, Some(state));
+                let mut older = session(harness, Some(State::Ended));
+                older.sighting.session_id = "older".into();
+                let sessions = [newest, older];
+                for (resume, force) in [(false, false), (true, false), (true, true)] {
+                    let planner = |m: &SessionMatch, resume| {
+                        plan(
+                            m,
+                            if m.sighting.session_id == "older" {
+                                Process::Gone
+                            } else {
+                                Process::Unknown
+                            },
+                            resume,
+                            Caller::Cli { force },
+                            None,
+                            &no_socket,
+                        )
+                    };
+                    let result = choose(&sessions, resume, &planner);
+                    if !resume {
+                        let reason = result.unwrap_err();
+                        let lines: Vec<_> = reason.lines().collect();
+                        assert!(lines[1].contains("--resume --force"));
+                        assert!(lines[2].contains(
+                            "add --resume to resume it headless, or open it with `provenance go`"
+                        ));
+                        assert_eq!(lines.len(), 3);
+                    } else {
+                        let (chosen, delivery) = result.unwrap();
+                        assert!(matches!(delivery, Delivery::Resume { .. }));
+                        assert_eq!(
+                            chosen.sighting.session_id,
+                            if force { "abc" } else { "older" }
+                        );
+                        assert_eq!(
+                            resume_note(&sessions, chosen),
+                            if force {
+                                None
+                            } else {
+                                Some(
+                                    "Skipped 1 newer matched session(s) that could not be resumed."
+                                        .into(),
+                                )
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gone_without_folder_and_live_ended_wording() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            let mut m = session(harness, Some(State::Ended));
+            for force in [false, true] {
+                let planner = |m: &SessionMatch, resume| {
+                    plan(
+                        m,
+                        Process::Live(7),
+                        resume,
+                        Caller::Cli { force },
+                        None,
+                        &no_socket,
+                    )
+                };
+                let sessions = [m.clone()];
+                let reason = choose(&sessions, false, &planner).unwrap_err();
+                assert!(reason.contains("its last recorded state is ended"));
+                assert!(!reason.contains("isn't running"));
+                assert!(choose(&sessions, true, &planner).is_ok());
+            }
+            m.sighting.cwd.clear();
+            let sessions = [m];
+            for force in [false, true] {
+                let planner = |m: &SessionMatch, resume| {
+                    plan(
+                        m,
+                        Process::Gone,
+                        resume,
+                        Caller::Cli { force },
+                        None,
+                        &no_socket,
+                    )
+                };
+                for resume in [false, true] {
+                    let reason = choose(&sessions, resume, &planner).unwrap_err();
+                    assert!(reason.contains("it isn't running, and its folder isn't known"));
+                    assert!(!reason.contains("--resume"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_process_policy_and_real_chooser_advice() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            for state in [
+                Some(State::Running),
+                Some(State::Waiting),
+                Some(State::Stopped),
+                Some(State::Ended),
+                None,
+            ] {
+                let active = matches!(
+                    state,
+                    Some(State::Running | State::Waiting | State::Stopped)
+                );
+                for (resume, force) in [(false, false), (true, false), (true, true)] {
+                    for folder in [true, false] {
+                        let mut m = session(harness, state);
+                        if !folder {
+                            m.sighting.cwd.clear();
+                        }
+                        let planner = |m: &SessionMatch, resume| {
+                            plan(
+                                m,
+                                Process::Unknown,
+                                resume,
+                                Caller::Cli { force },
+                                None,
+                                &no_socket,
+                            )
+                        };
+                        let expected = folder && resume && (!active || force);
+                        let d = planner(&m, resume);
+                        assert_eq!(
+                            matches!(d, Delivery::Resume { .. }),
+                            expected,
+                            "{harness:?} {state:?} {resume} {force} {folder}"
+                        );
+                        let sessions = [m];
+                        let chosen = choose(&sessions, resume, &planner);
+                        assert_eq!(chosen.is_ok(), expected);
+                        if let Err(reason) = chosen {
+                            assert!(reason.contains("we can't tell whether it's running"));
+                            assert!(!reason.contains("isn't running"));
+                            if !folder {
+                                assert!(reason.contains("folder isn't known"));
+                                assert!(!reason.contains("--resume"));
+                            } else if active && !force {
+                                assert!(reason.contains("may still be open"));
+                                assert!(reason.contains("--resume --force"));
+                            } else if !resume {
+                                assert!(reason.contains("add --resume"));
+                                assert!(!reason.contains("--force"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn force_preserves_live_routes_and_other_refusals() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            let mut m = session(harness, Some(State::Running));
+            assert_eq!(
+                plan(
+                    &m,
+                    Process::Live(7),
+                    true,
+                    Caller::Cli { force: true },
+                    None,
+                    &a_socket
+                ),
+                plan(
+                    &m,
+                    Process::Live(7),
+                    false,
+                    Caller::Cli { force: false },
+                    None,
+                    &a_socket
+                )
+            );
+            if harness == Harness::ClaudeCode {
+                assert!(matches!(
+                    plan(
+                        &m,
+                        Process::Live(7),
+                        true,
+                        Caller::Cli { force: true },
+                        None,
+                        &no_socket
+                    ),
+                    Delivery::Refuse(_)
+                ));
+            }
+            assert!(matches!(
+                plan(
+                    &m,
+                    Process::Gone,
+                    true,
+                    Caller::Cli { force: false },
+                    None,
+                    &no_socket
+                ),
+                Delivery::Resume { .. }
+            ));
+            assert!(
+                matches!(plan(&m, Process::Gone, false, Caller::Cli { force: false }, None, &no_socket), Delivery::Refuse(reason) if reason.contains("isn't running"))
+            );
+            m.sighting.machine = Some("elsewhere".into());
+            assert!(matches!(
+                plan(
+                    &m,
+                    Process::Unknown,
+                    true,
+                    Caller::Cli { force: true },
+                    None,
+                    &no_socket
+                ),
+                Delivery::Refuse(_)
+            ));
+            m.sighting.machine = None;
+            m.sighting.url = Some("https://example.invalid".into());
+            assert!(matches!(
+                plan(
+                    &m,
+                    Process::Unknown,
+                    true,
+                    Caller::Cli { force: true },
+                    None,
+                    &no_socket
+                ),
+                Delivery::Refuse(_)
+            ));
+        }
+    }
+
+    #[test]
     fn a_running_session_gets_its_harness_route() {
         let claude = session(Harness::ClaudeCode, Some(State::Waiting));
         assert_eq!(
-            plan(&claude, Process::Live(7), false, None, &a_socket),
+            plan(
+                &claude,
+                Process::Live(7),
+                false,
+                Caller::Cli { force: false },
+                None,
+                &a_socket
+            ),
             Delivery::ClaudeSocket("/tmp/cc-socks/7.sock".into())
         );
         let codex = session(Harness::Codex, Some(State::Running));
         assert_eq!(
-            plan(&codex, Process::Live(7), false, None, &no_socket),
+            plan(
+                &codex,
+                Process::Live(7),
+                false,
+                Caller::Cli { force: false },
+                None,
+                &no_socket
+            ),
             Delivery::CodexQueue("abc".into())
         );
     }
@@ -434,7 +769,14 @@ mod tests {
     fn a_claude_process_on_another_session_is_refused() {
         let claude = session(Harness::ClaudeCode, Some(State::Waiting));
         assert!(matches!(
-            plan(&claude, Process::Live(7), true, None, &no_socket),
+            plan(
+                &claude,
+                Process::Live(7),
+                true,
+                Caller::Cli { force: false },
+                None,
+                &no_socket
+            ),
             Delivery::Refuse(_)
         ));
     }
@@ -443,11 +785,25 @@ mod tests {
     fn a_stopped_session_is_resumed_only_when_asked() {
         let claude = session(Harness::ClaudeCode, Some(State::Ended));
         assert!(matches!(
-            plan(&claude, Process::Live(7), false, None, &a_socket),
+            plan(
+                &claude,
+                Process::Live(7),
+                false,
+                Caller::Cli { force: false },
+                None,
+                &a_socket
+            ),
             Delivery::Refuse(_)
         ));
         assert_eq!(
-            plan(&claude, Process::Gone, true, None, &a_socket),
+            plan(
+                &claude,
+                Process::Gone,
+                true,
+                Caller::Cli { force: false },
+                None,
+                &a_socket
+            ),
             Delivery::Resume {
                 cwd: "/work/shop".into(),
                 argv: vec![
@@ -460,7 +816,14 @@ mod tests {
         );
         let codex = session(Harness::Codex, None);
         assert_eq!(
-            plan(&codex, Process::Unknown, true, None, &no_socket),
+            plan(
+                &codex,
+                Process::Unknown,
+                true,
+                Caller::Cli { force: false },
+                None,
+                &no_socket
+            ),
             Delivery::Resume {
                 cwd: "/work/shop".into(),
                 argv: vec!["codex".into(), "exec".into(), "resume".into(), "abc".into()],
@@ -472,13 +835,27 @@ mod tests {
     fn other_harnesses_and_machines_are_refused() {
         let pi = session(Harness::Pi, Some(State::Waiting));
         assert!(matches!(
-            plan(&pi, Process::Live(7), true, None, &a_socket),
+            plan(
+                &pi,
+                Process::Live(7),
+                true,
+                Caller::Cli { force: false },
+                None,
+                &a_socket
+            ),
             Delivery::Refuse(_)
         ));
         let mut far = session(Harness::Codex, Some(State::Waiting));
         far.sighting.machine = Some("other".into());
         assert!(matches!(
-            plan(&far, Process::Live(7), true, Some("here"), &a_socket),
+            plan(
+                &far,
+                Process::Live(7),
+                true,
+                Caller::Cli { force: false },
+                Some("here"),
+                &a_socket
+            ),
             Delivery::Refuse(_)
         ));
     }
@@ -509,7 +886,7 @@ mod tests {
         let err = choose(&none_live, false, &fake).unwrap_err();
         assert!(err.contains("Claude session old (Terminal, ended): not now"));
         assert!(err.contains("OpenCode session oc"));
-        assert!(err.ends_with("(add --resume to resume one headless)"));
+        assert!(!err.contains("(add --resume to resume one headless)"));
         let only_opencode = [none_live[1].clone()];
         assert!(
             !choose(&only_opencode, false, &fake)

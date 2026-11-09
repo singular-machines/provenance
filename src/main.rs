@@ -68,9 +68,12 @@ enum Cmd {
         pr: String,
         /// The message.
         message: String,
-        /// If the session isn't running, resume it headless to answer.
+        /// Resume headless when no live process is known and the recorded state allows it.
         #[arg(long)]
         resume: bool,
+        /// Override an unknown process recorded as running, waiting or stopped, only if closed.
+        #[arg(long, requires = "resume")]
+        force: bool,
         /// Wait for its reply, up to this many seconds (default 300).
         #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "300")]
         wait: Option<u64>,
@@ -135,8 +138,9 @@ fn main() -> Result<()> {
             pr,
             message,
             resume,
+            force,
             wait,
-        } => send_cmd(&home()?, &pr, &message, resume, wait),
+        } => send_cmd(&home()?, &pr, &message, resume, force, wait),
         Cmd::Mcp => mcp::serve(&McpTools { home: home()? }),
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
@@ -431,12 +435,19 @@ struct Sent {
     id: String,
     to: String,
     how: &'static str,
+    note: Option<String>,
     mailbox: PathBuf,
     output: String,
     from_session: bool,
 }
 
-fn send_message(home: &std::path::Path, pr: &str, text: &str, resume: bool) -> Result<Sent> {
+fn send_message(
+    home: &std::path::Path,
+    pr: &str,
+    text: &str,
+    resume: bool,
+    caller: send::Caller,
+) -> Result<Sent> {
     let (repo, number, loaded, row) = resolve(home, pr)?;
     let sender = current_session(&loaded.records);
     let machine = stamps::machine_name();
@@ -452,6 +463,7 @@ fn send_message(home: &std::path::Path, pr: &str, text: &str, resume: bool) -> R
             m,
             process_of(&loaded, m),
             resume,
+            caller,
             machine.as_deref(),
             &|pid, id| send::claude_socket(home, pid, id),
         )
@@ -485,6 +497,11 @@ fn send_message(home: &std::path::Path, pr: &str, text: &str, resume: bool) -> R
         id,
         to: format!("{pr}'s {}", label(Some(&target))),
         how: send::describe(&delivery),
+        note: if matches!(delivery, send::Delivery::Resume { .. }) {
+            send::resume_note(&loaded.rows[row].sessions, m)
+        } else {
+            None
+        },
         mailbox,
         output,
         from_session: sender.is_some(),
@@ -496,10 +513,14 @@ fn send_cmd(
     pr: &str,
     text: &str,
     resume: bool,
+    force: bool,
     wait: Option<u64>,
 ) -> Result<()> {
-    let sent = send_message(home, pr, text, resume)?;
+    let sent = send_message(home, pr, text, resume, send::Caller::Cli { force })?;
     println!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
+    if let Some(note) = &sent.note {
+        println!("{note}");
+    }
     if !sent.output.is_empty() {
         println!("{}", sent.output);
     }
@@ -558,8 +579,11 @@ struct McpTools {
 
 impl mcp::Tools for McpTools {
     fn send(&self, pr: &str, text: &str, resume: bool) -> Result<String> {
-        let sent = send_message(&self.home, pr, text, resume)?;
+        let sent = send_message(&self.home, pr, text, resume, send::Caller::Mcp)?;
         let mut out = format!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
+        if let Some(note) = &sent.note {
+            out.push_str(&format!("\n{note}"));
+        }
         out.push_str(if sent.from_session {
             " Its answer will arrive in this session as a \"[provenance] Reply\" message."
         } else {
@@ -576,5 +600,19 @@ impl mcp::Tools for McpTools {
 
     fn reply(&self, message_id: &str, text: &str) -> Result<String> {
         reply_message(&self.home, message_id, text)
+    }
+}
+
+#[cfg(test)]
+mod send_cli_tests {
+    use super::*;
+
+    #[test]
+    fn force_requires_resume() {
+        assert!(Cli::try_parse_from(["provenance", "send", "123", "hello", "--force"]).is_err());
+        assert!(
+            Cli::try_parse_from(["provenance", "send", "123", "hello", "--resume", "--force"])
+                .is_ok()
+        );
     }
 }
