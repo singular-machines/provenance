@@ -187,8 +187,7 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
         .iter()
         .map(|r| ago(r.pr.created_at, now).len())
         .max()
-        .unwrap_or(0)
-        + 11;
+        .unwrap_or(0);
     let longest_title = rows.iter().map(|r| width(&r.pr.title)).max().unwrap_or(0);
     // "  ● #927  " + title + "  " + place + "  " + harness + " " + id + " ~" + " " + ago
     let session_w = if sessions.iter().any(Option::is_some) {
@@ -282,13 +281,7 @@ pub fn render(rows: &[PrRow], now: DateTime<Utc>, style: &Style, cached: Option<
                     String::new(),
                 ),
             };
-            let opened = style.paint(
-                DIM,
-                &format!(
-                    "{:>opened_w$}",
-                    format!("opened {} ago", ago(r.pr.created_at, now))
-                ),
-            );
+            let opened = style.paint(DIM, &format!("{:>opened_w$}", ago(r.pr.created_at, now)));
             let line = format!(
                 "  {} {}  {}  {}  {} {}",
                 style.paint(glyph_color(st), glyph(st)),
@@ -566,16 +559,16 @@ mod tests {
     fn groups_by_repo_with_live_sessions_first() {
         let got = render(&sample(), now(), &plain(Some(100)), Some("9s"));
         let want = "\
-acme/storefront                                                       3 open · 1 running · 1 waiting
-  ● #927  opened 2d ago  docs: Release 3.1 (RC pinned before go)    T3 Code    Claude 7157cbf5    0s
-  ◐ #946  opened 2d ago  docs(releases): add release process expl…  T3 Code    Codex  01a17e4f    6m
-    #896  opened 2d ago  release: ledger hotfix                     T3 Code    Claude d361dde1 ~ 10h
+acme/storefront                                                3 open · 1 running · 1 waiting
+  ● #927  2d  docs: Release 3.1 (RC pinned before go)        T3 Code    Claude 7157cbf5    0s
+  ◐ #946  2d  docs(releases): add release process explainer  T3 Code    Codex  01a17e4f    6m
+    #896  2d  release: ledger hotfix                         T3 Code    Claude d361dde1 ~ 10h
 
-acme/api                                                                                      1 open
-    #68   opened 2d ago  Ask before rebuilding the local cache      Conductor  Claude 7be310aa ~  3d
+acme/api                                                                               1 open
+    #68   2d  Ask before rebuilding the local cache          Conductor  Claude 7be310aa ~  3d
 
-example/web                                                                                   1 open
-    #41   opened 2d ago  Bump deps                                  — no session found
+example/web                                                                            1 open
+    #41   2d  Bump deps                                      — no session found
 
 5 open PRs in 3 repos · 1 with no session found  ·  ● running  ◐ waiting for you  ~ matched by branch, not stamped  ·  cached 9s ago (--refresh)
 ";
@@ -588,16 +581,31 @@ example/web                                                                     
         rows[2].pr.created_at = now() - Duration::hours(5);
         let out = render(&rows, now(), &plain(None), None);
         let line = out.lines().find(|l| l.contains("#927")).unwrap();
-        assert!(line.contains("opened 5h ago"), "{line}");
+        assert!(line.contains(" 5h "), "{line}");
         assert!(line.ends_with("0s"), "{line}");
         assert!(
             out.lines()
                 .find(|l| l.contains("#41"))
                 .unwrap()
-                .contains("opened 2d ago")
+                .contains(" 2d ")
         );
         let json = serde_json::to_value(&rows).unwrap();
         assert_eq!(json[2]["created_at"], "2026-10-30T07:00:00Z");
+    }
+
+    #[test]
+    fn opened_age_column_aligns_variable_widths() {
+        let mut rows = sample();
+        rows[2].pr.created_at = now() - Duration::days(2);
+        rows[3].pr.created_at = now() - Duration::days(100);
+        let out = render(&rows[2..4], now(), &plain(None), None);
+        let lines: Vec<_> = out
+            .lines()
+            .filter(|line| line.contains("#927") || line.contains("#946"))
+            .collect();
+        let short_age = lines[0].find("2d").unwrap();
+        let long_age = lines[1].find("100d").unwrap();
+        assert_eq!(short_age + "2d".len(), long_age + "100d".len(), "{out}");
     }
 
     #[test]
@@ -622,7 +630,7 @@ example/web                                                                     
                 .all(|l| l.chars().count() <= 80),
             "{got}"
         );
-        assert!(got.contains("docs(releases): add …"), "{got}");
+        assert!(got.contains("docs(releases): add release pro…"), "{got}");
     }
 
     #[test]
