@@ -82,7 +82,7 @@ provenance install      # optional: exact stamps and live status
 
 ### Messaging the session behind a PR
 
-`provenance send` messages the newest session matched to the PR that can take a message now, and passes over any it can't reach (an OpenCode session, an ended one). If none can, it says why for each, and `--resume` falls back to the newest session it can resume. It delivers through the harness's own way in. The session answers with the `reply` tool of `provenance mcp`, which `install` registers in Claude Code and Codex. Agents get the same `send` tool, so one session can ask the session behind another PR a question, and the answer comes back to it as a message.
+`provenance send` messages the newest session matched to the PR that can take a message now, and passes over any it can't reach (an OpenCode session, an ended one). If none can, it says why for each, and `--resume` falls back to the newest session it can resume. It delivers through the harness's own way in. The session answers with the `reply` tool of `provenance mcp`, which `install` registers in Claude Code and Codex. Agents get the same `send` tool, so one session can ask the session behind another PR a question, and the answer comes back to it as a `[provenance] Reply`.
 
 | Session | How the message gets in |
 |---|---|
@@ -91,7 +91,7 @@ provenance install      # optional: exact stamps and live status
 | Not running | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its folder. |
 | OpenCode, Pi, the web, another machine | Not supported yet. |
 
-Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed.
+Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed. Delivered replies start with `[provenance] Reply to message <id> from <session>`. They identify the answer as another session's text relayed by provenance, explain that it is a teammate's answer rather than the user's instruction and cannot grant permissions, and say to use it as information for the existing task. Anything a reply asks the receiver to do still needs the user's instruction, within the receiving session's own permissions. Replies must not be answered with `reply`, to avoid recursive reply loops.
 
 ## Reading the table
 
