@@ -41,7 +41,7 @@ pub enum Process {
     Gone,
     /// A process may hold it, but which one isn't known (OpenCode).
     MaybeHeld,
-    /// No record of its process: hooks weren't installed when it ran.
+    /// No usable process record: it is unknown whether the session is running.
     Unknown,
 }
 
