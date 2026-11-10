@@ -315,6 +315,7 @@ fn native_invoked_path(pid: i32) -> Option<String> {
 
 fn ps_process_info(pid: u32) -> Option<(u32, String, String)> {
     let out = Command::new("ps")
+        .env("LC_ALL", "C")
         .args([
             "-o",
             "ppid=",
@@ -451,6 +452,7 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
         return HashMap::new();
     }
     let mut alive: HashMap<u32, String> = Command::new("ps")
+        .env("LC_ALL", "C")
         .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
         .output()
         .ok()
@@ -689,6 +691,81 @@ mod tests {
             std::fs::canonicalize(ps.2).unwrap()
         );
         assert!(native_process_info(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_us_locale_keeps_ps_native_and_hook_start_times_equal() {
+        if std::env::var_os("PROVENANCE_LOCALE_FIXTURE").is_none() {
+            for locale in ["en_GB.UTF-8", "de_DE.UTF-8"] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "live::tests::non_us_locale_keeps_ps_native_and_hook_start_times_equal",
+                        "--nocapture",
+                    ])
+                    .env("PROVENANCE_LOCALE_FIXTURE", "1")
+                    .env("LC_ALL", locale)
+                    .env("LANG", locale)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{locale}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let pid = std::process::id();
+        let native = native_process_identity(pid).unwrap().1;
+        let ps = ps_process_info(pid).unwrap().1;
+        assert_eq!(ps, native);
+        // Prove the child locale is effective, rather than silently testing C.
+        let localized = Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(localized.status.success());
+        let localized = String::from_utf8(localized.stdout)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_ne!(localized, native);
+        struct IdentityProbe {
+            pid: u32,
+            started: String,
+        }
+        impl Probe for IdentityProbe {
+            fn harness_process(&self) -> Option<(u32, String)> {
+                Some((self.pid, self.started.clone()))
+            }
+            fn branch(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn env(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let probe = IdentityProbe { pid, started: ps };
+        let mut old = update(None, Harness::Codex, ev("SessionStart"), Utc::now(), &probe);
+        old.pid_started = Some(localized);
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let refreshed = update(
+                Some(old.clone()),
+                Harness::Codex,
+                ev(event),
+                Utc::now(),
+                &probe,
+            );
+            assert_eq!(refreshed.pid_started.as_deref(), Some(native.as_str()));
+            assert!(is_alive(
+                &refreshed,
+                &alive_pids(std::slice::from_ref(&refreshed))
+            ));
+        }
     }
 
     #[cfg(target_os = "macos")]
