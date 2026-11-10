@@ -244,19 +244,64 @@ fn native_process_info(pid: u32) -> Option<(u32, String, String)> {
         return None;
     }
     let info = unsafe { info.assume_init() };
-    let mut path = [0u8; 4096];
-    // SAFETY: path is writable for the supplied length.
-    let n = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-    if n <= 0 {
-        return None;
-    }
-    let end = path.iter().position(|b| *b == 0)?;
-    let path = String::from_utf8(path[..end].to_vec()).ok()?;
+    // proc_pidpath resolves symlinks (claude may become versions/<version>),
+    // which can hide an inner harness. KERN_PROCARGS2 exposes the invoked
+    // executable path used by ps. If it is unavailable, stop the ancestor
+    // walk rather than substituting a resolved path and selecting an outer session.
+    let path = native_invoked_path(pid)?;
     let started = chrono::DateTime::from_timestamp(i64::try_from(info.pbi_start_tvsec).ok()?, 0)?
         .with_timezone(&chrono::Local)
         .format("%a %b %-d %H:%M:%S %Y")
         .to_string();
     Some((info.pbi_ppid, started, path))
+}
+
+#[cfg(target_os = "macos")]
+fn invoked_path(bytes: &[u8]) -> Option<String> {
+    // Kernel layout: argc, NUL-terminated executable path, argv, environment.
+    // Only consume the executable path; never expose arguments/environment.
+    let path = bytes.get(std::mem::size_of::<libc::c_int>()..)?;
+    let end = path.iter().position(|b| *b == 0)?;
+    let path = std::str::from_utf8(&path[..end]).ok()?;
+    Path::new(path).is_absolute().then(|| path.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn native_invoked_path(pid: i32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0;
+    // SAFETY: query the required buffer size, with a valid MIB and size pointer.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size == 0
+        || size > 16 * 1024 * 1024
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; size];
+    // SAFETY: bytes is writable for size bytes. Read only the returned extent.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    invoked_path(bytes.get(..size)?)
 }
 
 fn ps_process_info(pid: u32) -> Option<(u32, String, String)> {
@@ -605,8 +650,100 @@ mod tests {
     #[test]
     fn native_identity_matches_ps_and_rejects_missing_process() {
         let pid = std::process::id();
-        assert_eq!(native_process_info(pid), ps_process_info(pid));
+        let native = native_process_info(pid).unwrap();
+        let ps = ps_process_info(pid).unwrap();
+        assert_eq!((&native.0, &native.1), (&ps.0, &ps.1));
+        assert_eq!(
+            std::fs::canonicalize(native.2).unwrap(),
+            std::fs::canonicalize(ps.2).unwrap()
+        );
         assert!(native_process_info(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invoked_path_parser_is_bounded_to_executable() {
+        let mut data = 1i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/tmp/claude\0argv\0PRIVATE_ENV=hidden\0");
+        assert_eq!(invoked_path(&data).as_deref(), Some("/tmp/claude"));
+        for data in [
+            &b""[..],
+            &b"abc"[..],
+            &b"1234relative\0"[..],
+            &b"1234/no-null"[..],
+        ] {
+            assert!(invoked_path(data).is_none());
+        }
+    }
+
+    // Each subprocess is this test executable, under throwaway symlink names.
+    // No model, hooks, owner state, or existing harness is involved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_symlink_harness_fixture() {
+        let Ok(stage) = std::env::var("PROVENANCE_NATIVE_FIXTURE_STAGE") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("PROVENANCE_NATIVE_FIXTURE_ROOT").unwrap());
+        if stage == "probe" {
+            let found = nearest_harness_with(
+                std::os::unix::process::parent_id(),
+                &native_process_info,
+                &|_| None,
+            )
+            .unwrap();
+            assert_eq!(found.0, Harness::ClaudeCode);
+            assert_eq!(found.1, std::os::unix::process::parent_id());
+        } else {
+            let (next, stage) = if stage == "outer" {
+                (root.join("claude"), "inner")
+            } else {
+                (std::env::current_exe().unwrap(), "probe")
+            };
+            let output = Command::new(next)
+                .args([
+                    "--exact",
+                    "live::tests::native_symlink_harness_fixture",
+                    "--nocapture",
+                ])
+                .env("PROVENANCE_NATIVE_FIXTURE_STAGE", stage)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_lookup_recognises_symlinked_inner_harness() {
+        let root = std::env::temp_dir().join(format!("prov-native-{}", crate::send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("2.1.321");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        for name in ["claude", "codex"] {
+            std::os::unix::fs::symlink(&binary, root.join(name)).unwrap();
+        }
+        let output = Command::new(root.join("codex"))
+            .args([
+                "--exact",
+                "live::tests::native_symlink_harness_fixture",
+                "--nocapture",
+            ])
+            .env("PROVENANCE_NATIVE_FIXTURE_ROOT", &root)
+            .env("PROVENANCE_NATIVE_FIXTURE_STAGE", "outer")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
