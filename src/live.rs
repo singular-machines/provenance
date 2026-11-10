@@ -146,14 +146,25 @@ impl Probe for SystemProbe {
 /// The nearest ancestor process that is a harness (`claude`, `codex`,
 /// `opencode` or `pi`): its harness, PID and start time.
 pub fn nearest_harness() -> Option<(Harness, u32, String)> {
-    let mut pid = std::os::unix::process::parent_id();
+    nearest_harness_with(
+        std::os::unix::process::parent_id(),
+        &ps_info,
+        &process_title,
+    )
+}
+
+fn nearest_harness_with(
+    mut pid: u32,
+    info: &dyn Fn(u32) -> Option<(u32, String, String)>,
+    title: &dyn Fn(u32) -> Option<String>,
+) -> Option<(Harness, u32, String)> {
     for _ in 0..12 {
-        let (ppid, started, comm) = ps_info(pid)?;
+        let (ppid, started, comm) = info(pid)?;
         let name = Path::new(&comm).file_name()?.to_string_lossy().to_string();
         // Pi runs on Node or Bun and names itself through its process title,
         // which shows in the command line rather than the executable.
         let name = if matches!(name.as_str(), "node" | "bun") {
-            process_title(pid).unwrap_or(name)
+            title(pid).unwrap_or(name)
         } else {
             name
         };
@@ -385,7 +396,7 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
     if pids.is_empty() {
         return HashMap::new();
     }
-    Command::new("ps")
+    let mut alive: HashMap<u32, String> = Command::new("ps")
         .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
         .output()
         .map(|o| {
@@ -398,7 +409,16 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // The sandbox may deny ps here too, not just during ancestor discovery.
+    for pid in records.iter().filter_map(|r| r.pid) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = alive.entry(pid)
+            && let Some((_, started, _)) = ps_info(pid)
+        {
+            entry.insert(started);
+        }
+    }
+    alive
 }
 
 pub fn is_alive(r: &Record, started: &HashMap<u32, String>) -> bool {
@@ -556,6 +576,21 @@ mod tests {
     fn record_file_names_are_safe() {
         let p = record_path(Path::new("/d"), Harness::Codex, "../../etc/x");
         assert_eq!(p, Path::new("/d/codex-etcx.json"));
+    }
+
+    #[test]
+    fn nested_harness_uses_nearest_verified_ancestor() {
+        let info = |pid| match pid {
+            10 => Some((20, "shell".into(), "/bin/zsh".into())),
+            20 => Some((30, "inner".into(), "/usr/bin/claude".into())),
+            30 => Some((1, "outer".into(), "/usr/bin/codex".into())),
+            _ => None,
+        };
+        assert_eq!(
+            nearest_harness_with(10, &info, &|_| None),
+            Some((Harness::ClaudeCode, 20, "inner".into()))
+        );
+        assert!(nearest_harness_with(99, &info, &|_| None).is_none());
     }
 
     #[test]

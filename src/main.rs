@@ -5,6 +5,7 @@ mod install;
 mod live;
 mod matching;
 mod mcp;
+mod names;
 mod render;
 mod send;
 mod sessions;
@@ -80,6 +81,20 @@ enum Cmd {
     },
     /// Run the MCP server that gives agent sessions `send` and `reply` tools.
     Mcp,
+    /// Bind a machine-local name to this exact session (owner request only).
+    Register {
+        name: String,
+        #[arg(long)]
+        replace: Option<String>,
+    },
+    /// Inspect machine-local names and delivery availability.
+    Names {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a name, guarded against concurrent replacement.
+    Unregister { name: String },
+
     /// Install the commit-stamp git hook, the Claude Code and Codex session hooks, and the MCP server.
     Install {
         /// Show what would change without changing anything.
@@ -141,6 +156,18 @@ fn main() -> Result<()> {
             force,
             wait,
         } => send_cmd(&home()?, &pr, &message, resume, force, wait),
+        Cmd::Register { name, replace } => {
+            println!("{}", register_name(&home()?, &name, replace.as_deref())?);
+            Ok(())
+        }
+        Cmd::Names { json } => list_names(&home()?, json),
+        Cmd::Unregister { name } => {
+            let store = names::Store::new(&home()?);
+            let (key, binding) = store.get(&name)?;
+            store.remove(&key, &binding.identity())?;
+            println!("Removed @{key} ({})", names::identity(&binding.identity()));
+            Ok(())
+        }
         Cmd::Mcp => mcp::serve(&McpTools { home: home()? }),
         Cmd::Install { dry_run } => {
             let bin = std::env::current_exe().context("finding the provenance binary")?;
@@ -484,75 +511,282 @@ struct Sent {
     from_session: bool,
 }
 
+fn checked_sender(records: &[live::Record]) -> Result<Option<send::Sender>> {
+    let me = current_session(records);
+    if me.is_none() && live::nearest_harness().is_some() {
+        anyhow::bail!(
+            "caller identity unavailable or ambiguous; install/approve provenance session hooks and retry inside the intended session. Shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching a hook record for this process; refusing to guess"
+        );
+    }
+    Ok(me)
+}
+
+fn named_recipient(
+    binding: &names::Binding,
+    records: &[live::Record],
+) -> Result<(sessions::Sighting, Option<live::State>, go::Process)> {
+    let r = records.iter().find(|r| r.harness == binding.harness && r.session_id == binding.session_id)
+        .with_context(|| format!("missing target information for {}; binding retained; inspect `provenance names --json` or unregister it", names::identity(&binding.identity())))?;
+    let alive = live::is_alive(r, &live::alive_pids(std::slice::from_ref(r)));
+    let sighting = sessions::Sighting {
+        harness: r.harness,
+        session_id: r.session_id.clone(),
+        app: r.app.clone(),
+        cwd: r.cwd.clone(),
+        branch: String::new(),
+        repo_url: None,
+        last_seen: r.updated,
+        log_path: r.transcript_path.as_ref().map(PathBuf::from),
+        machine: None,
+        url: None,
+    };
+    let process = if alive {
+        r.pid.map_or(go::Process::Unknown, go::Process::Live)
+    } else {
+        go::Process::Gone
+    };
+    Ok((sighting, Some(live::state(r, alive)), process))
+}
+
+fn plan_recipient(
+    home: &std::path::Path,
+    s: &sessions::Sighting,
+    state: Option<live::State>,
+    process: go::Process,
+    sender: Option<&send::Sender>,
+    resume: bool,
+    caller: send::Caller,
+) -> send::Delivery {
+    if sender.is_some_and(|me| me.harness == s.harness && me.session_id == s.session_id) {
+        return send::Delivery::Refuse("it's this session".into());
+    }
+    send::plan(
+        s,
+        state,
+        process,
+        resume,
+        caller,
+        stamps::machine_name().as_deref(),
+        &|pid, id| send::claude_socket(home, pid, id),
+    )
+}
+
+fn register_name(home: &std::path::Path, name: &str, replace: Option<&str>) -> Result<String> {
+    let records = live::load_records(home);
+    let me=checked_sender(&records)?.context("registration requires an identified local Claude Code or Codex session; run `provenance install`, approve the session hooks, then register from the intended session")?;
+    let record = records
+        .iter()
+        .find(|r| r.harness == me.harness && r.session_id == me.session_id)
+        .context("caller hook record missing")?;
+    let (key, binding) = names::Store::new(home).register(name, &me, &record.cwd, replace)?;
+    Ok(binding_status(home, &key, &binding, &records)?.to_string())
+}
+
+fn binding_status(
+    home: &std::path::Path,
+    key: &str,
+    binding: &names::Binding,
+    records: &[live::Record],
+) -> Result<serde_json::Value> {
+    let availability = match named_recipient(binding, records) {
+        Ok((s, state, process)) => {
+            match plan_recipient(home, &s, state, process, None, false, send::Caller::Mcp) {
+                send::Delivery::Refuse(why) => format!("unavailable: {why}"),
+                _ => "available".into(),
+            }
+        }
+        Err(e) => format!("unavailable: {e:#}"),
+    };
+    Ok(
+        serde_json::json!({"name":key,"display_name":binding.display_name,"harness":binding.harness,
+        "session_id":binding.session_id,"folder":binding.cwd_hint,"registered_at":binding.registered_at,"availability":availability}),
+    )
+}
+fn list_names(home: &std::path::Path, json: bool) -> Result<()> {
+    let records = live::load_records(home);
+    let rows: Vec<_> = names::Store::new(home)
+        .list()?
+        .iter()
+        .map(|(key, b)| binding_status(home, key, b, &records))
+        .collect::<Result<_>>()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        for row in rows {
+            println!(
+                "@{} → {}/{} ({}) {}",
+                row["name"].as_str().unwrap(),
+                row["harness"].as_str().unwrap(),
+                row["session_id"].as_str().unwrap(),
+                row["folder"].as_str().unwrap(),
+                row["availability"].as_str().unwrap()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum Address<'a> {
+    Name(&'a str),
+    Pr(&'a str),
+}
+fn parse_address(address: &str) -> Result<Address<'_>> {
+    match address.strip_prefix('@') {
+        Some(name) => {
+            names::canonical(name)?;
+            Ok(Address::Name(name))
+        }
+        None => Ok(Address::Pr(address)),
+    }
+}
+
 fn send_message(
     home: &std::path::Path,
-    pr: &str,
+    address: &str,
     text: &str,
     resume: bool,
     caller: send::Caller,
 ) -> Result<Sent> {
-    let (repo, number, loaded, row) = resolve(home, pr)?;
-    let sender = current_session(&loaded.records);
-    let machine = stamps::machine_name();
-    let plan = |m: &matching::SessionMatch, resume: bool| {
-        let s = &m.sighting;
-        if sender
-            .as_ref()
-            .is_some_and(|me| me.harness == s.harness && me.session_id == s.session_id)
+    // Snapshot the binding exactly once. This branch never queries GitHub.
+    let (s, delivery, sender, pr, named, note) = if let Address::Name(name) =
+        parse_address(address)?
+    {
+        let (key, binding) = names::Store::new(home).get(name)?;
+        let records = live::load_records(home);
+        let sender = checked_sender(&records)?;
+        let (s, state, process) = named_recipient(&binding, &records)?;
+        let delivery = plan_recipient(home, &s, state, process, sender.as_ref(), resume, caller);
+        if matches!(delivery, send::Delivery::Resume { .. })
+            && !s.log_path.as_ref().is_some_and(|p| p.is_file())
         {
-            return send::Delivery::Refuse("it's this session".into());
+            anyhow::bail!(
+                "missing target transcript information for @{} ({}); binding retained",
+                key,
+                names::identity(&binding.identity())
+            );
         }
-        send::plan(
-            m,
-            process_of(&loaded, m),
-            resume,
-            caller,
-            machine.as_deref(),
-            &|pid, id| send::claude_socket(home, pid, id),
+        if let send::Delivery::Refuse(why) = &delivery {
+            anyhow::bail!(
+                "can't message @{key} ({}): {why}; binding retained",
+                names::identity(&binding.identity())
+            );
+        }
+        let named = send::NamedAddress {
+            name: key,
+            recipient: binding.identity(),
+        };
+        (s, delivery, sender, None, Some(named), None)
+    } else {
+        let (repo, number, loaded, row) = resolve(home, address)?;
+        let sender = checked_sender(&loaded.records)?;
+        let plan = |m: &matching::SessionMatch, resume| {
+            plan_recipient(
+                home,
+                &m.sighting,
+                m.state,
+                process_of(&loaded, m),
+                sender.as_ref(),
+                resume,
+                caller,
+            )
+        };
+        let (m, delivery) =
+            send::choose(&loaded.rows[row].sessions, resume, &plan).map_err(|why| {
+                anyhow::anyhow!("can't message the session behind {repo}#{number}: {why}")
+            })?;
+        let note = if matches!(delivery, send::Delivery::Resume { .. }) {
+            send::resume_note(&loaded.rows[row].sessions, m, sender.as_ref())
+        } else {
+            None
+        };
+        (
+            m.sighting.clone(),
+            delivery,
+            sender,
+            Some(format!("{repo}#{number}")),
+            None,
+            note,
         )
     };
-    let (m, delivery) = send::choose(&loaded.rows[row].sessions, resume, &plan).map_err(|why| {
-        anyhow::anyhow!("can't message the session behind {repo}#{number}: {why}")
-    })?;
-    let s = &m.sighting;
+    deliver_message(
+        home,
+        Outgoing {
+            sighting: s,
+            delivery,
+            sender,
+            pr,
+            named,
+            note,
+        },
+        text,
+        &|d, id, address, from, to, log, text| {
+            send::deliver_forward(d, id, address, from, to, text, log)
+        },
+    )
+}
+
+struct Outgoing {
+    sighting: sessions::Sighting,
+    delivery: send::Delivery,
+    sender: Option<send::Sender>,
+    pr: Option<String>,
+    named: Option<send::NamedAddress>,
+    note: Option<String>,
+}
+type ForwardTransport<'a> = dyn Fn(&send::Delivery, &str, &str, &str, &str, Option<&std::path::Path>, &str) -> Result<String>
+    + 'a;
+fn deliver_message(
+    home: &std::path::Path,
+    outgoing: Outgoing,
+    text: &str,
+    transport: &ForwardTransport<'_>,
+) -> Result<Sent> {
+    let Outgoing {
+        sighting: s,
+        delivery,
+        sender,
+        pr,
+        named,
+        note,
+    } = outgoing;
     let target = send::Sender {
         harness: s.harness,
         session_id: s.session_id.clone(),
     };
+    let address = match &named {
+        Some(n) => format!("@{} ({})", n.name, names::identity(&target)),
+        None => pr.clone().unwrap_or_default(),
+    };
     let id = send::new_id();
-    let pr = format!("{repo}#{number}");
     let from = label(sender.as_ref());
-    // Recorded before delivery, so a quick reply finds its message.
     let mailbox = send::mailbox(&send::mail_dir(home), s.harness, &s.session_id);
     send::append(
         &mailbox,
         &send::Mail::Message {
             id: id.clone(),
-            pr: pr.clone(),
+            pr,
+            named_address: named,
             from: from.clone(),
             sender: sender.clone(),
-            text: text.to_string(),
+            text: text.into(),
             at: Utc::now(),
         },
     )?;
-    let output = send::deliver_forward(
+    let output = transport(
         &delivery,
         &id,
-        &pr,
+        &address,
         &from,
         &label(Some(&target)),
-        text,
         s.log_path.as_deref(),
+        text,
     )?;
     Ok(Sent {
         id,
-        to: format!("{pr}'s {}", label(Some(&target))),
+        to: format!("{address}'s {}", label(Some(&target))),
         how: send::describe(&delivery),
-        note: if matches!(delivery, send::Delivery::Resume { .. }) {
-            send::resume_note(&loaded.rows[row].sessions, m, sender.as_ref())
-        } else {
-            None
-        },
+        note,
         mailbox,
         output,
         from_session: sender.is_some(),
@@ -629,7 +863,7 @@ fn send_cmd_output(
 /// Record an answer to a message, and pass it to the session that sent it.
 fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String> {
     let records = live::load_records(home);
-    let me = current_session(&records);
+    let me = checked_sender(&records)?;
     let sender = send::record_reply(&send::mail_dir(home), me.as_ref(), id, text)?;
     let Some(to) = sender else {
         return Ok(format!(
@@ -683,6 +917,10 @@ struct McpTools<B = PathBuf> {
 }
 
 trait SendBackend {
+    fn register_name(&self, _name: &str, _replace: Option<&str>) -> Result<String> {
+        anyhow::bail!("registration unavailable in this backend")
+    }
+
     fn send_message(
         &self,
         pr: &str,
@@ -694,6 +932,10 @@ trait SendBackend {
 }
 
 impl SendBackend for PathBuf {
+    fn register_name(&self, name: &str, replace: Option<&str>) -> Result<String> {
+        register_name(self, name, replace)
+    }
+
     fn send_message(
         &self,
         pr: &str,
@@ -709,6 +951,10 @@ impl SendBackend for PathBuf {
 }
 
 impl<B: SendBackend> mcp::Tools for McpTools<B> {
+    fn register(&self, name: &str, replace: Option<&str>) -> Result<String> {
+        self.home.register_name(name, replace)
+    }
+
     fn send(&self, pr: &str, text: &str, resume: bool) -> Result<String> {
         let sent = self
             .home
@@ -865,9 +1111,15 @@ mod send_cli_tests {
                         url: None,
                     },
                 };
-                let d = send::plan(&m, go::Process::Unknown, resume, caller, None, &|_, _| {
-                    panic!("no socket lookup expected")
-                });
+                let d = send::plan(
+                    &m.sighting,
+                    m.state,
+                    go::Process::Unknown,
+                    resume,
+                    caller,
+                    None,
+                    &|_, _| panic!("no socket lookup expected"),
+                );
                 let send::Delivery::Refuse(reason) = d else {
                     panic!("MCP cannot force resume")
                 };
@@ -1036,5 +1288,201 @@ mod identity_tests {
             .session_id,
             "b"
         );
+    }
+}
+
+#[cfg(test)]
+mod named_tests {
+    use super::*;
+    fn record(id: &str, harness: Harness, pid: u32, started: &str) -> live::Record {
+        live::Record {
+            harness,
+            session_id: id.into(),
+            app: String::new(),
+            cwd: "/same".into(),
+            pid: Some(pid),
+            pid_started: Some(started.into()),
+            last_event: "Stop".into(),
+            updated: Utc::now(),
+            branches: Vec::new(),
+            transcript_path: None,
+        }
+    }
+    fn scratch() -> PathBuf {
+        let home = std::env::temp_dir().join(format!("prov-routing-{}", send::new_id()));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+    #[test]
+    fn address_prefix_is_exclusive_and_cli_accepts_spaces() {
+        assert_eq!(
+            parse_address("@PR Reviewer").unwrap(),
+            Address::Name("PR Reviewer")
+        );
+        assert_eq!(
+            parse_address("@pr-reviewer").unwrap(),
+            Address::Name("pr-reviewer")
+        );
+        for p in [
+            "123",
+            "owner/repo#123",
+            "https://github.com/owner/repo/pull/123",
+        ] {
+            assert_eq!(parse_address(p).unwrap(), Address::Pr(p));
+        }
+        assert!(parse_address("@").is_err());
+        assert!(parse_address("@bad/name").is_err());
+        assert!(
+            Cli::try_parse_from([
+                "provenance",
+                "register",
+                "PR Reviewer",
+                "--replace",
+                "codex/old"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "provenance",
+                "send",
+                "@PR Reviewer",
+                "hi",
+                "--wait",
+                "--resume"
+            ])
+            .is_ok()
+        );
+    }
+    #[test]
+    fn exact_named_target_survives_same_id_resume_but_never_transfers() {
+        let home = scratch();
+        let me = send::Sender {
+            harness: Harness::Codex,
+            session_id: "exact".into(),
+        };
+        let (_, binding) = names::Store::new(&home)
+            .register("Reviewer", &me, "/stale-hint", None)
+            .unwrap();
+        let mut r = record("exact", Harness::Codex, u32::MAX, "gone");
+        r.cwd = "/actual-folder".into();
+        let (s, state, process) = named_recipient(&binding, &[r.clone()]).unwrap();
+        assert_eq!(s.cwd, "/actual-folder");
+        assert!(matches!(
+            plan_recipient(&home, &s, state, process, None, false, send::Caller::Mcp),
+            send::Delivery::Refuse(_)
+        ));
+        let (_, started, _) = live::ps_info(std::process::id()).unwrap();
+        r.pid = Some(std::process::id());
+        r.pid_started = Some(started);
+        r.last_event = "UserPromptSubmit".into();
+        let (s, state, process) = named_recipient(&binding, &[r.clone()]).unwrap();
+        assert_eq!(
+            plan_recipient(&home, &s, state, process, None, false, send::Caller::Mcp),
+            send::Delivery::CodexQueue("exact".into())
+        );
+        assert!(matches!(
+            plan_recipient(
+                &home,
+                &s,
+                state,
+                process,
+                Some(&me),
+                false,
+                send::Caller::Mcp
+            ),
+            send::Delivery::Refuse(_)
+        ));
+        r.session_id = "new-session".into();
+        assert!(named_recipient(&binding, &[r]).is_err());
+        assert!(named_recipient(&binding, &[]).is_err());
+        assert_eq!(
+            names::Store::new(&home)
+                .get("Reviewer")
+                .unwrap()
+                .1
+                .session_id,
+            "exact"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn fake_delivery_and_replies_keep_snapshot_after_reassignment() {
+        let home = scratch();
+        let store = names::Store::new(&home);
+        let recipient = send::Sender {
+            harness: Harness::Codex,
+            session_id: "original".into(),
+        };
+        let sender = send::Sender {
+            harness: Harness::ClaudeCode,
+            session_id: "sender".into(),
+        };
+        store
+            .register("PR Reviewer", &recipient, "/", None)
+            .unwrap();
+        let r = record("original", Harness::Codex, 1, "start");
+        let binding = store.get("PR Reviewer").unwrap().1;
+        let (s, _, _) = named_recipient(&binding, &[r]).unwrap();
+        let transport = |route: &send::Delivery,
+                         _id: &str,
+                         address: &str,
+                         _from: &str,
+                         _to: &str,
+                         _log: Option<&std::path::Path>,
+                         _text: &str|
+         -> Result<String> {
+            assert_eq!(*route, send::Delivery::CodexQueue("original".into()));
+            assert!(address.contains("@pr-reviewer (codex/original)"));
+            store.register(
+                "PR Reviewer",
+                &send::Sender {
+                    harness: Harness::Codex,
+                    session_id: "replacement".into(),
+                },
+                "/",
+                Some("codex/original"),
+            )?;
+            Ok("accepted".into())
+        };
+        let sent = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery: send::Delivery::CodexQueue("original".into()),
+                sender: Some(sender.clone()),
+                pr: None,
+                note: None,
+                named: Some(send::NamedAddress {
+                    name: "pr-reviewer".into(),
+                    recipient: recipient.clone(),
+                }),
+            },
+            "hello",
+            &transport,
+        )
+        .unwrap();
+        assert_eq!(sent.output, "accepted");
+        assert_eq!(
+            send::record_reply(&send::mail_dir(&home), Some(&recipient), &sent.id, "answer")
+                .unwrap(),
+            Some(sender)
+        );
+        assert_eq!(
+            send::reply_to(&sent.mailbox, &sent.id).as_deref(),
+            Some("answer")
+        );
+        let wrong = send::Sender {
+            harness: Harness::Codex,
+            session_id: "replacement".into(),
+        };
+        assert!(
+            send::record_reply(&send::mail_dir(&home), Some(&wrong), &sent.id, "wrong").is_err()
+        );
+        let mail = std::fs::read_to_string(&sent.mailbox).unwrap();
+        let msg: serde_json::Value = serde_json::from_str(mail.lines().next().unwrap()).unwrap();
+        assert!(msg.get("pr").is_none());
+        assert_eq!(msg["named_address"]["recipient"]["session_id"], "original");
+        std::fs::remove_dir_all(home).unwrap();
     }
 }
