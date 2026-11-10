@@ -1501,7 +1501,7 @@ mod send_cli_tests {
         assert!(error.contains("may still be open"), "{error}");
         assert!(!error.contains("headless turn"));
         record.pid = Some(u32::MAX);
-        record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
+        record.pid_started = Some("Thu Oct 29 18:46:07 2026".into());
         std::fs::write(
             record.transcript_path.as_ref().unwrap(),
             "fixture transcript",
