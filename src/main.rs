@@ -69,7 +69,7 @@ enum Cmd {
         pr: String,
         /// The message.
         message: String,
-        /// Resume headless if the process is gone; if unknown, only when not recorded as active.
+        /// Resume headless if the process is gone; if unknown, only when not recorded as running, waiting or stopped.
         #[arg(long)]
         resume: bool,
         /// Override an unknown process recorded as running, waiting or stopped, only if closed.
@@ -134,12 +134,16 @@ enum HarnessArg {
 }
 
 fn main() -> Result<()> {
+    dispatch(Cli::parse())
+}
+
+fn dispatch(cli: Cli) -> Result<()> {
     let home = || -> Result<PathBuf> {
         Ok(PathBuf::from(
             std::env::var_os("HOME").context("HOME is not set")?,
         ))
     };
-    match Cli::parse().command {
+    match cli.command {
         Cmd::Prs {
             repo,
             author,
@@ -702,34 +706,17 @@ fn send_message(
     } else {
         let (repo, number, loaded, row) = resolve(home, address)?;
         let sender = checked_sender(&loaded.records)?;
-        let plan = |m: &matching::SessionMatch, resume| {
-            plan_recipient(
-                home,
-                &m.sighting,
-                m.state,
-                process_of(&loaded, m),
-                sender.as_ref(),
-                resume,
-                caller,
-            )
-        };
-        let (m, delivery) =
-            send::choose(&loaded.rows[row].sessions, resume, &plan).map_err(|why| {
-                anyhow::anyhow!("can't message the session behind {repo}#{number}: {why}")
-            })?;
-        let note = if matches!(delivery, send::Delivery::Resume { .. }) {
-            send::resume_note(&loaded.rows[row].sessions, m, sender.as_ref())
-        } else {
-            None
-        };
-        (
-            m.sighting.clone(),
-            delivery,
-            sender,
-            Some(format!("{repo}#{number}")),
-            None,
-            note,
-        )
+        return send_resolved(
+            home,
+            &repo,
+            number,
+            text,
+            &loaded.rows[row].sessions,
+            sender.as_ref(),
+            resume,
+            caller,
+            &|m| process_of(&loaded, m),
+        );
     };
     deliver_message(
         home,
@@ -739,6 +726,56 @@ fn send_message(
             sender,
             pr,
             named,
+            note,
+        },
+        text,
+        &|d, id, address, from, to, log, text| {
+            send::deliver_forward(d, id, address, from, to, text, log)
+        },
+    )
+}
+
+// Preserve main's post-resolution seam: production PR sends and fixture tests
+// share caller policy, self-send checks, log propagation and resume notes.
+#[allow(clippy::too_many_arguments)]
+fn send_resolved(
+    home: &std::path::Path,
+    repo: &str,
+    number: u64,
+    text: &str,
+    sessions: &[matching::SessionMatch],
+    sender: Option<&send::Sender>,
+    resume: bool,
+    caller: send::Caller,
+    process: &dyn Fn(&matching::SessionMatch) -> go::Process,
+) -> Result<Sent> {
+    let plan = |m: &matching::SessionMatch, resume| {
+        plan_recipient(
+            home,
+            &m.sighting,
+            m.state,
+            process(m),
+            sender,
+            resume,
+            caller,
+        )
+    };
+    let (m, delivery) = send::choose(sessions, resume, &plan).map_err(|why| {
+        anyhow::anyhow!("can't message the session behind {repo}#{number}: {why}")
+    })?;
+    let note = if matches!(delivery, send::Delivery::Resume { .. }) {
+        send::resume_note(sessions, m, sender)
+    } else {
+        None
+    };
+    deliver_message(
+        home,
+        Outgoing {
+            sighting: m.sighting.clone(),
+            delivery,
+            sender: sender.cloned(),
+            pr: Some(format!("{repo}#{number}")),
+            named: None,
             note,
         },
         text,
@@ -819,7 +856,8 @@ fn deliver_message(
 fn terminal_text(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
+            if (c.is_control() && c != '\n' && c != '\t')
+                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{61c}') {
                 c.escape_default().collect::<Vec<_>>()
             } else {
                 vec![c]
@@ -1208,7 +1246,9 @@ mod send_cli_tests {
         let error = send_cmd_output(result.map(|_| unreachable!()), None, &mut Vec::new())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("[provenance] Reply to message m-1 from Codex session test."));
+        assert!(error.contains("[provenance] Diagnostics (stderr) from Codex session test for message m-1. This is not a reply"));
+        assert!(error.contains("No session log is recorded."));
+        assert!(!error.contains("The log may"));
         assert!(error.contains("\nhostile\\r\\u{1b}[2J\nEND PROVENANCE "));
         assert!(!error.contains('\r'));
         assert!(!error.contains('\u{1b}'));
@@ -1229,6 +1269,318 @@ mod send_cli_tests {
         assert!(!display.contains('\u{1b}'));
         assert!(display.starts_with("[provenance] Reply"));
         assert!(display.ends_with("Do not answer this reply with the provenance `reply` tool."));
+    }
+
+    // Covers the production path after resolution, including caller, log and note wiring.
+    #[test]
+    fn resolved_send_preserves_caller_log_and_sender() {
+        // Run in a child with isolated HOME and executables; never mutate the test
+        // runner's environment or discover/resume an actual harness session.
+        if std::env::var_os("PROVENANCE_FIXTURE_CHILD").is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!("prov-fixtures-{}", send::new_id()));
+            std::fs::create_dir_all(&root).unwrap();
+            for (name, script) in [
+                (
+                    "codex",
+                    "#!/bin/sh\nprintf 'fixture diagnostics' >&2\nexit 97\n",
+                ),
+                ("claude", "#!/bin/sh\nprintf 'fixture answer'\n"),
+                (
+                    "gh",
+                    "#!/bin/sh\ncase \"$*\" in *'ids[]='*) cat \"$HOME/commits.json\";; *) cat \"$HOME/pr.json\";; esac\n",
+                ),
+                (
+                    "ps",
+                    "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n';; esac\n",
+                ),
+            ] {
+                let path = root.join(name);
+                std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "send_cli_tests::resolved_send_preserves_caller_log_and_sender",
+                    "--nocapture",
+                ])
+                .env_remove("CODEX_THREAD_ID")
+                .env_remove("CODEX_SESSION_ID")
+                .env("PROVENANCE_FIXTURE_CHILD", "1")
+                .env("HOME", &root)
+                .env("PROVENANCE_MACHINE", "fixture")
+                .env(
+                    "PATH",
+                    format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
+                )
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("prov-resolved-{}", send::new_id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let target = matching::SessionMatch {
+            kind: matching::MatchKind::Stamp,
+            state: Some(live::State::Stopped),
+            sighting: sessions::Sighting {
+                harness: Harness::Codex,
+                session_id: "fixture-target".into(),
+                app: "Terminal".into(),
+                cwd: home.to_string_lossy().into_owned(),
+                branch: "fixture".into(),
+                repo_url: None,
+                last_seen: Utc::now(),
+                log_path: Some(home.join("fixture-session.jsonl")),
+                machine: None,
+                url: None,
+            },
+        };
+        let unknown = |_: &matching::SessionMatch| go::Process::Unknown;
+        for caller in [send::Caller::Mcp, send::Caller::Cli { force: false }] {
+            let error = send_resolved(
+                &home,
+                "fixture/repo",
+                1,
+                "request",
+                std::slice::from_ref(&target),
+                None,
+                true,
+                caller,
+                &unknown,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("can't message the session behind"));
+            assert!(!error.contains("headless turn"));
+            assert_eq!(
+                error.contains("--force"),
+                matches!(caller, send::Caller::Cli { .. })
+            );
+        }
+        // Only the fake codex on PATH may run: it emits stderr and exits 97.
+        let error = send_resolved(
+            &home,
+            "fixture/repo",
+            1,
+            "request",
+            std::slice::from_ref(&target),
+            None,
+            true,
+            send::Caller::Cli { force: true },
+            &unknown,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("headless turn"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "Session log: {}.",
+                target.sighting.log_path.as_ref().unwrap().display()
+            )),
+            "{error}"
+        );
+
+        // Claude's fixture succeeds; sender is the only skipped newer session.
+        let mut chosen = target.clone();
+        chosen.sighting.harness = Harness::ClaudeCode;
+        chosen.state = Some(live::State::Ended);
+        let mut own = target.clone();
+        own.sighting.session_id = "fixture-sender".into();
+        let sender = send::Sender {
+            harness: own.sighting.harness,
+            session_id: own.sighting.session_id.clone(),
+        };
+        let sent = send_resolved(
+            &home,
+            "fixture/repo",
+            1,
+            "request",
+            &[own, chosen],
+            Some(&sender),
+            true,
+            send::Caller::Mcp,
+            &unknown,
+        )
+        .unwrap();
+        assert_eq!(sent.note, None);
+        // Exercise resolution, backend, CLI command and parsed dispatch with real
+        // records and fake gh, without consulting an external service.
+        let fixture_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        std::fs::write(fixture_home.join("pr.json"), r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","headRefName":"fixture","headRefOid":"aaa","baseRefOid":"bbb","repository":{"nameWithOwner":"fixture/repo"}}}}}"#).unwrap();
+        std::fs::write(fixture_home.join("commits.json"), r#"{"data":{"nodes":[{"id":"PR_1","headRefOid":"aaa","baseRefOid":"bbb","commits":{"nodes":[{"commit":{"message":"Agent-Session: codex/fixture-target","committedDate":"2026-10-30T01:00:00Z"}}]}}]}}"#).unwrap();
+        let records = live::live_dir(&fixture_home);
+        std::fs::create_dir_all(&records).unwrap();
+        let mut record = live::Record {
+            harness: Harness::Codex,
+            session_id: "fixture-target".into(),
+            app: "Terminal".into(),
+            cwd: home.to_string_lossy().into_owned(),
+            pid: None,
+            pid_started: None,
+            last_event: "UserPromptSubmit".into(),
+            updated: Utc::now(),
+            branches: vec![live::BranchSeen {
+                cwd: home.to_string_lossy().into_owned(),
+                branch: "fixture".into(),
+                last_seen: Utc::now(),
+            }],
+            transcript_path: Some(
+                home.join("real-wiring.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        let record_path = records.join("target.json");
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let pr = "fixture/repo#1";
+        let error = <PathBuf as SendBackend>::send_message(
+            &fixture_home,
+            pr,
+            "request",
+            true,
+            send::Caller::Mcp,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("can't message the session behind"),
+            "{error}"
+        );
+        assert!(!error.contains("--force"));
+        assert!(!error.contains("headless turn"));
+        for force in [false, true] {
+            let error = send_cmd(&fixture_home, pr, "request", true, force, None)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error.contains("headless turn"), force, "{error}");
+            assert_eq!(error.contains("--force"), !force, "{error}");
+            if force {
+                assert!(error.contains("real-wiring.jsonl"), "{error}");
+            }
+            let mut args = vec!["provenance", "send", pr, "request", "--resume"];
+            if force {
+                args.push("--force");
+            }
+            let error = dispatch(Cli::try_parse_from(args).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error.contains("headless turn"), force, "{error}");
+            assert_eq!(error.contains("--force"), !force, "{error}");
+        }
+        // Named routing shares main's guarded planner and diagnostics boundary,
+        // but retains an exact recipient and no fabricated PR metadata.
+        let named_identity = send::Sender {
+            harness: Harness::Codex,
+            session_id: record.session_id.clone(),
+        };
+        names::Store::new(&fixture_home)
+            .register("PR Reviewer", &named_identity, &record.cwd, None)
+            .unwrap();
+        let error = send_message(
+            &fixture_home,
+            "@PR Reviewer",
+            "named request",
+            true,
+            send::Caller::Mcp,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("may still be open"), "{error}");
+        assert!(!error.contains("headless turn"));
+        record.pid = Some(u32::MAX);
+        record.pid_started = Some("gone".into());
+        std::fs::write(
+            record.transcript_path.as_ref().unwrap(),
+            "fixture transcript",
+        )
+        .unwrap();
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = send_message(
+            &fixture_home,
+            "@PR Reviewer",
+            "named request",
+            true,
+            send::Caller::Mcp,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("Diagnostics (stderr)"), "{error}");
+        assert!(error.contains("This is not a reply"));
+        assert!(error.contains("real-wiring.jsonl"));
+        let mailbox = send::mailbox(
+            &send::mail_dir(&fixture_home),
+            record.harness,
+            &record.session_id,
+        );
+        let mail = std::fs::read_to_string(mailbox).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(mail.lines().last().unwrap()).unwrap();
+        assert_eq!(entry["named_address"]["name"], "pr-reviewer");
+        assert_eq!(
+            entry["named_address"]["recipient"]["session_id"],
+            record.session_id
+        );
+        assert!(entry.get("pr").is_none());
+        // The fake ps identifies this parent as the sender. Self exclusion must
+        // win even with force; dropping sender at the real entry point breaks it.
+        record.pid = Some(std::os::unix::process::parent_id());
+        record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = send_message(
+            &fixture_home,
+            pr,
+            "request",
+            true,
+            send::Caller::Cli { force: true },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("it's this session"), "{error}");
+        assert!(!error.contains("headless turn"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn unicode_format_characters_are_escaped_only_for_cli() {
+        let raw: String = (0x202a..=0x202e)
+            .chain(0x2066..=0x2069)
+            .chain(0x200b..=0x200f)
+            .chain([0x2060, 0xfeff, 0x61c])
+            .map(|n| char::from_u32(n).unwrap())
+            .collect();
+        let framed = send::framed_reply("m", "fixture", &raw).unwrap();
+        assert!(framed.contains(&raw));
+        let json = serde_json::to_string(&raw).unwrap();
+        assert_eq!(serde_json::from_str::<String>(&json).unwrap(), raw);
+        let expected: String = raw.chars().flat_map(char::escape_default).collect();
+        assert_eq!(terminal_text(&raw), expected);
+        let sent = Sent {
+            id: "m".into(),
+            to: "fixture".into(),
+            how: "fixture",
+            note: None,
+            mailbox: PathBuf::new(),
+            output: raw.clone(),
+            from_session: false,
+        };
+        let mut output = Vec::new();
+        cli_send_output(&sent, &mut output).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), format!("{expected}\n"));
+        assert_eq!(sent.output, raw);
     }
 
     #[test]
@@ -1423,8 +1775,16 @@ mod named_tests {
         }
     }
     fn scratch() -> PathBuf {
-        let home = std::env::temp_dir().join(format!("prov-routing-{}", send::new_id()));
-        std::fs::create_dir_all(&home).unwrap();
+        // Parallel routing tests must never share a directory, even when
+        // the clock returns the same timestamp to two calls to new_id().
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "prov-routing-{}-{}-{}",
+            std::process::id(),
+            send::new_id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&home).unwrap();
         home
     }
     #[test]
