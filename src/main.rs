@@ -68,7 +68,7 @@ enum Cmd {
         pr: String,
         /// The message.
         message: String,
-        /// Resume headless when no live process is known and the recorded state allows it.
+        /// Resume headless if the process is gone; if unknown, only when not recorded as active.
         #[arg(long)]
         resume: bool,
         /// Override an unknown process recorded as running, waiting or stopped, only if closed.
@@ -492,13 +492,21 @@ fn send_message(
             at: Utc::now(),
         },
     )?;
-    let output = send::deliver_forward(&delivery, &id, &pr, &from, &label(Some(&target)), text)?;
+    let output = send::deliver_forward(
+        &delivery,
+        &id,
+        &pr,
+        &from,
+        &label(Some(&target)),
+        text,
+        s.log_path.as_deref(),
+    )?;
     Ok(Sent {
         id,
         to: format!("{pr}'s {}", label(Some(&target))),
         how: send::describe(&delivery),
         note: if matches!(delivery, send::Delivery::Resume { .. }) {
-            send::resume_note(&loaded.rows[row].sessions, m)
+            send::resume_note(&loaded.rows[row].sessions, m, sender.as_ref())
         } else {
             None
         },
@@ -545,18 +553,27 @@ fn send_cmd(
     force: bool,
     wait: Option<u64>,
 ) -> Result<()> {
-    let sent = send_message(home, pr, text, resume, send::Caller::Cli { force })?;
-    println!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
+    let result = send_message(home, pr, text, resume, send::Caller::Cli { force });
+    send_cmd_output(result, wait, &mut std::io::stdout().lock())
+}
+
+fn send_cmd_output(
+    result: Result<Sent>,
+    wait: Option<u64>,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    let sent = result.map_err(|e| anyhow::anyhow!("{}", terminal_text(&format!("{e:#}"))))?;
+    writeln!(out, "Sent {} to {} via {}.", sent.id, sent.to, sent.how)?;
     if let Some(note) = &sent.note {
-        println!("{note}");
+        writeln!(out, "{note}")?;
     }
-    cli_send_output(&sent, &mut std::io::stdout().lock())?;
+    cli_send_output(&sent, out)?;
     let Some(secs) = wait else {
         return Ok(());
     };
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
-        if cli_waited_reply(&sent, &mut std::io::stdout().lock())? {
+        if cli_waited_reply(&sent, out)? {
             return Ok(());
         }
         if std::time::Instant::now() >= end {
@@ -604,9 +621,9 @@ fn mcp_send_text(sent: &Sent) -> String {
         out.push_str(&format!("\n{note}"));
     }
     out.push_str(if sent.from_session {
-            " Its answer will arrive in this session as a \"[provenance] Reply\" message."
+            "\n\nThe session that received this message will send its answer here as a \"[provenance] Reply\" message."
         } else {
-            " This session isn't recorded by provenance's hooks, so its answer can't be passed back here."
+            "\n\nThis session isn't recorded by provenance's hooks, so its answer can't be passed back here."
         });
     if !sent.output.is_empty() {
         out.push_str(&format!(
@@ -618,18 +635,46 @@ fn mcp_send_text(sent: &Sent) -> String {
 }
 
 /// The MCP tools, run against this machine.
-struct McpTools {
-    home: PathBuf,
+struct McpTools<B = PathBuf> {
+    home: B,
 }
 
-impl mcp::Tools for McpTools {
+trait SendBackend {
+    fn send_message(
+        &self,
+        pr: &str,
+        text: &str,
+        resume: bool,
+        caller: send::Caller,
+    ) -> Result<Sent>;
+    fn reply_message(&self, id: &str, text: &str) -> Result<String>;
+}
+
+impl SendBackend for PathBuf {
+    fn send_message(
+        &self,
+        pr: &str,
+        text: &str,
+        resume: bool,
+        caller: send::Caller,
+    ) -> Result<Sent> {
+        send_message(self, pr, text, resume, caller)
+    }
+    fn reply_message(&self, id: &str, text: &str) -> Result<String> {
+        reply_message(self, id, text)
+    }
+}
+
+impl<B: SendBackend> mcp::Tools for McpTools<B> {
     fn send(&self, pr: &str, text: &str, resume: bool) -> Result<String> {
-        let sent = send_message(&self.home, pr, text, resume, send::Caller::Mcp)?;
+        let sent = self
+            .home
+            .send_message(pr, text, resume, send::Caller::Mcp)?;
         Ok(mcp_send_text(&sent))
     }
 
     fn reply(&self, message_id: &str, text: &str) -> Result<String> {
-        reply_message(&self.home, message_id, text)
+        self.home.reply_message(message_id, text)
     }
 }
 
@@ -676,16 +721,19 @@ mod send_cli_tests {
             output: String::new(),
             from_session: false,
         };
+        let mailbox = sent.mailbox.clone();
         let mut output = Vec::new();
-        assert!(cli_waited_reply(&sent, &mut output).unwrap());
+        send_cmd_output(Ok(sent), Some(0), &mut output).unwrap();
         assert_reply_frame(
-            String::from_utf8(output).unwrap().trim_end(),
+            String::from_utf8(output)
+                .unwrap()
+                .split_once("\n")
+                .unwrap()
+                .1
+                .trim_end(),
             &terminal_text(body),
         );
-        assert_eq!(
-            send::reply_to(&sent.mailbox, &sent.id).as_deref(),
-            Some(body)
-        );
+        assert_eq!(send::reply_to(&mailbox, "m-1").as_deref(), Some(body));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -701,9 +749,16 @@ mod send_cli_tests {
                 "fixture".into(),
             ],
         };
-        let output =
-            send::deliver_forward(&delivery, "m-1", "pr", "sender", "Codex session test", body)
-                .unwrap();
+        let output = send::deliver_forward(
+            &delivery,
+            "m-1",
+            "pr",
+            "sender",
+            "Codex session test",
+            body,
+            None,
+        )
+        .unwrap();
         let sent = Sent {
             id: "m-1".into(),
             to: "Codex session test".into(),
@@ -721,14 +776,126 @@ mod send_cli_tests {
         assert!(reply.ends_with("Do not answer this reply with the provenance `reply` tool."));
         assert!(reply.contains("\nBEGIN PROVENANCE "));
         assert!(rendered.contains(body));
-        assert!(rendered.contains("Its answer will arrive"));
+        assert!(rendered.contains("\n\nThe session that received this message"));
         let mut cli = Vec::new();
-        cli_send_output(&sent, &mut cli).unwrap();
+        let expected = format!(
+            "Sent m-1 to Codex session test via fixture.\n{}\n",
+            terminal_text(&sent.output)
+        );
+        send_cmd_output(Ok(sent), None, &mut cli).unwrap();
         let cli = String::from_utf8(cli).unwrap();
-        assert_eq!(cli, format!("{}\n", terminal_text(&sent.output)));
+        assert_eq!(cli, expected);
         assert!(!cli.contains('\r'));
         assert!(!cli.contains('\u{1b}'));
-        assert!(cli.starts_with("[provenance] Reply to message m-1 from Codex session test."));
+        assert!(cli.contains("\n[provenance] Reply to message m-1 from Codex session test."));
+    }
+
+    struct FixtureBackend {
+        refuse: bool,
+    }
+    impl SendBackend for FixtureBackend {
+        fn send_message(
+            &self,
+            _: &str,
+            _: &str,
+            resume: bool,
+            caller: send::Caller,
+        ) -> Result<Sent> {
+            assert!(
+                matches!(caller, send::Caller::Mcp),
+                "MCP must not acquire CLI force capabilities"
+            );
+            if self.refuse {
+                let m = matching::SessionMatch {
+                    kind: matching::MatchKind::Stamp,
+                    state: Some(live::State::Stopped),
+                    sighting: sessions::Sighting {
+                        harness: Harness::Codex,
+                        session_id: "fixture".into(),
+                        app: "Terminal".into(),
+                        cwd: "/fixture".into(),
+                        branch: "fix".into(),
+                        repo_url: None,
+                        last_seen: Utc::now(),
+                        log_path: None,
+                        machine: None,
+                        url: None,
+                    },
+                };
+                let d = send::plan(&m, go::Process::Unknown, resume, caller, None, &|_, _| {
+                    panic!("no socket lookup expected")
+                });
+                let send::Delivery::Refuse(reason) = d else {
+                    panic!("MCP cannot force resume")
+                };
+                anyhow::bail!("{reason}");
+            }
+            let d = send::Delivery::Resume {
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf '%s' 'fixture answer'".into(),
+                ],
+            };
+            Ok(Sent { id: "m-1".into(), to: "Codex session test".into(), how: "a headless resume", note: Some("Skipped 1 newer matched session(s) not selected for headless resume (they may still be open or otherwise unavailable).".into()), mailbox: PathBuf::new(), output: send::deliver_forward(&d, "m-1", "pr", "sender", "Codex session test", "request", None)?, from_session: true })
+        }
+        fn reply_message(&self, _: &str, _: &str) -> Result<String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn real_mcp_send_path_keeps_caller_policy_and_output_wrapper() {
+        use mcp::Tools;
+        let refusal = McpTools {
+            home: FixtureBackend { refuse: true },
+        }
+        .send("1", "hello", true)
+        .unwrap_err()
+        .to_string();
+        assert!(refusal.contains("may still be open"));
+        assert!(!refusal.contains("--force"));
+        let output = McpTools {
+            home: FixtureBackend { refuse: false },
+        }
+        .send("1", "hello", true)
+        .unwrap();
+        assert!(output.starts_with("Sent m-1 to Codex session test via a headless resume."));
+        assert!(
+            output.contains("otherwise unavailable).\n\nThe session that received this message")
+        );
+        let (_, reply) = output.split_once("Output of the headless turn:\n").unwrap();
+        assert_reply_frame(reply, "fixture answer");
+    }
+
+    #[test]
+    fn cli_failed_turn_fences_stderr_and_escapes_controls() {
+        let d = send::Delivery::Resume {
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'hostile\\r\\033[2J' >&2; printf 'partial stdout'; exit 1".into(),
+            ],
+        };
+        let result = send::deliver_forward(
+            &d,
+            "m-1",
+            "pr",
+            "sender",
+            "Codex session test",
+            "request",
+            None,
+        );
+        let error = send_cmd_output(result.map(|_| unreachable!()), None, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[provenance] Reply to message m-1 from Codex session test."));
+        assert!(error.contains("\nhostile\\r\\u{1b}[2J\nEND PROVENANCE "));
+        assert!(!error.contains('\r'));
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains("partial stdout"));
     }
 
     #[test]
