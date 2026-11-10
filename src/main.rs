@@ -407,23 +407,54 @@ fn go(home: &std::path::Path, pr: &str, print: bool) -> Result<()> {
 /// The agent session this process runs under, if its hooks recorded it.
 fn current_session(records: &[live::Record]) -> Option<send::Sender> {
     let (harness, pid, started) = live::nearest_harness()?;
-    session_for_process(records, harness, pid, &started)
+    session_for_process_with_ids(
+        records,
+        harness,
+        pid,
+        &started,
+        std::env::var("CODEX_THREAD_ID").ok().as_deref(),
+        std::env::var("CODEX_SESSION_ID").ok().as_deref(),
+    )
 }
 
+#[cfg(test)]
 fn session_for_process(
     records: &[live::Record],
     harness: Harness,
     pid: u32,
     started: &str,
 ) -> Option<send::Sender> {
+    session_for_process_with_ids(records, harness, pid, started, None, None)
+}
+
+fn session_for_process_with_ids(
+    records: &[live::Record],
+    harness: Harness,
+    pid: u32,
+    started: &str,
+    thread: Option<&str>,
+    session: Option<&str>,
+) -> Option<send::Sender> {
     let mut matches = records.iter().filter(|r| {
         r.harness == harness && r.pid == Some(pid) && r.pid_started.as_deref() == Some(started)
     });
-    let first = matches.next()?;
+    let mut first = matches.next()?;
     // An app-server can host several sessions in one process. Recency does
     // not prove which session called us, even if only one is busy right now.
     if matches.any(|r| r.session_id != first.session_id) {
-        return None;
+        // These variables only select among hook records for this verified
+        // ancestor. They are correctness hints within the OS user boundary,
+        // not authentication against malicious code running as that user.
+        let id = thread.filter(|id| !id.is_empty() && Some(*id) == session)?;
+        if harness != Harness::Codex {
+            return None;
+        }
+        first = records.iter().find(|r| {
+            r.harness == harness
+                && r.pid == Some(pid)
+                && r.pid_started.as_deref() == Some(started)
+                && r.session_id == id
+        })?;
     }
     Some(send::Sender {
         harness: first.harness,
@@ -973,6 +1004,37 @@ mod identity_tests {
             session_for_process(std::slice::from_ref(&a), Harness::Codex, 11, "start").is_none()
         );
         let b = record("b", Harness::Codex, 10, "start");
-        assert!(session_for_process(&[a, b], Harness::Codex, 10, "start").is_none());
+        let records = [a, b];
+        assert!(session_for_process(&records, Harness::Codex, 10, "start").is_none());
+        for (thread, session) in [
+            (Some("a"), None),
+            (Some("a"), Some("b")),
+            (Some("foreign"), Some("foreign")),
+        ] {
+            assert!(
+                session_for_process_with_ids(
+                    &records,
+                    Harness::Codex,
+                    10,
+                    "start",
+                    thread,
+                    session
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(
+            session_for_process_with_ids(
+                &records,
+                Harness::Codex,
+                10,
+                "start",
+                Some("b"),
+                Some("b")
+            )
+            .unwrap()
+            .session_id,
+            "b"
+        );
     }
 }
