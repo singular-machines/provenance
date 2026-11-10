@@ -395,7 +395,7 @@ fn process_of(loaded: &Loaded, m: &matching::SessionMatch) -> go::Process {
         Some(r) if live::is_alive(r, &loaded.alive) => {
             r.pid.map_or(go::Process::Unknown, go::Process::Live)
         }
-        Some(r) if r.pid.is_some() => go::Process::Gone,
+        Some(r) if r.pid.is_some() && live::has_c_start_time(r) => go::Process::Gone,
         _ => go::Process::Unknown,
     }
 }
@@ -566,7 +566,7 @@ fn named_recipient(
     };
     let process = if alive {
         r.pid.map_or(go::Process::Unknown, go::Process::Live)
-    } else if r.pid.is_some() {
+    } else if r.pid.is_some() && live::has_c_start_time(r) {
         go::Process::Gone
     } else {
         go::Process::Unknown
@@ -1501,7 +1501,7 @@ mod send_cli_tests {
         assert!(error.contains("may still be open"), "{error}");
         assert!(!error.contains("headless turn"));
         record.pid = Some(u32::MAX);
-        record.pid_started = Some("gone".into());
+        record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
         std::fs::write(
             record.transcript_path.as_ref().unwrap(),
             "fixture transcript",
@@ -1993,6 +1993,63 @@ mod named_tests {
             ),
             send::Delivery::Resume { .. }
         ));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn legacy_localized_targets_stay_unknown_for_pr_and_named_resume() {
+        let home = scratch();
+        let identity = send::Sender {
+            harness: Harness::Codex,
+            session_id: "legacy".into(),
+        };
+        let (_, binding) = names::Store::new(&home)
+            .register("Reviewer", &identity, "/", None)
+            .unwrap();
+        for start in ["Tue 10 Nov 21:39:39 2026", "Di. 10 Nov. 21:39:39 2026"] {
+            for event in ["UserPromptSubmit", "Stop", "PostToolUse"] {
+                let mut r = record("legacy", Harness::Codex, std::process::id(), start);
+                r.last_event = event.into();
+                let (s, state, process) =
+                    named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
+                assert_eq!(process, go::Process::Unknown);
+                let m = matching::SessionMatch {
+                    sighting: s.clone(),
+                    state,
+                    kind: matching::MatchKind::Stamp,
+                };
+                let observed = live::alive_pids(std::slice::from_ref(&r));
+                let loaded = Loaded {
+                    fetched: github::Fetched {
+                        prs: vec![],
+                        fetched_at: Utc::now(),
+                        from_cache: false,
+                    },
+                    rows: vec![],
+                    records: vec![r],
+                    alive: observed,
+                    opencode: vec![],
+                };
+                assert_eq!(process_of(&loaded, &m), go::Process::Unknown);
+                for caller in [send::Caller::Mcp, send::Caller::Cli { force: false }] {
+                    assert!(matches!(
+                        plan_recipient(&home, &s, state, process, None, true, caller),
+                        send::Delivery::Refuse(_)
+                    ));
+                    assert!(matches!(
+                        plan_recipient(
+                            &home,
+                            &s,
+                            state,
+                            process_of(&loaded, &m),
+                            None,
+                            true,
+                            caller
+                        ),
+                        send::Delivery::Refuse(_)
+                    ));
+                }
+            }
+        }
         std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -313,9 +313,18 @@ fn native_invoked_path(pid: i32) -> Option<String> {
     invoked_path(bytes.get(..size)?)
 }
 
+// Pin only time. LC_ALL would also change comm's character encoding.
+fn start_time_ps() -> Command {
+    let mut command = Command::new("ps");
+    command.env_remove("LC_ALL").env("LC_TIME", "C");
+    if let Some(ctype) = std::env::var_os("LC_ALL").filter(|s| !s.is_empty()) {
+        command.env("LC_CTYPE", ctype);
+    }
+    command
+}
+
 fn ps_process_info(pid: u32) -> Option<(u32, String, String)> {
-    let out = Command::new("ps")
-        .env("LC_ALL", "C")
+    let out = start_time_ps()
         .args([
             "-o",
             "ppid=",
@@ -451,8 +460,7 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
     if pids.is_empty() {
         return HashMap::new();
     }
-    let mut alive: HashMap<u32, String> = Command::new("ps")
-        .env("LC_ALL", "C")
+    let mut alive: HashMap<u32, String> = start_time_ps()
         .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
         .output()
         .ok()
@@ -497,6 +505,15 @@ fn fill_alive_pids(
             entry.insert(started);
         }
     }
+}
+
+/// A legacy localized or missing start time cannot establish that a PID is
+/// gone. Keep it unknown until a start/prompt hook refreshes the record.
+pub fn has_c_start_time(record: &Record) -> bool {
+    record.pid_started.as_deref().is_some_and(|s| {
+        chrono::NaiveDateTime::parse_from_str(s, "%a %b %e %H:%M:%S %Y")
+            .is_ok_and(|date| date.format("%a %b %-d %H:%M:%S %Y").to_string() == s)
+    })
 }
 
 pub fn is_alive(r: &Record, started: &HashMap<u32, String>) -> bool {
@@ -697,31 +714,64 @@ mod tests {
     #[test]
     fn non_us_locale_keeps_ps_native_and_hook_start_times_equal() {
         if std::env::var_os("PROVENANCE_LOCALE_FIXTURE").is_none() {
-            for locale in ["en_GB.UTF-8", "de_DE.UTF-8"] {
-                let output = Command::new(std::env::current_exe().unwrap())
+            let root = std::env::temp_dir().join(format!("prov-locale-{}", crate::send::new_id()));
+            let directory = root.join("é dir/Fake.app/Contents/MacOS");
+            std::fs::create_dir_all(&directory).unwrap();
+            let binary = directory.join("codex");
+            std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+            for (category, locale) in [
+                ("LC_ALL", "C"),
+                ("LC_ALL", "en_GB.UTF-8"),
+                ("LC_ALL", "de_DE.UTF-8"),
+                ("LANG", "en_GB.UTF-8"),
+                ("LANG", "de_DE.UTF-8"),
+                ("none", ""),
+            ] {
+                let mut command = Command::new(&binary);
+                command
                     .args([
                         "--exact",
                         "live::tests::non_us_locale_keeps_ps_native_and_hook_start_times_equal",
                         "--nocapture",
                     ])
-                    .env("PROVENANCE_LOCALE_FIXTURE", "1")
-                    .env("LC_ALL", locale)
-                    .env("LANG", locale)
-                    .output()
-                    .unwrap();
+                    .env_remove("LC_ALL")
+                    .env_remove("LANG")
+                    .env_remove("LC_TIME")
+                    .env_remove("LC_CTYPE")
+                    .env("PROVENANCE_LOCALE_FIXTURE", format!("{category}:{locale}"));
+                if category != "none" {
+                    command.env(category, locale);
+                }
+                let output = command.output().unwrap();
                 assert!(
                     output.status.success(),
-                    "{locale}: {}{}",
+                    "{category}={locale}: {}{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
+            std::fs::remove_dir_all(root).unwrap();
             return;
         }
         let pid = std::process::id();
         let native = native_process_identity(pid).unwrap().1;
-        let ps = ps_process_info(pid).unwrap().1;
+        let (ppid, ps, comm) = ps_process_info(pid).unwrap();
+        assert_eq!(ppid, std::os::unix::process::parent_id());
         assert_eq!(ps, native);
+        let raw_comm = Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(raw_comm.status.success());
+        assert_eq!(comm, String::from_utf8(raw_comm.stdout).unwrap().trim());
+        let variant = std::env::var("PROVENANCE_LOCALE_FIXTURE").unwrap();
+        if variant.contains("UTF-8") {
+            assert!(comm.contains("é dir/Fake.app/Contents/MacOS/codex"));
+            assert_eq!(
+                std::fs::canonicalize(&comm).unwrap(),
+                std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+            );
+        }
         // Prove the child locale is effective, rather than silently testing C.
         let localized = Command::new("ps")
             .args(["-o", "lstart=", "-p", &pid.to_string()])
@@ -733,7 +783,7 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert_ne!(localized, native);
+        assert_eq!(localized == native, !variant.contains("UTF-8"), "{variant}");
         struct IdentityProbe {
             pid: u32,
             started: String,
@@ -927,6 +977,28 @@ mod tests {
                 Some((Harness::ClaudeCode, 10, "inner".into()))
             );
         }
+    }
+
+    #[test]
+    fn legacy_start_time_shapes_are_not_evidence_of_exit() {
+        let f = Fake {
+            pid: 42,
+            branch: "b",
+            probes: Cell::new(0),
+        };
+        let mut r = update(None, Harness::Codex, ev("SessionStart"), Utc::now(), &f);
+        assert!(has_c_start_time(&r));
+        for legacy in [
+            "Tue 10 Nov 21:39:39 2026",
+            "Di. 10 Nov. 21:39:39 2026",
+            "garbage",
+            "",
+        ] {
+            r.pid_started = Some(legacy.into());
+            assert!(!has_c_start_time(&r));
+        }
+        r.pid_started = None;
+        assert!(!has_c_start_time(&r));
     }
 
     #[test]
