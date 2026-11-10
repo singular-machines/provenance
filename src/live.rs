@@ -205,6 +205,50 @@ pub fn opencode_running() -> bool {
 
 /// `(ppid, start time, command path)` for one process.
 pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
+    let result = ps_process_info(pid);
+    #[cfg(target_os = "macos")]
+    let result = result.or_else(|| native_process_info(pid));
+    result
+}
+
+// Codex's macOS sandbox can deny executing ps while allowing libproc queries.
+// Read the same kernel identity; never substitute environment or folder hints.
+#[cfg(target_os = "macos")]
+fn native_process_info(pid: u32) -> Option<(u32, String, String)> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: libproc receives a correctly sized, writable buffer. It is read
+    // only after libproc reports that the complete structure was written.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if n != size as i32 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let mut path = [0u8; 4096];
+    // SAFETY: path is writable for the supplied length.
+    let n = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let end = path.iter().position(|b| *b == 0)?;
+    let path = String::from_utf8(path[..end].to_vec()).ok()?;
+    let started = chrono::DateTime::from_timestamp(i64::try_from(info.pbi_start_tvsec).ok()?, 0)?
+        .with_timezone(&chrono::Local)
+        .format("%a %b %-d %H:%M:%S %Y")
+        .to_string();
+    Some((info.pbi_ppid, started, path))
+}
+
+fn ps_process_info(pid: u32) -> Option<(u32, String, String)> {
     let out = Command::new("ps")
         .args([
             "-o",
@@ -218,6 +262,9 @@ pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
         ])
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     // `lstart` is always five fields: "Fri Oct 30 18:46:07 2026".
     let mut parts = line.split_whitespace();
@@ -517,6 +564,14 @@ mod tests {
         assert!(ppid > 0);
         assert_eq!(started.split_whitespace().count(), 5);
         assert!(!comm.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_identity_matches_ps_and_rejects_missing_process() {
+        let pid = std::process::id();
+        assert_eq!(native_process_info(pid), ps_process_info(pid));
+        assert!(native_process_info(u32::MAX).is_none());
     }
 
     #[test]

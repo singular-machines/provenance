@@ -407,16 +407,28 @@ fn go(home: &std::path::Path, pr: &str, print: bool) -> Result<()> {
 /// The agent session this process runs under, if its hooks recorded it.
 fn current_session(records: &[live::Record]) -> Option<send::Sender> {
     let (harness, pid, started) = live::nearest_harness()?;
-    records
-        .iter()
-        .filter(|r| {
-            r.harness == harness && r.pid == Some(pid) && r.pid_started.as_deref() == Some(&started)
-        })
-        .max_by_key(|r| r.updated)
-        .map(|r| send::Sender {
-            harness: r.harness,
-            session_id: r.session_id.clone(),
-        })
+    session_for_process(records, harness, pid, &started)
+}
+
+fn session_for_process(
+    records: &[live::Record],
+    harness: Harness,
+    pid: u32,
+    started: &str,
+) -> Option<send::Sender> {
+    let mut matches = records.iter().filter(|r| {
+        r.harness == harness && r.pid == Some(pid) && r.pid_started.as_deref() == Some(started)
+    });
+    let first = matches.next()?;
+    // An app-server can host several sessions in one process. Recency does
+    // not prove which session called us, even if only one is busy right now.
+    if matches.any(|r| r.session_id != first.session_id) {
+        return None;
+    }
+    Some(send::Sender {
+        harness: first.harness,
+        session_id: first.session_id.clone(),
+    })
 }
 
 fn label(sender: Option<&send::Sender>) -> String {
@@ -921,5 +933,46 @@ mod send_cli_tests {
             Cli::try_parse_from(["provenance", "send", "123", "hello", "--resume", "--force"])
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    fn record(id: &str, harness: Harness, pid: u32, started: &str) -> live::Record {
+        live::Record {
+            harness,
+            session_id: id.into(),
+            app: String::new(),
+            cwd: "/same".into(),
+            pid: Some(pid),
+            pid_started: Some(started.into()),
+            last_event: "Stop".into(),
+            updated: Utc::now(),
+            branches: Vec::new(),
+            transcript_path: None,
+        }
+    }
+    #[test]
+    fn exact_process_only_and_ambiguous_sessions_refused() {
+        let a = record("a", Harness::Codex, 10, "start");
+        assert_eq!(
+            session_for_process(std::slice::from_ref(&a), Harness::Codex, 10, "start")
+                .unwrap()
+                .session_id,
+            "a"
+        );
+        assert!(
+            session_for_process(std::slice::from_ref(&a), Harness::Codex, 10, "reused").is_none()
+        );
+        assert!(
+            session_for_process(std::slice::from_ref(&a), Harness::ClaudeCode, 10, "start")
+                .is_none()
+        );
+        assert!(
+            session_for_process(std::slice::from_ref(&a), Harness::Codex, 11, "start").is_none()
+        );
+        let b = record("b", Harness::Codex, 10, "start");
+        assert!(session_for_process(&[a, b], Harness::Codex, 10, "start").is_none());
     }
 }
