@@ -432,9 +432,11 @@ fn go(home: &std::path::Path, pr: &str, print: bool) -> Result<()> {
 }
 
 /// The agent session this process runs under, if its hooks recorded it.
-fn current_session(records: &[live::Record]) -> Option<send::Sender> {
-    let (harness, pid, started) = live::nearest_harness()?;
-    session_for_process_with_ids(
+fn current_session(records: &[live::Record]) -> Result<Option<send::Sender>> {
+    let Some((harness, pid, started)) = live::nearest_harness() else {
+        return Ok(None);
+    };
+    identify_session(
         records,
         harness,
         pid,
@@ -454,6 +456,7 @@ fn session_for_process(
     session_for_process_with_ids(records, harness, pid, started, None, None)
 }
 
+#[cfg(test)]
 fn session_for_process_with_ids(
     records: &[live::Record],
     harness: Harness,
@@ -462,31 +465,54 @@ fn session_for_process_with_ids(
     thread: Option<&str>,
     session: Option<&str>,
 ) -> Option<send::Sender> {
-    let mut matches = records.iter().filter(|r| {
-        r.harness == harness && r.pid == Some(pid) && r.pid_started.as_deref() == Some(started)
-    });
-    let mut first = matches.next()?;
-    // An app-server can host several sessions in one process. Recency does
-    // not prove which session called us, even if only one is busy right now.
-    if matches.any(|r| r.session_id != first.session_id) {
-        // These variables only select among hook records for this verified
-        // ancestor. They are correctness hints within the OS user boundary,
-        // not authentication against malicious code running as that user.
-        let id = thread.filter(|id| !id.is_empty() && Some(*id) == session)?;
-        if harness != Harness::Codex {
-            return None;
-        }
-        first = records.iter().find(|r| {
+    identify_session(records, harness, pid, started, thread, session)
+        .ok()
+        .flatten()
+}
+
+fn identify_session(
+    records: &[live::Record],
+    harness: Harness,
+    pid: u32,
+    started: &str,
+    thread: Option<&str>,
+    session: Option<&str>,
+) -> Result<Option<send::Sender>> {
+    let candidates: Vec<_> = records
+        .iter()
+        .filter(|r| {
             r.harness == harness
                 && r.pid == Some(pid)
                 && r.pid_started.as_deref() == Some(started)
-                && r.session_id == id
-        })?;
-    }
-    Some(send::Sender {
-        harness: first.harness,
-        session_id: first.session_id.clone(),
-    })
+                && r.last_event != "SessionEnd"
+        })
+        .collect();
+    let Some(first) = candidates.first() else {
+        return Ok(None);
+    };
+    let multiple = candidates.iter().any(|r| r.session_id != first.session_id);
+    // Unrecorded callers can still send without a reply route. Conflicting
+    // identity evidence must never be treated as an unrecorded caller.
+    let selected = if harness == Harness::Codex && (thread.is_some() || session.is_some()) {
+        let id = thread
+            .filter(|id| !id.is_empty() && Some(*id) == session)
+            .context(
+                "Codex caller identity conflicts: CODEX_THREAD_ID and CODEX_SESSION_ID must agree",
+            )?;
+        candidates.iter().find(|r|r.session_id == id).copied()
+            .context("Codex caller identity conflicts: session ID has no active hook record for the verified process")?
+    } else {
+        if multiple {
+            anyhow::bail!(
+                "caller identity is ambiguous; shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching an active hook record for this process; refusing to guess"
+            );
+        }
+        first
+    };
+    Ok(Some(send::Sender {
+        harness: selected.harness,
+        session_id: selected.session_id.clone(),
+    }))
 }
 
 fn label(sender: Option<&send::Sender>) -> String {
@@ -512,13 +538,7 @@ struct Sent {
 }
 
 fn checked_sender(records: &[live::Record]) -> Result<Option<send::Sender>> {
-    let me = current_session(records);
-    if me.is_none() && live::nearest_harness().is_some() {
-        anyhow::bail!(
-            "caller identity unavailable or ambiguous; install/approve provenance session hooks and retry inside the intended session. Shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching a hook record for this process; refusing to guess"
-        );
-    }
-    Ok(me)
+    current_session(records)
 }
 
 fn named_recipient(
@@ -542,8 +562,10 @@ fn named_recipient(
     };
     let process = if alive {
         r.pid.map_or(go::Process::Unknown, go::Process::Live)
-    } else {
+    } else if r.pid.is_some() {
         go::Process::Gone
+    } else {
+        go::Process::Unknown
     };
     Ok((sighting, Some(live::state(r, alive)), process))
 }
@@ -1255,6 +1277,17 @@ mod identity_tests {
         assert!(
             session_for_process(std::slice::from_ref(&a), Harness::Codex, 11, "start").is_none()
         );
+        assert!(
+            session_for_process_with_ids(
+                std::slice::from_ref(&a),
+                Harness::Codex,
+                10,
+                "start",
+                Some("other"),
+                Some("other")
+            )
+            .is_none()
+        );
         let b = record("b", Harness::Codex, 10, "start");
         let records = [a, b];
         assert!(session_for_process(&records, Harness::Codex, 10, "start").is_none());
@@ -1287,6 +1320,87 @@ mod identity_tests {
             .unwrap()
             .session_id,
             "b"
+        );
+    }
+    #[test]
+    fn ended_records_do_not_hide_new_sessions_after_clear() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            let mut old = record("old", harness, 10, "start");
+            old.last_event = "SessionEnd".into();
+            let active = record("new", harness, 10, "start");
+            assert_eq!(
+                identify_session(&[old.clone(), active], harness, 10, "start", None, None)
+                    .unwrap()
+                    .unwrap()
+                    .session_id,
+                "new"
+            );
+            assert!(
+                identify_session(&[old], harness, 10, "start", None, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn unrecorded_callers_are_distinct_from_conflicting_identity() {
+        for harness in [
+            Harness::OpenCode,
+            Harness::ClaudeCode,
+            Harness::Codex,
+            Harness::Pi,
+        ] {
+            assert!(
+                identify_session(&[], harness, 10, "start", None, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let a = record("a", Harness::Codex, 10, "start");
+        assert!(
+            identify_session(
+                std::slice::from_ref(&a),
+                Harness::Codex,
+                10,
+                "start",
+                Some("b"),
+                Some("b")
+            )
+            .is_err()
+        );
+        assert!(
+            identify_session(
+                std::slice::from_ref(&a),
+                Harness::Codex,
+                10,
+                "start",
+                None,
+                None
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            identify_session(
+                std::slice::from_ref(&a),
+                Harness::Codex,
+                10,
+                "start",
+                Some("a"),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            identify_session(
+                &[a, record("b", Harness::Codex, 10, "start")],
+                Harness::Codex,
+                10,
+                "start",
+                None,
+                None
+            )
+            .is_err()
         );
     }
 }
@@ -1483,6 +1597,42 @@ mod named_tests {
         let msg: serde_json::Value = serde_json::from_str(mail.lines().next().unwrap()).unwrap();
         assert!(msg.get("pr").is_none());
         assert_eq!(msg["named_address"]["recipient"]["session_id"], "original");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn named_unknown_process_keeps_resume_guard() {
+        let home = scratch();
+        let me = send::Sender {
+            harness: Harness::Codex,
+            session_id: "maybe-open".into(),
+        };
+        let (_, binding) = names::Store::new(&home)
+            .register("Reviewer", &me, "/", None)
+            .unwrap();
+        let mut r = record("maybe-open", Harness::Codex, 1, "start");
+        r.pid = None;
+        r.pid_started = None;
+        r.last_event = "UserPromptSubmit".into();
+        let (s, state, process) = named_recipient(&binding, &[r]).unwrap();
+        assert_eq!(process, go::Process::Unknown);
+        for caller in [send::Caller::Mcp, send::Caller::Cli { force: false }] {
+            assert!(matches!(
+                plan_recipient(&home, &s, state, process, None, true, caller),
+                send::Delivery::Refuse(_)
+            ));
+        }
+        assert!(matches!(
+            plan_recipient(
+                &home,
+                &s,
+                state,
+                process,
+                None,
+                true,
+                send::Caller::Cli { force: true }
+            ),
+            send::Delivery::Resume { .. }
+        ));
         std::fs::remove_dir_all(home).unwrap();
     }
 }
