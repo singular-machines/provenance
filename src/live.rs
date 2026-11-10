@@ -164,7 +164,9 @@ fn nearest_harness_with(
         // Pi runs on Node or Bun and names itself through its process title,
         // which shows in the command line rather than the executable.
         let name = if matches!(name.as_str(), "node" | "bun") {
-            title(pid).unwrap_or(name)
+            // An unreadable Node/Bun title may hide an inner harness.
+            // Never continue to an outer session without that evidence.
+            title(pid)?
         } else {
             name
         };
@@ -201,6 +203,9 @@ fn process_title(pid: u32) -> Option<String> {
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let line = String::from_utf8_lossy(&out.stdout);
     let first = line.split_whitespace().next()?;
     Some(Path::new(first).file_name()?.to_string_lossy().to_string())
@@ -226,11 +231,20 @@ pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
 // Read the same kernel identity; never substitute environment or folder hints.
 #[cfg(target_os = "macos")]
 fn native_process_info(pid: u32) -> Option<(u32, String, String)> {
+    let (ppid, started) = native_process_identity(pid)?;
+    // Liveness does not need this path; ancestor recognition does. Never
+    // substitute a resolved path that could hide a symlink-launched harness.
+    let path = native_invoked_path(i32::try_from(pid).ok()?)?;
+    Some((ppid, started, path))
+}
+
+/// Kernel process identity independent of executable path/title visibility.
+#[cfg(target_os = "macos")]
+fn native_process_identity(pid: u32) -> Option<(u32, String)> {
     let pid = i32::try_from(pid).ok()?;
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
-    // SAFETY: libproc receives a correctly sized, writable buffer. It is read
-    // only after libproc reports that the complete structure was written.
+    // SAFETY: correctly sized writable buffer; read only after a full write.
     let n = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -244,16 +258,11 @@ fn native_process_info(pid: u32) -> Option<(u32, String, String)> {
         return None;
     }
     let info = unsafe { info.assume_init() };
-    // proc_pidpath resolves symlinks (claude may become versions/<version>),
-    // which can hide an inner harness. KERN_PROCARGS2 exposes the invoked
-    // executable path used by ps. If it is unavailable, stop the ancestor
-    // walk rather than substituting a resolved path and selecting an outer session.
-    let path = native_invoked_path(pid)?;
     let started = chrono::DateTime::from_timestamp(i64::try_from(info.pbi_start_tvsec).ok()?, 0)?
         .with_timezone(&chrono::Local)
         .format("%a %b %-d %H:%M:%S %Y")
         .to_string();
-    Some((info.pbi_ppid, started, path))
+    Some((info.pbi_ppid, started))
 }
 
 #[cfg(target_os = "macos")]
@@ -263,7 +272,7 @@ fn invoked_path(bytes: &[u8]) -> Option<String> {
     let path = bytes.get(std::mem::size_of::<libc::c_int>()..)?;
     let end = path.iter().position(|b| *b == 0)?;
     let path = std::str::from_utf8(&path[..end]).ok()?;
-    Path::new(path).is_absolute().then(|| path.to_string())
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -444,6 +453,8 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
     let mut alive: HashMap<u32, String> = Command::new("ps")
         .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
         .output()
+        .ok()
+        .filter(|out| out.status.success())
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
@@ -455,15 +466,35 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
                 .collect()
         })
         .unwrap_or_default();
-    // The sandbox may deny ps here too, not just during ancestor discovery.
+    // Start time alone proves liveness. Do not require executable-path or
+    // title visibility, which can be more restricted in a sandbox.
+    fill_alive_pids(records, &mut alive, &process_start);
+    alive
+}
+
+fn process_start(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        native_process_identity(pid).map(|(_, started)| started)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ps_info(pid).map(|(_, started, _)| started)
+    }
+}
+
+fn fill_alive_pids(
+    records: &[Record],
+    alive: &mut HashMap<u32, String>,
+    start: &dyn Fn(u32) -> Option<String>,
+) {
     for pid in records.iter().filter_map(|r| r.pid) {
         if let std::collections::hash_map::Entry::Vacant(entry) = alive.entry(pid)
-            && let Some((_, started, _)) = ps_info(pid)
+            && let Some(started) = start(pid)
         {
             entry.insert(started);
         }
     }
-    alive
 }
 
 pub fn is_alive(r: &Record, started: &HashMap<u32, String>) -> bool {
@@ -666,12 +697,11 @@ mod tests {
         let mut data = 1i32.to_ne_bytes().to_vec();
         data.extend_from_slice(b"/tmp/claude\0argv\0PRIVATE_ENV=hidden\0");
         assert_eq!(invoked_path(&data).as_deref(), Some("/tmp/claude"));
-        for data in [
-            &b""[..],
-            &b"abc"[..],
-            &b"1234relative\0"[..],
-            &b"1234/no-null"[..],
-        ] {
+        assert_eq!(
+            invoked_path(b"1234./claude\0ignored").as_deref(),
+            Some("./claude")
+        );
+        for data in [&b""[..], &b"abc"[..], &b"1234\0"[..], &b"1234/no-null"[..]] {
             assert!(invoked_path(data).is_none());
         }
     }
@@ -694,13 +724,42 @@ mod tests {
             .unwrap();
             assert_eq!(found.0, Harness::ClaudeCode);
             assert_eq!(found.1, std::os::unix::process::parent_id());
+            if std::env::var_os("PROVENANCE_NATIVE_FIXTURE_RELATIVE").is_some() {
+                let pid = std::os::unix::process::parent_id();
+                let (ppid, started, path) = native_process_info(pid).unwrap();
+                assert!(ppid > 0);
+                assert_eq!(path, "./claude");
+                let r = Record {
+                    harness: Harness::ClaudeCode,
+                    session_id: "relative".into(),
+                    app: String::new(),
+                    cwd: String::new(),
+                    pid: Some(pid),
+                    pid_started: Some(started),
+                    last_event: "UserPromptSubmit".into(),
+                    updated: Utc::now(),
+                    branches: vec![],
+                    transcript_path: None,
+                };
+                let mut alive = HashMap::new();
+                fill_alive_pids(std::slice::from_ref(&r), &mut alive, &process_start);
+                assert!(is_alive(&r, &alive));
+            }
         } else {
             let (next, stage) = if stage == "outer" {
-                (root.join("claude"), "inner")
+                (
+                    if std::env::var_os("PROVENANCE_NATIVE_FIXTURE_RELATIVE").is_some() {
+                        PathBuf::from("./claude")
+                    } else {
+                        root.join("claude")
+                    },
+                    "inner",
+                )
             } else {
                 (std::env::current_exe().unwrap(), "probe")
             };
             let output = Command::new(next)
+                .current_dir(&root)
                 .args([
                     "--exact",
                     "live::tests::native_symlink_harness_fixture",
@@ -744,6 +803,79 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_relative_path_keeps_ancestor_and_liveness() {
+        let root = std::env::temp_dir().join(format!("prov-relative-{}", crate::send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("2.1.321");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        for name in ["claude", "codex"] {
+            std::os::unix::fs::symlink(&binary, root.join(name)).unwrap();
+        }
+        let output = Command::new("./codex")
+            .current_dir(&root)
+            .args([
+                "--exact",
+                "live::tests::native_symlink_harness_fixture",
+                "--nocapture",
+            ])
+            .env("PROVENANCE_NATIVE_FIXTURE_ROOT", &root)
+            .env("PROVENANCE_NATIVE_FIXTURE_STAGE", "outer")
+            .env("PROVENANCE_NATIVE_FIXTURE_RELATIVE", "1")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn unreadable_node_or_bun_title_stops_before_outer_harness() {
+        for binary in ["node", "bun"] {
+            let info = |pid| match pid {
+                10 => Some((20, "inner".into(), format!("/bin/{binary}"))),
+                20 => Some((1, "outer".into(), "/bin/codex".into())),
+                _ => None,
+            };
+            assert!(nearest_harness_with(10, &info, &|_| None).is_none());
+            assert_eq!(
+                nearest_harness_with(10, &info, &|_| Some("claude".into())),
+                Some((Harness::ClaudeCode, 10, "inner".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_fill_needs_only_matching_start_time() {
+        let r = Record {
+            harness: Harness::Codex,
+            session_id: "test".into(),
+            app: String::new(),
+            cwd: String::new(),
+            pid: Some(42),
+            pid_started: Some("start".into()),
+            last_event: "Stop".into(),
+            updated: Utc::now(),
+            branches: vec![],
+            transcript_path: None,
+        };
+        let mut alive = HashMap::new();
+        fill_alive_pids(std::slice::from_ref(&r), &mut alive, &|pid| {
+            (pid == 42).then(|| "start".into())
+        });
+        assert!(is_alive(&r, &alive));
+        let mut reused = r.clone();
+        reused.pid_started = Some("other".into());
+        assert!(!is_alive(&reused, &alive));
+        fill_alive_pids(&[r], &mut alive, &|_| None);
+        assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
     }
 
     #[test]
