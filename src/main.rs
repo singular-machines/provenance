@@ -119,12 +119,16 @@ enum HarnessArg {
 }
 
 fn main() -> Result<()> {
+    dispatch(Cli::parse())
+}
+
+fn dispatch(cli: Cli) -> Result<()> {
     let home = || -> Result<PathBuf> {
         Ok(PathBuf::from(
             std::env::var_os("HOME").context("HOME is not set")?,
         ))
     };
-    match Cli::parse().command {
+    match cli.command {
         Cmd::Prs {
             repo,
             author,
@@ -546,7 +550,7 @@ fn terminal_text(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
             if (c.is_control() && c != '\n' && c != '\t')
-                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}') {
+                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{61c}') {
                 c.escape_default().collect::<Vec<_>>()
             } else {
                 vec![c]
@@ -957,12 +961,20 @@ mod send_cli_tests {
                     "#!/bin/sh\nprintf 'fixture diagnostics' >&2\nexit 97\n",
                 ),
                 ("claude", "#!/bin/sh\nprintf 'fixture answer'\n"),
+                (
+                    "gh",
+                    "#!/bin/sh\ncase \"$*\" in *'ids[]='*) cat \"$HOME/commits.json\";; *) cat \"$HOME/pr.json\";; esac\n",
+                ),
+                (
+                    "ps",
+                    "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n';; esac\n",
+                ),
             ] {
                 let path = root.join(name);
                 std::fs::write(&path, script).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "send_cli_tests::resolved_send_preserves_caller_log_and_sender",
@@ -975,10 +987,16 @@ mod send_cli_tests {
                     "PATH",
                     format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
                 )
-                .status()
+                .output()
                 .unwrap();
             std::fs::remove_dir_all(root).unwrap();
-            assert!(status.success());
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
             return;
         }
         let home = std::env::temp_dir().join(format!("prov-resolved-{}", send::new_id()));
@@ -1069,6 +1087,88 @@ mod send_cli_tests {
         )
         .unwrap();
         assert_eq!(sent.note, None);
+        // Exercise resolution, backend, CLI command and parsed dispatch with real
+        // records and fake gh, without consulting an external service.
+        let fixture_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        std::fs::write(fixture_home.join("pr.json"), r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","headRefName":"fixture","headRefOid":"aaa","baseRefOid":"bbb","repository":{"nameWithOwner":"fixture/repo"}}}}}"#).unwrap();
+        std::fs::write(fixture_home.join("commits.json"), r#"{"data":{"nodes":[{"id":"PR_1","headRefOid":"aaa","baseRefOid":"bbb","commits":{"nodes":[{"commit":{"message":"Agent-Session: codex/fixture-target","committedDate":"2026-10-30T01:00:00Z"}}]}}]}}"#).unwrap();
+        let records = live::live_dir(&fixture_home);
+        std::fs::create_dir_all(&records).unwrap();
+        let mut record = live::Record {
+            harness: Harness::Codex,
+            session_id: "fixture-target".into(),
+            app: "Terminal".into(),
+            cwd: home.to_string_lossy().into_owned(),
+            pid: None,
+            pid_started: None,
+            last_event: "UserPromptSubmit".into(),
+            updated: Utc::now(),
+            branches: vec![live::BranchSeen {
+                cwd: home.to_string_lossy().into_owned(),
+                branch: "fixture".into(),
+                last_seen: Utc::now(),
+            }],
+            transcript_path: Some(
+                home.join("real-wiring.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        let record_path = records.join("target.json");
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let pr = "fixture/repo#1";
+        let error = <PathBuf as SendBackend>::send_message(
+            &fixture_home,
+            pr,
+            "request",
+            true,
+            send::Caller::Mcp,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("can't message the session behind"),
+            "{error}"
+        );
+        assert!(!error.contains("--force"));
+        assert!(!error.contains("headless turn"));
+        for force in [false, true] {
+            let error = send_cmd(&fixture_home, pr, "request", true, force, None)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error.contains("headless turn"), force, "{error}");
+            assert_eq!(error.contains("--force"), !force, "{error}");
+            if force {
+                assert!(error.contains("real-wiring.jsonl"), "{error}");
+            }
+            let mut args = vec!["provenance", "send", pr, "request", "--resume"];
+            if force {
+                args.push("--force");
+            }
+            let error = dispatch(Cli::try_parse_from(args).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error.contains("headless turn"), force, "{error}");
+            assert_eq!(error.contains("--force"), !force, "{error}");
+        }
+        // The fake ps identifies this parent as the sender. Self exclusion must
+        // win even with force; dropping sender at the real entry point breaks it.
+        record.pid = Some(std::os::unix::process::parent_id());
+        record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = send_message(
+            &fixture_home,
+            pr,
+            "request",
+            true,
+            send::Caller::Cli { force: true },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("it's this session"), "{error}");
+        assert!(!error.contains("headless turn"));
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -1077,7 +1177,7 @@ mod send_cli_tests {
         let raw: String = (0x202a..=0x202e)
             .chain(0x2066..=0x2069)
             .chain(0x200b..=0x200f)
-            .chain([0x2060, 0xfeff])
+            .chain([0x2060, 0xfeff, 0x61c])
             .map(|n| char::from_u32(n).unwrap())
             .collect();
         let framed = send::framed_reply("m", "fixture", &raw).unwrap();
