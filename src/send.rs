@@ -47,14 +47,14 @@ pub struct Sender {
 /// How to deliver to one session. `socket` finds a Claude Code process's
 /// inbox socket, if that process still holds the given session.
 fn plan_delivery(
-    m: &SessionMatch,
+    s: &crate::sessions::Sighting,
+    state: Option<State>,
     process: Process,
     resume: bool,
     force: bool,
     machine: Option<&str>,
     socket: &dyn Fn(u32, &str) -> Option<PathBuf>,
 ) -> Delivery {
-    let s = &m.sighting;
     if s.url.is_some() {
         return Delivery::Refuse("it's a Claude Code on the web session".into());
     }
@@ -73,7 +73,7 @@ fn plan_delivery(
         ));
     }
     if let Process::Live(pid) = process
-        && m.state != Some(State::Ended)
+        && state != Some(State::Ended)
     {
         return match s.harness {
             Harness::ClaudeCode => match socket(pid, &s.session_id) {
@@ -96,14 +96,14 @@ fn plan_delivery(
     // Without a PID, a session still open mid-turn can read as Stopped.
     if matches!(process, Process::Unknown | Process::MaybeHeld)
         && matches!(
-            m.state,
+            state,
             Some(State::Running | State::Waiting | State::Stopped)
         )
         && !(resume && force)
     {
         return Delivery::Refuse(format!(
             "{status}; its last recorded state is {}, so it may still be open",
-            crate::render::state_word(m.state.unwrap())
+            crate::render::state_word(state.unwrap())
         ));
     }
     if !resume {
@@ -125,7 +125,8 @@ pub enum Caller {
 /// Plan delivery and derive retry advice from the same planner used to resume.
 /// `force` is a CLI-only override for unknown processes recorded as active.
 pub fn plan(
-    m: &SessionMatch,
+    s: &crate::sessions::Sighting,
+    state: Option<State>,
     process: Process,
     resume: bool,
     caller: Caller,
@@ -133,17 +134,17 @@ pub fn plan(
     socket: &dyn Fn(u32, &str) -> Option<PathBuf>,
 ) -> Delivery {
     let force = matches!(caller, Caller::Cli { force: true });
-    let decision = plan_delivery(m, process, resume, force, machine, socket);
+    let decision = plan_delivery(s, state, process, resume, force, machine, socket);
     if let Delivery::Refuse(reason) = decision {
         let advice = if !resume
             && matches!(
-                plan_delivery(m, process, true, false, machine, socket),
+                plan_delivery(s, state, process, true, false, machine, socket),
                 Delivery::Resume { .. }
             ) {
             "; add --resume to resume it headless, or open it with `provenance go`"
         } else if matches!(caller, Caller::Cli { force: false })
             && matches!(
-                plan_delivery(m, process, true, true, machine, socket),
+                plan_delivery(s, state, process, true, true, machine, socket),
                 Delivery::Resume { .. }
             )
         {
@@ -479,13 +480,22 @@ pub fn describe(d: &Delivery) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedAddress {
+    pub name: String,
+    pub recipient: Sender,
+}
+
 /// One line in a session's mailbox.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Mail {
     Message {
         id: String,
-        pr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        named_address: Option<NamedAddress>,
         from: String,
         sender: Option<Sender>,
         text: String,
@@ -632,7 +642,15 @@ mod tests {
                 for resume in [false, true] {
                     let sessions = [session(harness, Some(state))];
                     let planner = |m: &SessionMatch, resume| {
-                        plan(m, Process::Unknown, resume, Caller::Mcp, None, &no_socket)
+                        plan(
+                            &m.sighting,
+                            m.state,
+                            Process::Unknown,
+                            resume,
+                            Caller::Mcp,
+                            None,
+                            &no_socket,
+                        )
                     };
                     let reason = choose(&sessions, resume, &planner).unwrap_err();
                     assert!(reason.contains("may still be open"));
@@ -643,7 +661,15 @@ mod tests {
             }
             let sessions = [session(harness, Some(State::Ended))];
             let planner = |m: &SessionMatch, resume| {
-                plan(m, Process::Unknown, resume, Caller::Mcp, None, &no_socket)
+                plan(
+                    &m.sighting,
+                    m.state,
+                    Process::Unknown,
+                    resume,
+                    Caller::Mcp,
+                    None,
+                    &no_socket,
+                )
             };
             assert!(
                 choose(&sessions, false, &planner)
@@ -665,7 +691,8 @@ mod tests {
                 for (resume, force) in [(false, false), (true, false), (true, true)] {
                     let planner = |m: &SessionMatch, resume| {
                         plan(
-                            m,
+                            &m.sighting,
+                            m.state,
                             if m.sighting.session_id == "older" {
                                 Process::Gone
                             } else {
@@ -717,7 +744,8 @@ mod tests {
             for force in [false, true] {
                 let planner = |m: &SessionMatch, resume| {
                     plan(
-                        m,
+                        &m.sighting,
+                        m.state,
                         Process::Live(7),
                         resume,
                         Caller::Cli { force },
@@ -736,7 +764,8 @@ mod tests {
             for force in [false, true] {
                 let planner = |m: &SessionMatch, resume| {
                     plan(
-                        m,
+                        &m.sighting,
+                        m.state,
                         Process::Gone,
                         resume,
                         Caller::Cli { force },
@@ -775,7 +804,8 @@ mod tests {
                         }
                         let planner = |m: &SessionMatch, resume| {
                             plan(
-                                m,
+                                &m.sighting,
+                                m.state,
                                 Process::Unknown,
                                 resume,
                                 Caller::Cli { force },
@@ -819,7 +849,8 @@ mod tests {
             let mut m = session(harness, Some(State::Running));
             assert_eq!(
                 plan(
-                    &m,
+                    &m.sighting,
+                    m.state,
                     Process::Live(7),
                     true,
                     Caller::Cli { force: true },
@@ -827,7 +858,8 @@ mod tests {
                     &a_socket
                 ),
                 plan(
-                    &m,
+                    &m.sighting,
+                    m.state,
                     Process::Live(7),
                     false,
                     Caller::Cli { force: false },
@@ -838,7 +870,8 @@ mod tests {
             if harness == Harness::ClaudeCode {
                 assert!(matches!(
                     plan(
-                        &m,
+                        &m.sighting,
+                        m.state,
                         Process::Live(7),
                         true,
                         Caller::Cli { force: true },
@@ -850,7 +883,8 @@ mod tests {
             }
             assert!(matches!(
                 plan(
-                    &m,
+                    &m.sighting,
+                    m.state,
                     Process::Gone,
                     true,
                     Caller::Cli { force: false },
@@ -860,12 +894,13 @@ mod tests {
                 Delivery::Resume { .. }
             ));
             assert!(
-                matches!(plan(&m, Process::Gone, false, Caller::Cli { force: false }, None, &no_socket), Delivery::Refuse(reason) if reason.contains("isn't running"))
+                matches!(plan(&m.sighting, m.state, Process::Gone, false, Caller::Cli { force: false }, None, &no_socket), Delivery::Refuse(reason) if reason.contains("isn't running"))
             );
             m.sighting.machine = Some("elsewhere".into());
             assert!(matches!(
                 plan(
-                    &m,
+                    &m.sighting,
+                    m.state,
                     Process::Unknown,
                     true,
                     Caller::Cli { force: true },
@@ -878,7 +913,8 @@ mod tests {
             m.sighting.url = Some("https://example.invalid".into());
             assert!(matches!(
                 plan(
-                    &m,
+                    &m.sighting,
+                    m.state,
                     Process::Unknown,
                     true,
                     Caller::Cli { force: true },
@@ -895,7 +931,8 @@ mod tests {
         let claude = session(Harness::ClaudeCode, Some(State::Waiting));
         assert_eq!(
             plan(
-                &claude,
+                &claude.sighting,
+                claude.state,
                 Process::Live(7),
                 false,
                 Caller::Cli { force: false },
@@ -907,7 +944,8 @@ mod tests {
         let codex = session(Harness::Codex, Some(State::Running));
         assert_eq!(
             plan(
-                &codex,
+                &codex.sighting,
+                codex.state,
                 Process::Live(7),
                 false,
                 Caller::Cli { force: false },
@@ -923,7 +961,8 @@ mod tests {
         let claude = session(Harness::ClaudeCode, Some(State::Waiting));
         assert!(matches!(
             plan(
-                &claude,
+                &claude.sighting,
+                claude.state,
                 Process::Live(7),
                 true,
                 Caller::Cli { force: false },
@@ -939,7 +978,8 @@ mod tests {
         let claude = session(Harness::ClaudeCode, Some(State::Ended));
         assert!(matches!(
             plan(
-                &claude,
+                &claude.sighting,
+                claude.state,
                 Process::Live(7),
                 false,
                 Caller::Cli { force: false },
@@ -950,7 +990,8 @@ mod tests {
         ));
         assert_eq!(
             plan(
-                &claude,
+                &claude.sighting,
+                claude.state,
                 Process::Gone,
                 true,
                 Caller::Cli { force: false },
@@ -970,7 +1011,8 @@ mod tests {
         let codex = session(Harness::Codex, None);
         assert_eq!(
             plan(
-                &codex,
+                &codex.sighting,
+                codex.state,
                 Process::Unknown,
                 true,
                 Caller::Cli { force: false },
@@ -989,7 +1031,8 @@ mod tests {
         let pi = session(Harness::Pi, Some(State::Waiting));
         assert!(matches!(
             plan(
-                &pi,
+                &pi.sighting,
+                pi.state,
                 Process::Live(7),
                 true,
                 Caller::Cli { force: false },
@@ -1002,7 +1045,8 @@ mod tests {
         far.sighting.machine = Some("other".into());
         assert!(matches!(
             plan(
-                &far,
+                &far.sighting,
+                far.state,
                 Process::Live(7),
                 true,
                 Caller::Cli { force: false },
@@ -1101,7 +1145,8 @@ mod tests {
             &path,
             &Mail::Message {
                 id: "m-1".into(),
-                pr: "o/r#1".into(),
+                pr: Some("o/r#1".into()),
+                named_address: None,
                 from: "you".into(),
                 sender: Some(sender.clone()),
                 text: "hi".into(),
@@ -1331,5 +1376,10 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn old_mail_with_pr_and_without_named_metadata_still_reads() {
+        let m:Mail=serde_json::from_str(r#"{"kind":"message","id":"m-old","pr":"o/r#1","from":"terminal","sender":null,"text":"hi","at":"2026-01-01T00:00:00Z"}"#).unwrap();
+        assert!(matches!(m,Mail::Message{pr:Some(pr),named_address:None,..} if pr=="o/r#1"));
     }
 }

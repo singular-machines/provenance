@@ -146,14 +146,27 @@ impl Probe for SystemProbe {
 /// The nearest ancestor process that is a harness (`claude`, `codex`,
 /// `opencode` or `pi`): its harness, PID and start time.
 pub fn nearest_harness() -> Option<(Harness, u32, String)> {
-    let mut pid = std::os::unix::process::parent_id();
+    nearest_harness_with(
+        std::os::unix::process::parent_id(),
+        &ps_info,
+        &process_title,
+    )
+}
+
+fn nearest_harness_with(
+    mut pid: u32,
+    info: &dyn Fn(u32) -> Option<(u32, String, String)>,
+    title: &dyn Fn(u32) -> Option<String>,
+) -> Option<(Harness, u32, String)> {
     for _ in 0..12 {
-        let (ppid, started, comm) = ps_info(pid)?;
+        let (ppid, started, comm) = info(pid)?;
         let name = Path::new(&comm).file_name()?.to_string_lossy().to_string();
         // Pi runs on Node or Bun and names itself through its process title,
         // which shows in the command line rather than the executable.
         let name = if matches!(name.as_str(), "node" | "bun") {
-            process_title(pid).unwrap_or(name)
+            // An unreadable Node/Bun title may hide an inner harness.
+            // Never continue to an outer session without that evidence.
+            title(pid)?
         } else {
             name
         };
@@ -190,6 +203,9 @@ fn process_title(pid: u32) -> Option<String> {
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let line = String::from_utf8_lossy(&out.stdout);
     let first = line.split_whitespace().next()?;
     Some(Path::new(first).file_name()?.to_string_lossy().to_string())
@@ -205,7 +221,110 @@ pub fn opencode_running() -> bool {
 
 /// `(ppid, start time, command path)` for one process.
 pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
-    let out = Command::new("ps")
+    let result = ps_process_info(pid);
+    #[cfg(target_os = "macos")]
+    let result = result.or_else(|| native_process_info(pid));
+    result
+}
+
+// Codex's macOS sandbox can deny executing ps while allowing libproc queries.
+// Read the same kernel identity; never substitute environment or folder hints.
+#[cfg(target_os = "macos")]
+fn native_process_info(pid: u32) -> Option<(u32, String, String)> {
+    let (ppid, started) = native_process_identity(pid)?;
+    // Liveness does not need this path; ancestor recognition does. Never
+    // substitute a resolved path that could hide a symlink-launched harness.
+    let path = native_invoked_path(i32::try_from(pid).ok()?)?;
+    Some((ppid, started, path))
+}
+
+/// Kernel process identity independent of executable path/title visibility.
+#[cfg(target_os = "macos")]
+fn native_process_identity(pid: u32) -> Option<(u32, String)> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: correctly sized writable buffer; read only after a full write.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if n != size as i32 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let started = chrono::DateTime::from_timestamp(i64::try_from(info.pbi_start_tvsec).ok()?, 0)?
+        .with_timezone(&chrono::Local)
+        .format("%a %b %-d %H:%M:%S %Y")
+        .to_string();
+    Some((info.pbi_ppid, started))
+}
+
+#[cfg(target_os = "macos")]
+fn invoked_path(bytes: &[u8]) -> Option<String> {
+    // Kernel layout: argc, NUL-terminated executable path, argv, environment.
+    // Only consume the executable path; never expose arguments/environment.
+    let path = bytes.get(std::mem::size_of::<libc::c_int>()..)?;
+    let end = path.iter().position(|b| *b == 0)?;
+    let path = std::str::from_utf8(&path[..end]).ok()?;
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn native_invoked_path(pid: i32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0;
+    // SAFETY: query the required buffer size, with a valid MIB and size pointer.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size == 0
+        || size > 16 * 1024 * 1024
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; size];
+    // SAFETY: bytes is writable for size bytes. Read only the returned extent.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    invoked_path(bytes.get(..size)?)
+}
+
+// Pin only time. LC_ALL would also change comm's character encoding.
+fn start_time_ps() -> Command {
+    let mut command = Command::new("ps");
+    command.env_remove("LC_ALL").env("LC_TIME", "C");
+    if let Some(ctype) = std::env::var_os("LC_ALL").filter(|s| !s.is_empty()) {
+        command.env("LC_CTYPE", ctype);
+    }
+    command
+}
+
+fn ps_process_info(pid: u32) -> Option<(u32, String, String)> {
+    let out = start_time_ps()
         .args([
             "-o",
             "ppid=",
@@ -218,6 +337,9 @@ pub(crate) fn ps_info(pid: u32) -> Option<(u32, String, String)> {
         ])
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     // `lstart` is always five fields: "Fri Oct 30 18:46:07 2026".
     let mut parts = line.split_whitespace();
@@ -338,9 +460,11 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
     if pids.is_empty() {
         return HashMap::new();
     }
-    Command::new("ps")
+    let mut alive: HashMap<u32, String> = start_time_ps()
         .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
         .output()
+        .ok()
+        .filter(|out| out.status.success())
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
@@ -351,7 +475,45 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Start time alone proves liveness. Do not require executable-path or
+    // title visibility, which can be more restricted in a sandbox.
+    fill_alive_pids(records, &mut alive, &process_start);
+    alive
+}
+
+fn process_start(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        native_process_identity(pid).map(|(_, started)| started)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ps_info(pid).map(|(_, started, _)| started)
+    }
+}
+
+fn fill_alive_pids(
+    records: &[Record],
+    alive: &mut HashMap<u32, String>,
+    start: &dyn Fn(u32) -> Option<String>,
+) {
+    for pid in records.iter().filter_map(|r| r.pid) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = alive.entry(pid)
+            && let Some(started) = start(pid)
+        {
+            entry.insert(started);
+        }
+    }
+}
+
+/// A legacy localized or missing start time cannot establish that a PID is
+/// gone. Keep it unknown until a start/prompt hook refreshes the record.
+pub fn has_c_start_time(record: &Record) -> bool {
+    record.pid_started.as_deref().is_some_and(|s| {
+        chrono::NaiveDateTime::parse_from_str(s, "%a %b %e %H:%M:%S %Y")
+            .is_ok_and(|date| date.format("%a %b %-d %H:%M:%S %Y").to_string() == s)
+    })
 }
 
 pub fn is_alive(r: &Record, started: &HashMap<u32, String>) -> bool {
@@ -512,11 +674,357 @@ mod tests {
     }
 
     #[test]
+    fn nested_harness_uses_nearest_verified_ancestor() {
+        let info = |pid| match pid {
+            10 => Some((20, "shell".into(), "/bin/zsh".into())),
+            20 => Some((30, "inner".into(), "/usr/bin/claude".into())),
+            30 => Some((1, "outer".into(), "/usr/bin/codex".into())),
+            _ => None,
+        };
+        assert_eq!(
+            nearest_harness_with(10, &info, &|_| None),
+            Some((Harness::ClaudeCode, 20, "inner".into()))
+        );
+        assert!(nearest_harness_with(99, &info, &|_| None).is_none());
+    }
+
+    #[test]
     fn parses_ps_output_for_this_process() {
         let (ppid, started, comm) = ps_info(std::process::id()).unwrap();
         assert!(ppid > 0);
         assert_eq!(started.split_whitespace().count(), 5);
         assert!(!comm.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_identity_matches_ps_and_rejects_missing_process() {
+        let pid = std::process::id();
+        let native = native_process_info(pid).unwrap();
+        let ps = ps_process_info(pid).unwrap();
+        assert_eq!((&native.0, &native.1), (&ps.0, &ps.1));
+        assert_eq!(
+            std::fs::canonicalize(native.2).unwrap(),
+            std::fs::canonicalize(ps.2).unwrap()
+        );
+        assert!(native_process_info(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_us_locale_keeps_ps_native_and_hook_start_times_equal() {
+        if std::env::var_os("PROVENANCE_LOCALE_FIXTURE").is_none() {
+            let root = std::env::temp_dir().join(format!("prov-locale-{}", crate::send::new_id()));
+            let directory = root.join("é dir/Fake.app/Contents/MacOS");
+            std::fs::create_dir_all(&directory).unwrap();
+            let binary = directory.join("codex");
+            std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+            for (category, locale) in [
+                ("LC_ALL", "C"),
+                ("LC_ALL", "en_GB.UTF-8"),
+                ("LC_ALL", "de_DE.UTF-8"),
+                ("LANG", "en_GB.UTF-8"),
+                ("LANG", "de_DE.UTF-8"),
+                ("none", ""),
+            ] {
+                let mut command = Command::new(&binary);
+                command
+                    .args([
+                        "--exact",
+                        "live::tests::non_us_locale_keeps_ps_native_and_hook_start_times_equal",
+                        "--nocapture",
+                    ])
+                    .env_remove("LC_ALL")
+                    .env_remove("LANG")
+                    .env_remove("LC_TIME")
+                    .env_remove("LC_CTYPE")
+                    .env("PROVENANCE_LOCALE_FIXTURE", format!("{category}:{locale}"));
+                if category != "none" {
+                    command.env(category, locale);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{category}={locale}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let pid = std::process::id();
+        let native = native_process_identity(pid).unwrap().1;
+        let (ppid, ps, comm) = ps_process_info(pid).unwrap();
+        assert_eq!(ppid, std::os::unix::process::parent_id());
+        assert_eq!(ps, native);
+        let raw_comm = Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(raw_comm.status.success());
+        assert_eq!(comm, String::from_utf8(raw_comm.stdout).unwrap().trim());
+        let variant = std::env::var("PROVENANCE_LOCALE_FIXTURE").unwrap();
+        if variant.contains("UTF-8") {
+            assert!(comm.contains("é dir/Fake.app/Contents/MacOS/codex"));
+            assert_eq!(
+                std::fs::canonicalize(&comm).unwrap(),
+                std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+            );
+        }
+        // Prove the child locale is effective, rather than silently testing C.
+        let localized = Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(localized.status.success());
+        let localized = String::from_utf8(localized.stdout)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(localized == native, !variant.contains("UTF-8"), "{variant}");
+        struct IdentityProbe {
+            pid: u32,
+            started: String,
+        }
+        impl Probe for IdentityProbe {
+            fn harness_process(&self) -> Option<(u32, String)> {
+                Some((self.pid, self.started.clone()))
+            }
+            fn branch(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn env(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let probe = IdentityProbe { pid, started: ps };
+        let mut old = update(None, Harness::Codex, ev("SessionStart"), Utc::now(), &probe);
+        old.pid_started = Some(localized);
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let refreshed = update(
+                Some(old.clone()),
+                Harness::Codex,
+                ev(event),
+                Utc::now(),
+                &probe,
+            );
+            assert_eq!(refreshed.pid_started.as_deref(), Some(native.as_str()));
+            assert!(is_alive(
+                &refreshed,
+                &alive_pids(std::slice::from_ref(&refreshed))
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invoked_path_parser_is_bounded_to_executable() {
+        let mut data = 1i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/tmp/claude\0argv\0PRIVATE_ENV=hidden\0");
+        assert_eq!(invoked_path(&data).as_deref(), Some("/tmp/claude"));
+        assert_eq!(
+            invoked_path(b"1234./claude\0ignored").as_deref(),
+            Some("./claude")
+        );
+        for data in [&b""[..], &b"abc"[..], &b"1234\0"[..], &b"1234/no-null"[..]] {
+            assert!(invoked_path(data).is_none());
+        }
+    }
+
+    // Each subprocess is this test executable, under throwaway symlink names.
+    // No model, hooks, owner state, or existing harness is involved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_symlink_harness_fixture() {
+        let Ok(stage) = std::env::var("PROVENANCE_NATIVE_FIXTURE_STAGE") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("PROVENANCE_NATIVE_FIXTURE_ROOT").unwrap());
+        if stage == "probe" {
+            let found = nearest_harness_with(
+                std::os::unix::process::parent_id(),
+                &native_process_info,
+                &|_| None,
+            )
+            .unwrap();
+            assert_eq!(found.0, Harness::ClaudeCode);
+            assert_eq!(found.1, std::os::unix::process::parent_id());
+            if std::env::var_os("PROVENANCE_NATIVE_FIXTURE_RELATIVE").is_some() {
+                let pid = std::os::unix::process::parent_id();
+                let (ppid, started, path) = native_process_info(pid).unwrap();
+                assert!(ppid > 0);
+                assert_eq!(path, "./claude");
+                let r = Record {
+                    harness: Harness::ClaudeCode,
+                    session_id: "relative".into(),
+                    app: String::new(),
+                    cwd: String::new(),
+                    pid: Some(pid),
+                    pid_started: Some(started),
+                    last_event: "UserPromptSubmit".into(),
+                    updated: Utc::now(),
+                    branches: vec![],
+                    transcript_path: None,
+                };
+                let mut alive = HashMap::new();
+                fill_alive_pids(std::slice::from_ref(&r), &mut alive, &process_start);
+                assert!(is_alive(&r, &alive));
+            }
+        } else {
+            let (next, stage) = if stage == "outer" {
+                (
+                    if std::env::var_os("PROVENANCE_NATIVE_FIXTURE_RELATIVE").is_some() {
+                        PathBuf::from("./claude")
+                    } else {
+                        root.join("claude")
+                    },
+                    "inner",
+                )
+            } else {
+                (std::env::current_exe().unwrap(), "probe")
+            };
+            let output = Command::new(next)
+                .current_dir(&root)
+                .args([
+                    "--exact",
+                    "live::tests::native_symlink_harness_fixture",
+                    "--nocapture",
+                ])
+                .env("PROVENANCE_NATIVE_FIXTURE_STAGE", stage)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_lookup_recognises_symlinked_inner_harness() {
+        let root = std::env::temp_dir().join(format!("prov-native-{}", crate::send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("2.1.321");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        for name in ["claude", "codex"] {
+            std::os::unix::fs::symlink(&binary, root.join(name)).unwrap();
+        }
+        let output = Command::new(root.join("codex"))
+            .args([
+                "--exact",
+                "live::tests::native_symlink_harness_fixture",
+                "--nocapture",
+            ])
+            .env("PROVENANCE_NATIVE_FIXTURE_ROOT", &root)
+            .env("PROVENANCE_NATIVE_FIXTURE_STAGE", "outer")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_relative_path_keeps_ancestor_and_liveness() {
+        let root = std::env::temp_dir().join(format!("prov-relative-{}", crate::send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("2.1.321");
+        std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+        for name in ["claude", "codex"] {
+            std::os::unix::fs::symlink(&binary, root.join(name)).unwrap();
+        }
+        let output = Command::new("./codex")
+            .current_dir(&root)
+            .args([
+                "--exact",
+                "live::tests::native_symlink_harness_fixture",
+                "--nocapture",
+            ])
+            .env("PROVENANCE_NATIVE_FIXTURE_ROOT", &root)
+            .env("PROVENANCE_NATIVE_FIXTURE_STAGE", "outer")
+            .env("PROVENANCE_NATIVE_FIXTURE_RELATIVE", "1")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn unreadable_node_or_bun_title_stops_before_outer_harness() {
+        for binary in ["node", "bun"] {
+            let info = |pid| match pid {
+                10 => Some((20, "inner".into(), format!("/bin/{binary}"))),
+                20 => Some((1, "outer".into(), "/bin/codex".into())),
+                _ => None,
+            };
+            assert!(nearest_harness_with(10, &info, &|_| None).is_none());
+            assert_eq!(
+                nearest_harness_with(10, &info, &|_| Some("claude".into())),
+                Some((Harness::ClaudeCode, 10, "inner".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_start_time_shapes_are_not_evidence_of_exit() {
+        let f = Fake {
+            pid: 42,
+            branch: "b",
+            probes: Cell::new(0),
+        };
+        let mut r = update(None, Harness::Codex, ev("SessionStart"), Utc::now(), &f);
+        assert!(has_c_start_time(&r));
+        for legacy in [
+            "Tue 10 Nov 21:39:39 2026",
+            "Di. 10 Nov. 21:39:39 2026",
+            "garbage",
+            "",
+        ] {
+            r.pid_started = Some(legacy.into());
+            assert!(!has_c_start_time(&r));
+        }
+        r.pid_started = None;
+        assert!(!has_c_start_time(&r));
+    }
+
+    #[test]
+    fn liveness_fill_needs_only_matching_start_time() {
+        let r = Record {
+            harness: Harness::Codex,
+            session_id: "test".into(),
+            app: String::new(),
+            cwd: String::new(),
+            pid: Some(42),
+            pid_started: Some("start".into()),
+            last_event: "Stop".into(),
+            updated: Utc::now(),
+            branches: vec![],
+            transcript_path: None,
+        };
+        let mut alive = HashMap::new();
+        fill_alive_pids(std::slice::from_ref(&r), &mut alive, &|pid| {
+            (pid == 42).then(|| "start".into())
+        });
+        assert!(is_alive(&r, &alive));
+        let mut reused = r.clone();
+        reused.pid_started = Some("other".into());
+        assert!(!is_alive(&reused, &alive));
+        fill_alive_pids(&[r], &mut alive, &|_| None);
+        assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
     }
 
     #[test]
