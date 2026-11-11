@@ -648,10 +648,7 @@ fn plan_recipient(
         harness: s.harness,
         session_id: s.session_id.clone(),
     };
-    match send::socket_refusal(home, &target, &delivery) {
-        Some(why) => send::Delivery::Refuse(why),
-        None => delivery,
-    }
+    send::bypass_route(home, &target, &delivery).unwrap_or(delivery)
 }
 
 fn register_name(home: &std::path::Path, name: &str, replace: Option<&str>) -> Result<String> {
@@ -902,9 +899,13 @@ fn deliver_message(
         harness: s.harness,
         session_id: s.session_id.clone(),
     };
-    if let Some(why) = send::socket_refusal(home, &target, &delivery) {
-        anyhow::bail!("can't message {}: {why}", label(Some(&target)));
-    }
+    let delivery = match send::bypass_route(home, &target, &delivery) {
+        Some(send::Delivery::Refuse(why)) => {
+            anyhow::bail!("can't message {}: {why}", label(Some(&target)))
+        }
+        Some(rerouted) => rerouted,
+        None => delivery,
+    };
     let address = match &named {
         Some(n) => format!("@{} ({})", n.name, names::identity(&target)),
         None => pr.clone().unwrap_or_default(),
@@ -1052,9 +1053,13 @@ fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String>
             label(Some(&to))
         ));
     };
-    if let Some(why) = send::socket_refusal(home, &to, &route) {
-        return Ok(format!("Reply to {id} saved, but not forwarded: {why}."));
-    }
+    let route = match send::bypass_route(home, &to, &route) {
+        Some(send::Delivery::Refuse(why)) => {
+            return Ok(format!("Reply to {id} saved, but not forwarded: {why}."));
+        }
+        Some(rerouted) => rerouted,
+        None => route,
+    };
     send::deliver_reply(&route, id, &label(me.as_ref()), text)?;
     if matches!(route, send::Delivery::ClaudeSocket(_)) {
         Ok(format!(
@@ -2182,9 +2187,16 @@ mod named_tests {
         home: &std::path::Path,
         mode: Option<&str>,
     ) -> (live::Record, sessions::Sighting) {
+        socket_target_with_id(home, mode, "socket-target")
+    }
+    fn socket_target_with_id(
+        home: &std::path::Path,
+        mode: Option<&str>,
+        id: &str,
+    ) -> (live::Record, sessions::Sighting) {
         let pid = std::process::id();
         let (_, started, _) = live::ps_info(pid).unwrap();
-        let mut r = record("socket-target", Harness::ClaudeCode, pid, &started);
+        let mut r = record(id, Harness::ClaudeCode, pid, &started);
         r.permission_mode = mode.map(str::to_string);
         let dir = live::live_dir(home);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2267,6 +2279,118 @@ mod named_tests {
         .to_string();
         assert!(error.contains("bypass mode"));
         assert!(!send::mail_dir(&home).exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    /// A T3 Code state database recording `session` as thread `thread`'s
+    /// Claude Code conversation.
+    fn t3_fixture(home: &std::path::Path, thread: &str, session: &str, strength: &str) {
+        let dir = home.join(".t3/userdata");
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = serde_json::json!({
+            "appThreadId": thread,
+            "nativeThreadRef": {"driver": "claudeAgent", "nativeId": session, "strength": strength},
+        });
+        let sql = format!(
+            "CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, archived_at TEXT, deleted_at TEXT);
+             CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+             INSERT INTO orchestration_v2_projection_threads VALUES ('{thread}', NULL, NULL);
+             INSERT INTO orchestration_v2_projection_provider_threads VALUES ('p1', '2026-11-11T00:00:00Z', '{payload}');"
+        );
+        let out = std::process::Command::new("sqlite3")
+            .arg(dir.join("statev2.sqlite"))
+            .arg(sql)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    #[test]
+    fn t3_thread_needs_a_strong_live_reference() {
+        let session = "a4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let home = scratch();
+        let db = home.join(".t3/userdata/statev2.sqlite");
+        assert_eq!(send::t3_thread(&db, session), None);
+        t3_fixture(&home, "thread-1", session, "strong");
+        assert_eq!(send::t3_thread(&db, session).as_deref(), Some("thread-1"));
+        assert_eq!(
+            send::t3_thread(&db, "b4217d94-c60f-4ad7-9b6b-1b7b52976ea4"),
+            None
+        );
+        assert_eq!(send::t3_thread(&db, "x' OR '1'='1"), None);
+        let archive = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg("UPDATE orchestration_v2_projection_threads SET archived_at = 'now';")
+            .status()
+            .unwrap();
+        assert!(archive.success());
+        assert_eq!(send::t3_thread(&db, session), None);
+        std::fs::remove_dir_all(home).unwrap();
+        let home = scratch();
+        t3_fixture(&home, "thread-1", session, "weak");
+        assert_eq!(
+            send::t3_thread(&home.join(".t3/userdata/statev2.sqlite"), session),
+            None
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn bypass_socket_reroutes_through_t3_when_t3_hosts_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let session = "c4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let home = scratch();
+        let (r, s) = socket_target_with_id(&home, Some("bypassPermissions"), session);
+        t3_fixture(&home, "thread-9", session, "strong");
+        let bin = home.join(".t3/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let t3 = bin.join("t3");
+        std::fs::write(
+            &t3,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'sent\\n'\n",
+                home.join("t3-args.txt").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let delivery = plan_recipient(
+            &home,
+            &s,
+            Some(live::State::Running),
+            go::Process::Live(std::process::id()),
+            None,
+            false,
+            send::Caller::Mcp,
+        );
+        assert_eq!(
+            delivery,
+            send::Delivery::T3Thread {
+                bin: t3.clone(),
+                thread: "thread-9".into()
+            }
+        );
+        let sent = send_message(
+            &home,
+            "@Socket Target",
+            "hello there",
+            false,
+            send::Caller::Mcp,
+        )
+        .unwrap();
+        assert!(!sent.socket_write);
+        assert_eq!(sent.how, "T3 Code's thread queue");
+        let args = std::fs::read_to_string(home.join("t3-args.txt")).unwrap();
+        let mut args = args.lines();
+        assert_eq!(args.next(), Some("thread"));
+        assert_eq!(args.next(), Some("send"));
+        assert_eq!(args.next(), Some("thread-9"));
+        let body: String = args.collect::<Vec<_>>().join("\n");
+        assert!(body.contains("hello there"));
+        assert!(body.contains("BEGIN PROVENANCE"));
+        let mailbox = send::mailbox(&send::mail_dir(&home), r.harness, &r.session_id);
+        assert_eq!(send::read(&mailbox).len(), 1);
         std::fs::remove_dir_all(home).unwrap();
     }
     #[test]
