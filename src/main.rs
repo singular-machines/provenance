@@ -79,6 +79,8 @@ enum Cmd {
         #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "300")]
         wait: Option<u64>,
     },
+    /// Answer a message from this exact receiving session.
+    Reply { message_id: String, text: String },
     /// Run the MCP server that gives agent sessions `send` and `reply` tools.
     Mcp,
     /// Bind a machine-local name to this exact session (owner request only).
@@ -170,6 +172,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             let (key, binding) = store.get(&name)?;
             store.remove(&key, &binding.identity())?;
             println!("Removed @{key} ({})", names::identity(&binding.identity()));
+            Ok(())
+        }
+        Cmd::Reply { message_id, text } => {
+            let result = reply_message(&home()?, &message_id, &text)
+                .map_err(|e| anyhow::anyhow!("{}", terminal_text(&format!("{e:#}"))))?;
+            println!("{}", terminal_text(&result));
             Ok(())
         }
         Cmd::Mcp => mcp::serve(&McpTools { home: home()? }),
@@ -474,6 +482,15 @@ fn session_for_process_with_ids(
         .flatten()
 }
 
+#[derive(Debug)]
+struct AmbiguousCaller;
+impl std::fmt::Display for AmbiguousCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("caller identity is ambiguous; shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching an active hook record for this process; refusing to guess")
+    }
+}
+impl std::error::Error for AmbiguousCaller {}
+
 fn identify_session(
     records: &[live::Record],
     harness: Harness,
@@ -507,9 +524,7 @@ fn identify_session(
             .context("Codex caller identity conflicts: session ID has no active hook record for the verified process")?
     } else {
         if multiple {
-            anyhow::bail!(
-                "caller identity is ambiguous; shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching an active hook record for this process; refusing to guess"
-            );
+            return Err(AmbiguousCaller.into());
         }
         first
     };
@@ -1059,7 +1074,11 @@ impl<B: SendBackend> mcp::Tools for McpTools<B> {
     }
 
     fn reply(&self, message_id: &str, text: &str) -> Result<String> {
-        self.home.reply_message(message_id, text)
+        self.home.reply_message(message_id, text).map_err(|error| {
+            if error.is::<AmbiguousCaller>() {
+                error.context("MCP cannot select a session in this shared process. Use the CLI command `provenance reply MESSAGE_ID \"text\"` from the receiving session, replacing MESSAGE_ID with the message's ID")
+            } else { error }
+        })
     }
 }
 
@@ -2211,7 +2230,7 @@ mod named_tests {
             assert!(cli.contains("written to the inbox socket"));
             assert!(cli.contains("Receipt is not confirmed"));
             assert!(!cli.starts_with("Sent "));
-            let sent = Sent {
+            let mut sent = Sent {
                 id: "fixture".into(),
                 to: "target".into(),
                 how: "its inbox socket",
@@ -2222,7 +2241,148 @@ mod named_tests {
                 from_session: false,
             };
             assert!(mcp_send_text(&sent).contains("Receipt is not confirmed"));
+            sent.from_session = true;
+            let output = mcp_send_text(&sent);
+            assert!(output.contains("If the target receives and answers"));
+            assert!(!output.contains("The session that received"));
             std::fs::remove_dir_all(home).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership() {
+        let Ok(case) = std::env::var("PROVENANCE_REPLY_FIXTURE") else {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!("prov-reply-{}", send::new_id()));
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            for (name, script) in [
+                (
+                    "ps",
+                    "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n';; *) printf '987654 Fri Oct 30 18:46:07 2026\\n';; esac\n",
+                ),
+                (
+                    "codex",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HOME/transport.txt\"\nprintf 'queued\\n'\n",
+                ),
+            ] {
+                let p = bin.join(name);
+                std::fs::write(&p, script).unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for case in ["cli", "mcp"] {
+                let home = root.join(case);
+                std::fs::create_dir_all(&home).unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact","reply_cli_tests::cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership","--nocapture"])
+                    .env("HOME",home).env("PATH",format!("{}:{}",bin.display(),std::env::var("PATH").unwrap()))
+                    .env("PROVENANCE_REPLY_FIXTURE",case).env_remove("CODEX_THREAD_ID").env_remove("CODEX_SESSION_ID");
+                if case == "cli" {
+                    command
+                        .env("CODEX_THREAD_ID", "recipient-a")
+                        .env("CODEX_SESSION_ID", "recipient-a");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let dir = live::live_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, pid) in [
+            ("recipient-a", std::os::unix::process::parent_id()),
+            ("recipient-b", std::os::unix::process::parent_id()),
+            ("original-sender", 987654),
+        ] {
+            let r = serde_json::json!({"harness":"codex","session_id":id,"app":"fixture","cwd":"/fixture","pid":pid,"pid_started":"Fri Oct 30 18:46:07 2026","last_event":"Stop","updated":Utc::now(),"branches":[],"transcript_path":null});
+            std::fs::write(dir.join(format!("{id}.json")), r.to_string()).unwrap();
+        }
+        let recipient = send::Sender {
+            harness: Harness::Codex,
+            session_id: "recipient-a".into(),
+        };
+        let original = send::Sender {
+            harness: Harness::Codex,
+            session_id: "original-sender".into(),
+        };
+        for (to, id) in [("recipient-a", "m-owned"), ("recipient-b", "m-wrong")] {
+            send::append(
+                &send::mailbox(&send::mail_dir(&home), Harness::Codex, to),
+                &send::Mail::Message {
+                    id: id.into(),
+                    pr: Some("o/r#1".into()),
+                    named_address: None,
+                    from: "fixture".into(),
+                    sender: Some(original.clone()),
+                    text: "request".into(),
+                    at: Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+        if case == "mcp" {
+            use mcp::Tools;
+            let error = McpTools { home: home.clone() }
+                .reply("m-owned", "answer")
+                .unwrap_err();
+            assert!(error.is::<AmbiguousCaller>());
+            let text = format!("{error:#}");
+            assert!(text.contains("provenance reply MESSAGE_ID"));
+            assert!(
+                send::reply_to(
+                    &send::mailbox(
+                        &send::mail_dir(&home),
+                        recipient.harness,
+                        &recipient.session_id
+                    ),
+                    "m-owned"
+                )
+                .is_none()
+            );
+            assert!(!home.join("transport.txt").exists());
+            return;
+        }
+        dispatch(Cli::try_parse_from(["provenance", "reply", "m-owned", "answer"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            send::reply_to(
+                &send::mailbox(
+                    &send::mail_dir(&home),
+                    recipient.harness,
+                    &recipient.session_id
+                ),
+                "m-owned"
+            )
+            .as_deref(),
+            Some("answer")
+        );
+        let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
+        assert!(transport.contains("queue --thread original-sender"));
+        assert!(transport.contains("Reply to message m-owned"));
+        assert!(
+            dispatch(Cli::try_parse_from(["provenance", "reply", "m-wrong", "bad"]).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("no message m-wrong was sent to this session")
+        );
+        let rpath = dir.join("original-sender.json");
+        let mut r: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&rpath).unwrap()).unwrap();
+        r["last_event"] = "SessionEnd".into();
+        std::fs::write(rpath, r.to_string()).unwrap();
+        let result = reply_message(&home, "m-owned", "saved answer").unwrap();
+        assert!(result.contains("saved, but"));
+        assert!(result.contains("isn't running"));
     }
 }
