@@ -69,8 +69,8 @@ enum Cmd {
         #[arg(long, default_value_t = 3, value_name = "DAYS")]
         stale_days: u32,
         /// Write the timeline as an HTML page and open it, or write it to PATH.
-        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
-        html: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        html: Option<Option<PathBuf>>,
         /// Print JSON instead of a list.
         #[arg(long, conflicts_with = "html")]
         json: bool,
@@ -452,7 +452,8 @@ struct LogArgs {
     repo: Option<String>,
     author: String,
     stale_days: u32,
-    html: Option<PathBuf>,
+    /// `Some(None)` for a bare `--html`: write to the cache folder and open it.
+    html: Option<Option<PathBuf>>,
     json: bool,
     all: bool,
     refresh: bool,
@@ -505,12 +506,10 @@ fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
     }
     if let Some(path) = &args.html {
         let page = log::render_html(&entries, &window, now, args.stale_days)?;
-        let open = path.as_os_str().is_empty();
-        let path = if open {
-            cache::dir(home).join("log.html")
-        } else {
-            path.clone()
-        };
+        let open = path.is_none();
+        let path = path
+            .clone()
+            .unwrap_or_else(|| cache::dir(home).join("log.html"));
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -2945,4 +2944,29 @@ fn non_git_resume_refuses_before_mailbox_or_transport() {
     assert!(error.contains("no mailbox entry"));
     assert!(!send::mail_dir(&home).exists());
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(test)]
+mod log_cli_tests {
+    use super::*;
+
+    fn html(args: &[&str]) -> Option<Option<PathBuf>> {
+        let argv = ["provenance", "log"].iter().chain(args);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Cmd::Log { html, .. } => html,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn html_flag_takes_an_optional_path() {
+        assert_eq!(html(&[]), None);
+        assert_eq!(html(&["--html"]), Some(None));
+        assert_eq!(html(&["--html", "--since", "7d"]), Some(None));
+        assert_eq!(
+            html(&["--html", "out/t.html"]),
+            Some(Some(PathBuf::from("out/t.html")))
+        );
+        assert!(Cli::try_parse_from(["provenance", "log", "--html", "--json"]).is_err());
+    }
 }
