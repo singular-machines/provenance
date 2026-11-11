@@ -232,7 +232,13 @@ PRs are then matched by branch only (marked `~`), with the [Known gaps](#known-g
 - `provenance machine <alias>` sets a name of your choice (letters, digits, `.`, `-`, `_`). `provenance machine` shows the current one.
 - `PROVENANCE_MACHINE` overrides it for one shell.
 - Stamps are part of commit history. On public repositories they publish the session ID and this machine name. The git hook is global, so it applies to every repository you commit to. To install without it, see [Without commit stamps](#without-commit-stamps).
-- Everything else stays on your machine: session logs are read locally, and nothing is sent anywhere except `gh` queries to GitHub.
+- Everything else stays on your machine: session logs are read locally, and nothing is sent anywhere except `gh` queries to GitHub and the update check below.
+
+### Update notice
+
+Once a day, `prs`, `go`, `names`, `install`, `uninstall` and `machine` start a background `git ls-remote --tags` against this repository. When a newer release is out, the next of those commands prints one line on stderr with the command to update (`cargo install --git https://github.com/singular-machines/provenance --force`). The answer is cached in `~/.cache/provenance/`, so no command waits on the network. Nothing is checked or printed when stderr isn't a terminal, when `CI` is set, or in hooks, the MCP server, `send` and `reply`. Set `PROVENANCE_NO_UPDATE_CHECK=1` to turn it off.
+
+Releases are cut by bumping `version` in `Cargo.toml`: when that lands on `main`, the Release workflow tags it and publishes a GitHub release.
 
 ## Speed
 
@@ -243,6 +249,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 | PR list | 2 minutes; the footer says how old it is, and `--refresh` skips it |
 | Commit stamps | The PR's head or base moves |
 | Session logs | The log file's size or modified time changes |
+| Newest release | 24 hours |
 
 ## Known gaps
 

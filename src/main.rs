@@ -10,6 +10,7 @@ mod render;
 mod send;
 mod sessions;
 mod stamps;
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -126,6 +127,25 @@ enum Cmd {
     /// (Run by harness hooks.) Record a session event read from stdin.
     #[command(hide = true)]
     Hook { harness: HarnessArg },
+    /// (Run in the background.) Look up the newest release for the update notice.
+    #[command(hide = true)]
+    UpdateCheck,
+}
+
+impl Cmd {
+    /// Commands people run by hand. Hooks, the MCP server and the messaging
+    /// commands agents call never print the update notice.
+    fn shows_update_notice(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Prs { .. }
+                | Cmd::Go { .. }
+                | Cmd::Names { .. }
+                | Cmd::Install { .. }
+                | Cmd::Machine { .. }
+                | Cmd::Uninstall { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -136,7 +156,16 @@ enum HarnessArg {
 }
 
 fn main() -> Result<()> {
-    dispatch(Cli::parse())
+    let cli = Cli::parse();
+    let notice = match std::env::var_os("HOME") {
+        Some(home) if cli.command.shows_update_notice() => update::notice(&PathBuf::from(home)),
+        _ => None,
+    };
+    let result = dispatch(cli);
+    if let Some(n) = notice {
+        eprintln!("\n{n}");
+    }
+    result
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
@@ -220,6 +249,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             if let Ok(home) = home() {
                 live::run_hook(h, &home);
             }
+            Ok(())
+        }
+        Cmd::UpdateCheck => {
+            update::run_check(&home()?);
             Ok(())
         }
     }
