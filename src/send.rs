@@ -1,8 +1,10 @@
 //! `provenance send`: message the session behind a PR, and its reply tool.
 //!
 //! A running session is messaged through its harness's own way in: a Claude
-//! Code session's inbox socket, or `codex queue` for Codex. A session that
-//! isn't running is only reached by resuming it headless, when asked to.
+//! Code session's inbox socket, or `codex queue` for Codex. A Claude Code
+//! session in bypass mode holds socket messages, so when T3 Code hosts it,
+//! `t3 thread send` delivers instead. A session that isn't running is only
+//! reached by resuming it headless, when asked to.
 //!
 //! Every message and reply is kept in a mailbox, one JSONL file per receiving
 //! session under `~/.local/state/provenance/mail/`, so a reply can be matched
@@ -31,6 +33,14 @@ pub enum Delivery {
     ClaudeSocket(PathBuf),
     /// Queue acceptance only; recipient consumption is not acknowledged.
     CodexQueue(String),
+    /// `t3 thread send`: T3 Code runs it as the thread's next turn. `base`
+    /// is the T3 data directory the thread was found in, passed to `t3` so
+    /// lookup and delivery use the same one.
+    T3Thread {
+        bin: PathBuf,
+        base: PathBuf,
+        thread: String,
+    },
     /// Resume the session headless in its folder, with the message as its prompt.
     Resume { cwd: String, argv: Vec<String> },
     /// The message can't be delivered, and why.
@@ -221,7 +231,7 @@ pub fn socket_refusal(home: &Path, target: &Sender, delivery: &Delivery) -> Opti
         return None;
     }
     Some(format!(
-        "{BYPASS_REASON}; nothing was delivered. Use a session not running in bypass mode"
+        "{BYPASS_REASON}; nothing was delivered. Use a session not running in bypass mode, or one hosted by T3 Code"
     ))
 }
 
@@ -234,7 +244,138 @@ pub fn bypass_note(reasons: &[String]) -> Option<String> {
         .iter()
         .filter(|r| r.starts_with(BYPASS_REASON))
         .count();
-    (count > 0).then(|| format!("Skipped {count} newer matched session(s): {BYPASS_REASON}. Use a session not running in bypass mode."))
+    (count > 0).then(|| format!("Skipped {count} newer matched session(s): {BYPASS_REASON}, and T3 Code doesn't host them. Use a session not running in bypass mode, or one hosted by T3 Code."))
+}
+
+/// Where a held socket write goes instead. `None` when the socket isn't held;
+/// T3 Code's own thread queue when T3 hosts the session; otherwise a refusal.
+/// A planned T3 route is checked again, so a mapping or process that changed
+/// since planning is refused instead of delivered to whatever the thread now
+/// runs. T3 offers no way to bind a send to the native session, so a switch
+/// between this check and `t3 thread send` remains possible.
+pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option<Delivery> {
+    let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
+    if let Delivery::T3Thread { .. } = delivery {
+        let current =
+            live_record(home, target).and_then(|_| t3_route(home, &base, &target.session_id));
+        return Some(match current {
+            Some(d) if &d == delivery => d,
+            Some(_) => Delivery::Refuse(
+                "its T3 Code thread changed since the message was planned; nothing was delivered"
+                    .into(),
+            ),
+            None => Delivery::Refuse(
+                "it is no longer running in a T3 Code thread provenance can identify; nothing was delivered"
+                    .into(),
+            ),
+        });
+    }
+    let why = socket_refusal(home, target, delivery)?;
+    Some(t3_route(home, &base, &target.session_id).unwrap_or(Delivery::Refuse(why)))
+}
+
+/// The target's hook record, if its process is still alive.
+fn live_record(home: &Path, target: &Sender) -> Option<crate::live::Record> {
+    let records = crate::live::load_records(home);
+    let record = records
+        .into_iter()
+        .find(|r| r.harness == target.harness && r.session_id == target.session_id)?;
+    let alive = crate::live::alive_pids(std::slice::from_ref(&record));
+    crate::live::is_alive(&record, &alive).then_some(record)
+}
+
+/// T3 Code's data directory from `T3CODE_HOME`, resolved as T3 resolves it:
+/// unset, empty or blank means `~/.t3`; surrounding blanks are trimmed; `~`
+/// and `~/` expand to the home folder; a relative path is from the current
+/// folder; and `.` and `..` are resolved as text, like Node's `path.resolve`,
+/// so `link/..` is never followed through a symlink.
+pub fn t3_base(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
+    let path = match configured.as_ref().map(|c| (c, c.to_str())) {
+        None => home.join(".t3"),
+        Some((_, Some(text))) => match text.trim() {
+            "" => home.join(".t3"),
+            "~" => home.to_path_buf(),
+            text => match text.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(text),
+            },
+        },
+        Some((raw, None)) => PathBuf::from(raw),
+    };
+    resolve_lexically(&path)
+}
+
+/// An absolute `path` with `.` and `..` removed without touching the disk.
+fn resolve_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let absolute = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut out = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn t3_route(home: &Path, base: &Path, session_id: &str) -> Option<Delivery> {
+    let thread = t3_thread(&base.join("userdata/statev2.sqlite"), session_id)?;
+    let installed = home.join(".t3/bin/t3");
+    let bin = if installed.is_file() {
+        installed
+    } else {
+        PathBuf::from("t3")
+    };
+    Some(Delivery::T3Thread {
+        bin,
+        base: base.to_path_buf(),
+        thread,
+    })
+}
+
+/// The T3 Code thread whose current conversation is the Claude Code session
+/// `session_id`, read from T3's state database. T3 records the native session
+/// behind each provider thread in its `nativeThreadRef`, and keeps old provider
+/// threads after a switch, so only a strong reference from the thread's
+/// active provider thread counts. Several such threads is ambiguous: none.
+pub fn t3_thread(db: &Path, session_id: &str) -> Option<String> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return None;
+    }
+    if !db.is_file() {
+        return None;
+    }
+    let query = format!(
+        "SELECT t.thread_id FROM orchestration_v2_projection_provider_threads p \
+         JOIN orchestration_v2_projection_threads t \
+           ON t.thread_id = json_extract(p.payload_json, '$.appThreadId') \
+          AND t.active_provider_thread_id = p.provider_thread_id \
+         WHERE json_extract(p.payload_json, '$.nativeThreadRef.driver') = 'claudeAgent' \
+           AND json_extract(p.payload_json, '$.nativeThreadRef.nativeId') = '{session_id}' \
+           AND json_extract(p.payload_json, '$.nativeThreadRef.strength') = 'strong' \
+           AND t.archived_at IS NULL AND t.deleted_at IS NULL \
+         LIMIT 2;"
+    );
+    let out = Command::new("sqlite3")
+        .args(["-readonly", "-batch", "-noheader"])
+        .arg(db)
+        .arg(query)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let thread = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !thread.is_empty() && !thread.contains('\n')).then_some(thread)
 }
 
 /// Choose an unpredictable, per-delivery boundary absent from the body.
@@ -395,6 +536,14 @@ fn deliver(d: &Delivery, text: &str, relay: Relay<'_>) -> Result<String> {
             Command::new("codex").args(["queue", "--thread", thread, "--message", text]),
             None,
         ),
+        Delivery::T3Thread { bin, base, thread } => run(
+            Command::new(bin)
+                .args(["thread", "send", "--base-dir"])
+                .arg(base)
+                .args([thread.as_str(), text]),
+            None,
+        )
+        .map(|_| String::new()),
         Delivery::Resume { cwd, argv } => {
             if !Path::new(cwd).is_dir() {
                 bail!("the session's folder is gone: {cwd}");
@@ -524,6 +673,7 @@ pub fn describe(d: &Delivery) -> &'static str {
     match d {
         Delivery::ClaudeSocket(_) => "its inbox socket",
         Delivery::CodexQueue(_) => "codex queue",
+        Delivery::T3Thread { .. } => "T3 Code's thread queue",
         Delivery::Resume { .. } => "a headless resume",
         Delivery::Refuse(_) => "nothing",
     }
