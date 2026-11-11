@@ -79,6 +79,8 @@ enum Cmd {
         #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "300")]
         wait: Option<u64>,
     },
+    /// Answer a message from this exact receiving session.
+    Reply { message_id: String, text: String },
     /// Run the MCP server that gives agent sessions `send` and `reply` tools.
     Mcp,
     /// Bind a machine-local name to this exact session (owner request only).
@@ -170,6 +172,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             let (key, binding) = store.get(&name)?;
             store.remove(&key, &binding.identity())?;
             println!("Removed @{key} ({})", names::identity(&binding.identity()));
+            Ok(())
+        }
+        Cmd::Reply { message_id, text } => {
+            let result = reply_message(&home()?, &message_id, &text)
+                .map_err(|e| anyhow::anyhow!("{}", terminal_text(&format!("{e:#}"))))?;
+            println!("{}", terminal_text(&result));
             Ok(())
         }
         Cmd::Mcp => mcp::serve(&McpTools { home: home()? }),
@@ -474,6 +482,15 @@ fn session_for_process_with_ids(
         .flatten()
 }
 
+#[derive(Debug)]
+struct AmbiguousCaller;
+impl std::fmt::Display for AmbiguousCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("caller identity is ambiguous; shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching an active hook record for this process; refusing to guess")
+    }
+}
+impl std::error::Error for AmbiguousCaller {}
+
 fn identify_session(
     records: &[live::Record],
     harness: Harness,
@@ -507,9 +524,7 @@ fn identify_session(
             .context("Codex caller identity conflicts: session ID has no active hook record for the verified process")?
     } else {
         if multiple {
-            anyhow::bail!(
-                "caller identity is ambiguous; shared Codex processes need agreeing CODEX_THREAD_ID and CODEX_SESSION_ID matching an active hook record for this process; refusing to guess"
-            );
+            return Err(AmbiguousCaller.into());
         }
         first
     };
@@ -535,6 +550,7 @@ struct Sent {
     id: String,
     to: String,
     how: &'static str,
+    socket_write: bool,
     note: Option<String>,
     mailbox: PathBuf,
     output: String,
@@ -586,7 +602,7 @@ fn plan_recipient(
     if sender.is_some_and(|me| me.harness == s.harness && me.session_id == s.session_id) {
         return send::Delivery::Refuse("it's this session".into());
     }
-    send::plan(
+    let delivery = send::plan(
         s,
         state,
         process,
@@ -594,7 +610,15 @@ fn plan_recipient(
         caller,
         stamps::machine_name().as_deref(),
         &|pid, id| send::claude_socket(home, pid, id),
-    )
+    );
+    let target = send::Sender {
+        harness: s.harness,
+        session_id: s.session_id.clone(),
+    };
+    match send::socket_refusal(home, &target, &delivery) {
+        Some(why) => send::Delivery::Refuse(why),
+        None => delivery,
+    }
 }
 
 fn register_name(home: &std::path::Path, name: &str, replace: Option<&str>) -> Result<String> {
@@ -813,6 +837,9 @@ fn deliver_message(
         harness: s.harness,
         session_id: s.session_id.clone(),
     };
+    if let Some(why) = send::socket_refusal(home, &target, &delivery) {
+        anyhow::bail!("can't message {}: {why}", label(Some(&target)));
+    }
     let address = match &named {
         Some(n) => format!("@{} ({})", n.name, names::identity(&target)),
         None => pr.clone().unwrap_or_default(),
@@ -845,6 +872,7 @@ fn deliver_message(
         id,
         to: format!("{address}'s {}", label(Some(&target))),
         how: send::describe(&delivery),
+        socket_write: matches!(delivery, send::Delivery::ClaudeSocket(_)),
         note,
         mailbox,
         output,
@@ -894,13 +922,24 @@ fn send_cmd(
     send_cmd_output(result, wait, &mut std::io::stdout().lock())
 }
 
+fn send_acceptance(sent: &Sent) -> String {
+    if sent.socket_write {
+        format!(
+            "Message {} was written to the inbox socket for {}. Receipt is not confirmed.",
+            sent.id, sent.to
+        )
+    } else {
+        format!("Sent {} to {} via {}.", sent.id, sent.to, sent.how)
+    }
+}
+
 fn send_cmd_output(
     result: Result<Sent>,
     wait: Option<u64>,
     out: &mut impl std::io::Write,
 ) -> Result<()> {
     let sent = result.map_err(|e| anyhow::anyhow!("{}", terminal_text(&format!("{e:#}"))))?;
-    writeln!(out, "Sent {} to {} via {}.", sent.id, sent.to, sent.how)?;
+    writeln!(out, "{}", send_acceptance(&sent))?;
     if let Some(note) = &sent.note {
         writeln!(out, "{note}")?;
     }
@@ -948,16 +987,28 @@ fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String>
             label(Some(&to))
         ));
     };
+    if let Some(why) = send::socket_refusal(home, &to, &route) {
+        return Ok(format!("Reply to {id} saved, but not forwarded: {why}."));
+    }
     send::deliver_reply(&route, id, &label(me.as_ref()), text)?;
-    Ok(format!("Reply to {id} sent to {}.", label(Some(&to))))
+    if matches!(route, send::Delivery::ClaudeSocket(_)) {
+        Ok(format!(
+            "Reply to {id} was written to the inbox socket for {}. Receipt is not confirmed.",
+            label(Some(&to))
+        ))
+    } else {
+        Ok(format!("Reply to {id} sent to {}.", label(Some(&to))))
+    }
 }
 
 fn mcp_send_text(sent: &Sent) -> String {
-    let mut out = format!("Sent {} to {} via {}.", sent.id, sent.to, sent.how);
+    let mut out = send_acceptance(sent);
     if let Some(note) = &sent.note {
         out.push_str(&format!("\n{note}"));
     }
-    out.push_str(if sent.from_session {
+    out.push_str(if sent.from_session && sent.socket_write {
+            "\n\nIf the target receives and answers this message, its reply can arrive here as a \"[provenance] Reply\" message."
+        } else if sent.from_session {
             "\n\nThe session that received this message will send its answer here as a \"[provenance] Reply\" message."
         } else {
             "\n\nThis session isn't recorded by provenance's hooks, so its answer can't be passed back here."
@@ -1023,7 +1074,11 @@ impl<B: SendBackend> mcp::Tools for McpTools<B> {
     }
 
     fn reply(&self, message_id: &str, text: &str) -> Result<String> {
-        self.home.reply_message(message_id, text)
+        self.home.reply_message(message_id, text).map_err(|error| {
+            if error.is::<AmbiguousCaller>() {
+                error.context("MCP cannot select a session in this shared process. Use the CLI command `provenance reply MESSAGE_ID \"text\"` from the receiving session, replacing MESSAGE_ID with the message's ID")
+            } else { error }
+        })
     }
 }
 
@@ -1065,6 +1120,7 @@ mod send_cli_tests {
             id: "m-1".into(),
             to: "Codex session test".into(),
             how: "fixture",
+            socket_write: false,
             note: None,
             mailbox,
             output: String::new(),
@@ -1112,6 +1168,7 @@ mod send_cli_tests {
             id: "m-1".into(),
             to: "Codex session test".into(),
             how: "fixture",
+            socket_write: false,
             note: None,
             mailbox: PathBuf::new(),
             output,
@@ -1193,7 +1250,7 @@ mod send_cli_tests {
                     "printf '%s' 'fixture answer'".into(),
                 ],
             };
-            Ok(Sent { id: "m-1".into(), to: "Codex session test".into(), how: "a headless resume", note: Some("Skipped 1 newer matched session(s) not selected for headless resume (they may still be open or otherwise unavailable).".into()), mailbox: PathBuf::new(), output: send::deliver_forward(&d, "m-1", "pr", "sender", "Codex session test", "request", None)?, from_session: true })
+            Ok(Sent { id: "m-1".into(), to: "Codex session test".into(), how: "a headless resume", socket_write:false, note: Some("Skipped 1 newer matched session(s) not selected for headless resume (they may still be open or otherwise unavailable).".into()), mailbox: PathBuf::new(), output: send::deliver_forward(&d, "m-1", "pr", "sender", "Codex session test", "request", None)?, from_session: true })
         }
         fn reply_message(&self, _: &str, _: &str) -> Result<String> {
             unreachable!()
@@ -1435,6 +1492,7 @@ mod send_cli_tests {
                 branch: "fixture".into(),
                 last_seen: Utc::now(),
             }],
+            permission_mode: None,
             transcript_path: Some(
                 home.join("real-wiring.jsonl")
                     .to_string_lossy()
@@ -1572,6 +1630,7 @@ mod send_cli_tests {
             id: "m".into(),
             to: "fixture".into(),
             how: "fixture",
+            socket_write: false,
             note: None,
             mailbox: PathBuf::new(),
             output: raw.clone(),
@@ -1608,6 +1667,7 @@ mod identity_tests {
             updated: Utc::now(),
             branches: Vec::new(),
             transcript_path: None,
+            permission_mode: None,
         }
     }
     #[test]
@@ -1772,6 +1832,7 @@ mod named_tests {
             updated: Utc::now(),
             branches: Vec::new(),
             transcript_path: None,
+            permission_mode: None,
         }
     }
     fn scratch() -> PathBuf {
@@ -2051,5 +2112,277 @@ mod named_tests {
             }
         }
         std::fs::remove_dir_all(home).unwrap();
+    }
+    fn socket_target(
+        home: &std::path::Path,
+        mode: Option<&str>,
+    ) -> (live::Record, sessions::Sighting) {
+        let pid = std::process::id();
+        let (_, started, _) = live::ps_info(pid).unwrap();
+        let mut r = record("socket-target", Harness::ClaudeCode, pid, &started);
+        r.permission_mode = mode.map(str::to_string);
+        let dir = live::live_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target.json"), serde_json::to_vec(&r).unwrap()).unwrap();
+        let dir = home.join(".claude/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{pid}.json")),
+            serde_json::json!({"sessionId":r.session_id,"messagingSocketPath":"/fake/inbox.sock"})
+                .to_string(),
+        )
+        .unwrap();
+        let identity = send::Sender {
+            harness: r.harness,
+            session_id: r.session_id.clone(),
+        };
+        let (_, binding) = names::Store::new(home)
+            .register("Socket Target", &identity, "/", None)
+            .unwrap();
+        let (s, _, _) = named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
+        (r, s)
+    }
+    #[test]
+    fn bypass_socket_refused_before_mail_on_pr_and_named_routes() {
+        let home = scratch();
+        let (r, s) = socket_target(&home, Some("bypassPermissions"));
+        let m = matching::SessionMatch {
+            sighting: s.clone(),
+            state: Some(live::State::Waiting),
+            kind: matching::MatchKind::Stamp,
+        };
+        for caller in [send::Caller::Mcp, send::Caller::Cli { force: false }] {
+            let error = send_resolved(
+                &home,
+                "test/repo",
+                1,
+                "never deliver",
+                std::slice::from_ref(&m),
+                None,
+                false,
+                caller,
+                &|_| go::Process::Live(std::process::id()),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("Claude Code holds"));
+            assert!(error.contains("nothing was delivered"));
+        }
+        for caller in [send::Caller::Mcp, send::Caller::Cli { force: false }] {
+            let error = send_message(&home, "@Socket Target", "never deliver", false, caller)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("nothing was delivered"));
+        }
+        let target = send::Sender {
+            harness: r.harness,
+            session_id: r.session_id.clone(),
+        };
+        let named = send::NamedAddress {
+            name: "socket-target".into(),
+            recipient: target,
+        };
+        let error = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery: send::Delivery::ClaudeSocket("/fake/inbox.sock".into()),
+                sender: None,
+                pr: None,
+                named: Some(named),
+                note: None,
+            },
+            "never deliver",
+            &|_, _, _, _, _, _, _| panic!("refusal must precede transport"),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("bypass mode"));
+        assert!(!send::mail_dir(&home).exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn unknown_and_non_bypass_socket_writes_have_honest_cli_and_mcp_text() {
+        for mode in [None, Some("default"), Some("auto")] {
+            let home = scratch();
+            let (_, s) = socket_target(&home, mode);
+            let sent = deliver_message(
+                &home,
+                Outgoing {
+                    sighting: s,
+                    delivery: send::Delivery::ClaudeSocket("/fake/inbox.sock".into()),
+                    sender: None,
+                    pr: Some("o/r#1".into()),
+                    named: None,
+                    note: None,
+                },
+                "hi",
+                &|_, _, _, _, _, _, _| Ok(String::new()),
+            )
+            .unwrap();
+            assert!(sent.socket_write);
+            let mut cli = Vec::new();
+            send_cmd_output(Ok(sent), None, &mut cli).unwrap();
+            let cli = String::from_utf8(cli).unwrap();
+            assert!(cli.contains("written to the inbox socket"));
+            assert!(cli.contains("Receipt is not confirmed"));
+            assert!(!cli.starts_with("Sent "));
+            let mut sent = Sent {
+                id: "fixture".into(),
+                to: "target".into(),
+                how: "its inbox socket",
+                socket_write: true,
+                note: None,
+                mailbox: PathBuf::new(),
+                output: String::new(),
+                from_session: false,
+            };
+            assert!(mcp_send_text(&sent).contains("Receipt is not confirmed"));
+            sent.from_session = true;
+            let output = mcp_send_text(&sent);
+            assert!(output.contains("If the target receives and answers"));
+            assert!(!output.contains("The session that received"));
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod reply_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership() {
+        let Ok(case) = std::env::var("PROVENANCE_REPLY_FIXTURE") else {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!("prov-reply-{}", send::new_id()));
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            for (name, script) in [
+                (
+                    "ps",
+                    "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n';; *) printf '987654 Fri Oct 30 18:46:07 2026\\n';; esac\n",
+                ),
+                (
+                    "codex",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HOME/transport.txt\"\nprintf 'queued\\n'\n",
+                ),
+            ] {
+                let p = bin.join(name);
+                std::fs::write(&p, script).unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for case in ["cli", "mcp"] {
+                let home = root.join(case);
+                std::fs::create_dir_all(&home).unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact","reply_cli_tests::cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership","--nocapture"])
+                    .env("HOME",home).env("PATH",format!("{}:{}",bin.display(),std::env::var("PATH").unwrap()))
+                    .env("PROVENANCE_REPLY_FIXTURE",case).env_remove("CODEX_THREAD_ID").env_remove("CODEX_SESSION_ID");
+                if case == "cli" {
+                    command
+                        .env("CODEX_THREAD_ID", "recipient-a")
+                        .env("CODEX_SESSION_ID", "recipient-a");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let dir = live::live_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, pid) in [
+            ("recipient-a", std::os::unix::process::parent_id()),
+            ("recipient-b", std::os::unix::process::parent_id()),
+            ("original-sender", 987654),
+        ] {
+            let r = serde_json::json!({"harness":"codex","session_id":id,"app":"fixture","cwd":"/fixture","pid":pid,"pid_started":"Fri Oct 30 18:46:07 2026","last_event":"Stop","updated":Utc::now(),"branches":[],"transcript_path":null});
+            std::fs::write(dir.join(format!("{id}.json")), r.to_string()).unwrap();
+        }
+        let recipient = send::Sender {
+            harness: Harness::Codex,
+            session_id: "recipient-a".into(),
+        };
+        let original = send::Sender {
+            harness: Harness::Codex,
+            session_id: "original-sender".into(),
+        };
+        for (to, id) in [("recipient-a", "m-owned"), ("recipient-b", "m-wrong")] {
+            send::append(
+                &send::mailbox(&send::mail_dir(&home), Harness::Codex, to),
+                &send::Mail::Message {
+                    id: id.into(),
+                    pr: Some("o/r#1".into()),
+                    named_address: None,
+                    from: "fixture".into(),
+                    sender: Some(original.clone()),
+                    text: "request".into(),
+                    at: Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+        if case == "mcp" {
+            use mcp::Tools;
+            let error = McpTools { home: home.clone() }
+                .reply("m-owned", "answer")
+                .unwrap_err();
+            assert!(error.is::<AmbiguousCaller>());
+            let text = format!("{error:#}");
+            assert!(text.contains("provenance reply MESSAGE_ID"));
+            assert!(
+                send::reply_to(
+                    &send::mailbox(
+                        &send::mail_dir(&home),
+                        recipient.harness,
+                        &recipient.session_id
+                    ),
+                    "m-owned"
+                )
+                .is_none()
+            );
+            assert!(!home.join("transport.txt").exists());
+            return;
+        }
+        dispatch(Cli::try_parse_from(["provenance", "reply", "m-owned", "answer"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            send::reply_to(
+                &send::mailbox(
+                    &send::mail_dir(&home),
+                    recipient.harness,
+                    &recipient.session_id
+                ),
+                "m-owned"
+            )
+            .as_deref(),
+            Some("answer")
+        );
+        let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
+        assert!(transport.contains("queue --thread original-sender"));
+        assert!(transport.contains("Reply to message m-owned"));
+        assert!(
+            dispatch(Cli::try_parse_from(["provenance", "reply", "m-wrong", "bad"]).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("no message m-wrong was sent to this session")
+        );
+        let rpath = dir.join("original-sender.json");
+        let mut r: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&rpath).unwrap()).unwrap();
+        r["last_event"] = "SessionEnd".into();
+        std::fs::write(rpath, r.to_string()).unwrap();
+        let result = reply_message(&home, "m-owned", "saved answer").unwrap();
+        assert!(result.contains("saved, but"));
+        assert!(result.contains("isn't running"));
     }
 }

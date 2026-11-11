@@ -188,6 +188,31 @@ pub fn claude_socket(home: &Path, pid: u32, session_id: &str) -> Option<PathBuf>
         .map(PathBuf::from)
 }
 
+/// A hook observation is local evidence, never a permission assertion sent
+/// to a peer. Match both the live process and its exact session/socket.
+pub fn socket_refusal(home: &Path, target: &Sender, delivery: &Delivery) -> Option<String> {
+    let Delivery::ClaudeSocket(path) = delivery else {
+        return None;
+    };
+    if target.harness != Harness::ClaudeCode {
+        return None;
+    }
+    let records = crate::live::load_records(home);
+    let record = records
+        .iter()
+        .find(|r| r.harness == target.harness && r.session_id == target.session_id)?;
+    if record.permission_mode.as_deref() != Some("bypassPermissions") {
+        return None;
+    }
+    let alive = crate::live::alive_pids(std::slice::from_ref(record));
+    if !crate::live::is_alive(record, &alive)
+        || claude_socket(home, record.pid?, &target.session_id).as_ref() != Some(path)
+    {
+        return None;
+    }
+    Some("Claude Code holds socket messages from provenance when the target is in bypass mode; nothing was delivered. Use a session not running in bypass mode".into())
+}
+
 /// Choose an unpredictable, per-delivery boundary absent from the body.
 fn boundary(text: &str, mut next: impl FnMut() -> Result<String>) -> Result<String> {
     loop {
@@ -1381,5 +1406,38 @@ mod tests {
     fn old_mail_with_pr_and_without_named_metadata_still_reads() {
         let m:Mail=serde_json::from_str(r#"{"kind":"message","id":"m-old","pr":"o/r#1","from":"terminal","sender":null,"text":"hi","at":"2026-01-01T00:00:00Z"}"#).unwrap();
         assert!(matches!(m,Mail::Message{pr:Some(pr),named_address:None,..} if pr=="o/r#1"));
+    }
+    #[test]
+    fn socket_payload_never_asserts_a_permission_mode() {
+        let dir = std::env::temp_dir().join(format!("prov-socket-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("inbox.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let reader = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream)
+                .read_line(&mut line)
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        });
+        deliver_forward(
+            &Delivery::ClaudeSocket(path),
+            "m-test",
+            "o/r#1",
+            "sender",
+            "target",
+            "hello",
+            None,
+        )
+        .unwrap();
+        let value = reader.join().unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"].as_object().unwrap().len(), 2);
+        assert_eq!(value["message"]["role"], "user");
+        assert!(!value.to_string().contains("permission_mode"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

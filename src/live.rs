@@ -30,6 +30,8 @@ pub struct Record {
     /// time. Kept per folder: a branch name only means something in its repository.
     pub branches: Vec<BranchSeen>,
     pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,6 +88,7 @@ struct HookInput {
     cwd: Option<String>,
     hook_event_name: String,
     transcript_path: Option<String>,
+    permission_mode: Option<String>,
 }
 
 /// Hook entry point. Never fails the harness: errors are swallowed and
@@ -412,6 +415,7 @@ pub fn update(
         last_event: event.hook_event_name,
         updated: now,
         branches,
+        permission_mode: event.permission_mode,
         transcript_path: event
             .transcript_path
             .or_else(|| previous.and_then(|p| p.transcript_path)),
@@ -424,6 +428,7 @@ pub struct HookEvent {
     pub cwd: Option<String>,
     pub hook_event_name: String,
     pub transcript_path: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 impl From<HookInput> for HookEvent {
@@ -433,6 +438,7 @@ impl From<HookInput> for HookEvent {
             cwd: h.cwd,
             hook_event_name: h.hook_event_name,
             transcript_path: h.transcript_path,
+            permission_mode: h.permission_mode,
         }
     }
 }
@@ -611,6 +617,7 @@ mod tests {
             cwd: Some("/r".into()),
             hook_event_name: name.into(),
             transcript_path: None,
+            permission_mode: None,
         }
     }
 
@@ -649,6 +656,39 @@ mod tests {
             .map(|b| (b.branch.as_str(), b.last_seen))
             .collect();
         assert_eq!(seen, [("main", at(1)), ("feat", at(3))]);
+    }
+
+    #[test]
+    fn permission_mode_observation_updates_and_missing_evidence_is_unknown() {
+        let probe = Fake {
+            pid: 42,
+            branch: "b",
+            probes: Cell::new(0),
+        };
+        let mut event = ev("UserPromptSubmit");
+        event.permission_mode = Some("bypassPermissions".into());
+        let record = update(None, Harness::ClaudeCode, event, at(1), &probe);
+        assert_eq!(record.permission_mode.as_deref(), Some("bypassPermissions"));
+        let mut event = ev("Stop");
+        event.permission_mode = Some("default".into());
+        let record = update(Some(record), Harness::ClaudeCode, event, at(2), &probe);
+        assert_eq!(record.permission_mode.as_deref(), Some("default"));
+        let record = update(
+            Some(record),
+            Harness::ClaudeCode,
+            ev("SessionStart"),
+            at(3),
+            &probe,
+        );
+        assert!(record.permission_mode.is_none());
+        let mut old = serde_json::to_value(record).unwrap();
+        old.as_object_mut().unwrap().remove("permission_mode");
+        assert!(
+            serde_json::from_value::<Record>(old)
+                .unwrap()
+                .permission_mode
+                .is_none()
+        );
     }
 
     #[test]
@@ -867,6 +907,7 @@ mod tests {
                     updated: Utc::now(),
                     branches: vec![],
                     transcript_path: None,
+                    permission_mode: None,
                 };
                 let mut alive = HashMap::new();
                 fill_alive_pids(std::slice::from_ref(&r), &mut alive, &process_start);
@@ -1014,6 +1055,7 @@ mod tests {
             updated: Utc::now(),
             branches: vec![],
             transcript_path: None,
+            permission_mode: None,
         };
         let mut alive = HashMap::new();
         fill_alive_pids(std::slice::from_ref(&r), &mut alive, &|pid| {
@@ -1071,6 +1113,7 @@ mod tests {
             updated: Utc::now(),
             branches: Vec::new(),
             transcript_path: None,
+            permission_mode: None,
         };
         let (old, new) = (
             rec("Mon Oct 26 10:00:00 2026"),
