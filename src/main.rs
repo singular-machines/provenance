@@ -2281,21 +2281,9 @@ mod named_tests {
         assert!(!send::mail_dir(&home).exists());
         std::fs::remove_dir_all(home).unwrap();
     }
-    /// A T3 Code state database recording `session` as thread `thread`'s
-    /// Claude Code conversation.
-    fn t3_fixture(home: &std::path::Path, thread: &str, session: &str, strength: &str) {
-        let dir = home.join(".t3/userdata");
+    fn t3_sql(base: &std::path::Path, sql: &str) {
+        let dir = base.join("userdata");
         std::fs::create_dir_all(&dir).unwrap();
-        let payload = serde_json::json!({
-            "appThreadId": thread,
-            "nativeThreadRef": {"driver": "claudeAgent", "nativeId": session, "strength": strength},
-        });
-        let sql = format!(
-            "CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, archived_at TEXT, deleted_at TEXT);
-             CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);
-             INSERT INTO orchestration_v2_projection_threads VALUES ('{thread}', NULL, NULL);
-             INSERT INTO orchestration_v2_projection_provider_threads VALUES ('p1', '2026-11-11T00:00:00Z', '{payload}');"
-        );
         let out = std::process::Command::new("sqlite3")
             .arg(dir.join("statev2.sqlite"))
             .arg(sql)
@@ -2307,42 +2295,135 @@ mod named_tests {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    /// Adds provider thread `provider` of T3 thread `thread`, referring to the
+    /// Claude Code session `session`; `active` makes it the thread's current
+    /// conversation.
+    fn t3_add(
+        base: &std::path::Path,
+        thread: &str,
+        provider: &str,
+        session: &str,
+        strength: &str,
+        active: bool,
+    ) {
+        let payload = serde_json::json!({
+            "appThreadId": thread,
+            "nativeThreadRef": {"driver": "claudeAgent", "nativeId": session, "strength": strength},
+        });
+        t3_sql(
+            base,
+            &format!(
+                "CREATE TABLE IF NOT EXISTS orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, active_provider_thread_id TEXT, archived_at TEXT, deleted_at TEXT);
+                 CREATE TABLE IF NOT EXISTS orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+                 INSERT OR IGNORE INTO orchestration_v2_projection_threads VALUES ('{thread}', NULL, NULL, NULL);
+                 INSERT INTO orchestration_v2_projection_provider_threads VALUES ('{provider}', '2026-11-11T00:00:00Z', '{payload}');
+                 UPDATE orchestration_v2_projection_threads SET active_provider_thread_id = '{provider}' WHERE thread_id = '{thread}' AND {active};"
+            ),
+        );
+    }
     #[test]
-    fn t3_thread_needs_a_strong_live_reference() {
+    fn t3_thread_binds_to_one_current_conversation() {
         let session = "a4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let other = "b4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let db = |home: &std::path::Path| home.join(".t3/userdata/statev2.sqlite");
         let home = scratch();
-        let db = home.join(".t3/userdata/statev2.sqlite");
-        assert_eq!(send::t3_thread(&db, session), None);
-        t3_fixture(&home, "thread-1", session, "strong");
-        assert_eq!(send::t3_thread(&db, session).as_deref(), Some("thread-1"));
+        let base = home.join(".t3");
+        assert_eq!(send::t3_thread(&db(&home), session), None);
+        t3_add(&base, "thread-1", "p1", session, "strong", true);
         assert_eq!(
-            send::t3_thread(&db, "b4217d94-c60f-4ad7-9b6b-1b7b52976ea4"),
-            None
+            send::t3_thread(&db(&home), session).as_deref(),
+            Some("thread-1")
         );
-        assert_eq!(send::t3_thread(&db, "x' OR '1'='1"), None);
-        let archive = std::process::Command::new("sqlite3")
-            .arg(&db)
-            .arg("UPDATE orchestration_v2_projection_threads SET archived_at = 'now';")
-            .status()
-            .unwrap();
-        assert!(archive.success());
-        assert_eq!(send::t3_thread(&db, session), None);
+        assert_eq!(send::t3_thread(&db(&home), other), None);
+        assert_eq!(send::t3_thread(&db(&home), "x' OR '1'='1"), None);
+        t3_sql(
+            &base,
+            "UPDATE orchestration_v2_projection_threads SET archived_at = 'now';",
+        );
+        assert_eq!(send::t3_thread(&db(&home), session), None);
         std::fs::remove_dir_all(home).unwrap();
+        // A weak reference doesn't identify the session.
         let home = scratch();
-        t3_fixture(&home, "thread-1", session, "weak");
+        t3_add(&home.join(".t3"), "thread-1", "p1", session, "weak", true);
+        assert_eq!(send::t3_thread(&db(&home), session), None);
+        std::fs::remove_dir_all(home).unwrap();
+        // The thread switched to another conversation: its old provider
+        // thread still names the session, but a send reaches the new one.
+        let home = scratch();
+        let base = home.join(".t3");
+        t3_add(&base, "thread-a", "provider-old", session, "strong", false);
+        t3_add(&base, "thread-a", "provider-new", other, "strong", true);
+        assert_eq!(send::t3_thread(&db(&home), session), None);
         assert_eq!(
-            send::t3_thread(&home.join(".t3/userdata/statev2.sqlite"), session),
-            None
+            send::t3_thread(&db(&home), other).as_deref(),
+            Some("thread-a")
         );
+        std::fs::remove_dir_all(home).unwrap();
+        // Two threads currently claiming the session is ambiguous.
+        let home = scratch();
+        let base = home.join(".t3");
+        t3_add(&base, "thread-a", "pa", session, "strong", true);
+        t3_add(&base, "thread-b", "pb", session, "strong", true);
+        assert_eq!(send::t3_thread(&db(&home), session), None);
         std::fs::remove_dir_all(home).unwrap();
     }
     #[test]
+    fn t3_base_resolves_t3code_home_as_t3_does() {
+        let home = std::path::Path::new("/Users/someone");
+        let cwd = std::env::current_dir().unwrap();
+        let base = |v: Option<&str>| send::t3_base(home, v.map(Into::into));
+        assert_eq!(base(None), home.join(".t3"));
+        assert_eq!(base(Some("")), home.join(".t3"));
+        assert_eq!(base(Some("  \t")), home.join(".t3"));
+        assert_eq!(base(Some("~")), home);
+        assert_eq!(base(Some("~/t3data")), home.join("t3data"));
+        assert_eq!(base(Some("  /srv/t3  ")), std::path::Path::new("/srv/t3"));
+        assert_eq!(base(Some("rel/t3")), cwd.join("rel/t3"));
+    }
+    /// Routing reads `T3CODE_HOME`, so each case runs in a child test process
+    /// with an environment this test owns: unset, and set to a custom folder.
+    #[test]
     fn bypass_socket_reroutes_through_t3_when_t3_hosts_the_session() {
+        let Ok(case) = std::env::var("PROVENANCE_T3_FIXTURE") else {
+            let root = scratch();
+            for case in ["default", "custom"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "named_tests::bypass_socket_reroutes_through_t3_when_t3_hosts_the_session",
+                        "--nocapture",
+                    ])
+                    .env("PROVENANCE_T3_FIXTURE", case);
+                if case == "custom" {
+                    command.env(
+                        "T3CODE_HOME",
+                        format!("  {}  ", root.join("custom-t3").display()),
+                    );
+                } else {
+                    command.env_remove("T3CODE_HOME");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        };
         use std::os::unix::fs::PermissionsExt;
         let session = "c4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
         let home = scratch();
+        let base = match case.as_str() {
+            "custom" => PathBuf::from(std::env::var("T3CODE_HOME").unwrap().trim()),
+            _ => home.join(".t3"),
+        };
         let (r, s) = socket_target_with_id(&home, Some("bypassPermissions"), session);
-        t3_fixture(&home, "thread-9", session, "strong");
+        t3_add(&base, "thread-9", "p9", session, "strong", true);
         let bin = home.join(".t3/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let t3 = bin.join("t3");
@@ -2355,6 +2436,11 @@ mod named_tests {
         )
         .unwrap();
         std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let planned = send::Delivery::T3Thread {
+            bin: t3.clone(),
+            base: base.clone(),
+            thread: "thread-9".into(),
+        };
         let delivery = plan_recipient(
             &home,
             &s,
@@ -2364,13 +2450,7 @@ mod named_tests {
             false,
             send::Caller::Mcp,
         );
-        assert_eq!(
-            delivery,
-            send::Delivery::T3Thread {
-                bin: t3.clone(),
-                thread: "thread-9".into()
-            }
-        );
+        assert_eq!(delivery, planned);
         let sent = send_message(
             &home,
             "@Socket Target",
@@ -2385,11 +2465,44 @@ mod named_tests {
         let mut args = args.lines();
         assert_eq!(args.next(), Some("thread"));
         assert_eq!(args.next(), Some("send"));
+        assert_eq!(args.next(), Some("--base-dir"));
+        assert_eq!(args.next(), base.to_str());
         assert_eq!(args.next(), Some("thread-9"));
         let body: String = args.collect::<Vec<_>>().join("\n");
         assert!(body.contains("hello there"));
         assert!(body.contains("BEGIN PROVENANCE"));
         let mailbox = send::mailbox(&send::mail_dir(&home), r.harness, &r.session_id);
+        assert_eq!(send::read(&mailbox).len(), 1);
+        // The thread switches conversation after the route was planned: the
+        // planned delivery is refused before mail or transport.
+        t3_add(
+            &base,
+            "thread-9",
+            "p10",
+            "d4217d94-c60f-4ad7-9b6b-1b7b52976ea4",
+            "strong",
+            true,
+        );
+        let error = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery: planned,
+                sender: None,
+                pr: None,
+                named: None,
+                note: None,
+            },
+            "never deliver",
+            &|_, _, _, _, _, _, _| panic!("refusal must precede transport"),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("no longer running in a T3 Code thread"),
+            "{error}"
+        );
         assert_eq!(send::read(&mailbox).len(), 1);
         std::fs::remove_dir_all(home).unwrap();
     }

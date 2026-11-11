@@ -33,8 +33,14 @@ pub enum Delivery {
     ClaudeSocket(PathBuf),
     /// `codex queue`: a running Codex session takes it now, or after its turn.
     CodexQueue(String),
-    /// `t3 thread send`: T3 Code runs it as the thread's next turn.
-    T3Thread { bin: PathBuf, thread: String },
+    /// `t3 thread send`: T3 Code runs it as the thread's next turn. `base`
+    /// is the T3 data directory the thread was found in, passed to `t3` so
+    /// lookup and delivery use the same one.
+    T3Thread {
+        bin: PathBuf,
+        base: PathBuf,
+        thread: String,
+    },
     /// Resume the session headless in its folder, with the message as its prompt.
     Resume { cwd: String, argv: Vec<String> },
     /// The message can't be delivered, and why.
@@ -233,20 +239,69 @@ pub fn bypass_note(reasons: &[String]) -> Option<String> {
 
 /// Where a held socket write goes instead. `None` when the socket isn't held;
 /// T3 Code's own thread queue when T3 hosts the session; otherwise a refusal.
+/// A planned T3 route is checked again, so a mapping or process that changed
+/// since planning is refused instead of delivered to whatever the thread now
+/// runs. T3 offers no way to bind a send to the native session, so a switch
+/// between this check and `t3 thread send` remains possible.
 pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option<Delivery> {
+    let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
+    if let Delivery::T3Thread { .. } = delivery {
+        let current =
+            live_record(home, target).and_then(|_| t3_route(home, &base, &target.session_id));
+        return Some(match current {
+            Some(d) if &d == delivery => d,
+            Some(_) => Delivery::Refuse(
+                "its T3 Code thread changed since the message was planned; nothing was delivered"
+                    .into(),
+            ),
+            None => Delivery::Refuse(
+                "it is no longer running in a T3 Code thread provenance can identify; nothing was delivered"
+                    .into(),
+            ),
+        });
+    }
     let why = socket_refusal(home, target, delivery)?;
-    Some(t3_route(home, &target.session_id).unwrap_or(Delivery::Refuse(why)))
+    Some(t3_route(home, &base, &target.session_id).unwrap_or(Delivery::Refuse(why)))
 }
 
-/// T3 Code's data directory: `T3CODE_HOME`, or `~/.t3`.
-fn t3_base(home: &Path) -> PathBuf {
-    std::env::var_os("T3CODE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".t3"))
+/// The target's hook record, if its process is still alive.
+fn live_record(home: &Path, target: &Sender) -> Option<crate::live::Record> {
+    let records = crate::live::load_records(home);
+    let record = records
+        .into_iter()
+        .find(|r| r.harness == target.harness && r.session_id == target.session_id)?;
+    let alive = crate::live::alive_pids(std::slice::from_ref(&record));
+    crate::live::is_alive(&record, &alive).then_some(record)
 }
 
-fn t3_route(home: &Path, session_id: &str) -> Option<Delivery> {
-    let base = t3_base(home);
+/// T3 Code's data directory from `T3CODE_HOME`, resolved as T3 resolves it:
+/// unset, empty or blank means `~/.t3`; surrounding blanks are trimmed; `~`
+/// and `~/` expand to the home folder; a relative path is from the current
+/// folder.
+pub fn t3_base(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
+    let default = || home.join(".t3");
+    let Some(configured) = configured else {
+        return default();
+    };
+    let path = match configured.to_str() {
+        Some(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return default();
+            } else if text == "~" {
+                home.to_path_buf()
+            } else if let Some(rest) = text.strip_prefix("~/") {
+                home.join(rest)
+            } else {
+                PathBuf::from(text)
+            }
+        }
+        None => PathBuf::from(configured),
+    };
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+fn t3_route(home: &Path, base: &Path, session_id: &str) -> Option<Delivery> {
     let thread = t3_thread(&base.join("userdata/statev2.sqlite"), session_id)?;
     let installed = home.join(".t3/bin/t3");
     let bin = if installed.is_file() {
@@ -254,12 +309,18 @@ fn t3_route(home: &Path, session_id: &str) -> Option<Delivery> {
     } else {
         PathBuf::from("t3")
     };
-    Some(Delivery::T3Thread { bin, thread })
+    Some(Delivery::T3Thread {
+        bin,
+        base: base.to_path_buf(),
+        thread,
+    })
 }
 
-/// The live T3 Code thread whose Claude Code conversation is `session_id`,
-/// read from T3's state database. T3 records the native session it drives in
-/// each provider thread's `nativeThreadRef`; only strong references count.
+/// The T3 Code thread whose current conversation is the Claude Code session
+/// `session_id`, read from T3's state database. T3 records the native session
+/// behind each provider thread in its `nativeThreadRef`, and keeps old provider
+/// threads after a switch, so only a strong reference from the thread's
+/// active provider thread counts. Several such threads is ambiguous: none.
 pub fn t3_thread(db: &Path, session_id: &str) -> Option<String> {
     if session_id.is_empty()
         || !session_id
@@ -275,11 +336,12 @@ pub fn t3_thread(db: &Path, session_id: &str) -> Option<String> {
         "SELECT t.thread_id FROM orchestration_v2_projection_provider_threads p \
          JOIN orchestration_v2_projection_threads t \
            ON t.thread_id = json_extract(p.payload_json, '$.appThreadId') \
+          AND t.active_provider_thread_id = p.provider_thread_id \
          WHERE json_extract(p.payload_json, '$.nativeThreadRef.driver') = 'claudeAgent' \
            AND json_extract(p.payload_json, '$.nativeThreadRef.nativeId') = '{session_id}' \
            AND json_extract(p.payload_json, '$.nativeThreadRef.strength') = 'strong' \
            AND t.archived_at IS NULL AND t.deleted_at IS NULL \
-         ORDER BY p.updated_at DESC LIMIT 1;"
+         LIMIT 2;"
     );
     let out = Command::new("sqlite3")
         .args(["-readonly", "-batch", "-noheader"])
@@ -450,8 +512,11 @@ fn deliver(d: &Delivery, text: &str, relay: Relay<'_>) -> Result<String> {
             Command::new("codex").args(["queue", "--thread", thread, "--message", text]),
             None,
         ),
-        Delivery::T3Thread { bin, thread } => run(
-            Command::new(bin).args(["thread", "send", thread, text]),
+        Delivery::T3Thread { bin, base, thread } => run(
+            Command::new(bin)
+                .args(["thread", "send", "--base-dir"])
+                .arg(base)
+                .args([thread.as_str(), text]),
             None,
         )
         .map(|_| String::new()),
