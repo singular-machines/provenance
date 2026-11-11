@@ -31,7 +31,7 @@ use crate::sessions::Harness;
 pub enum Delivery {
     /// Write to a running Claude Code session's inbox socket.
     ClaudeSocket(PathBuf),
-    /// `codex queue`: a running Codex session takes it now, or after its turn.
+    /// Queue acceptance only; recipient consumption is not acknowledged.
     CodexQueue(String),
     /// `t3 thread send`: T3 Code runs it as the thread's next turn. `base`
     /// is the T3 data directory the thread was found in, passed to `t3` so
@@ -123,6 +123,16 @@ fn plan_delivery(
         cwd: s.cwd.clone(),
         argv: headless_argv(s.harness, &s.session_id),
     }
+}
+
+// Do not inherit GIT_DIR/GIT_WORK_TREE from the sending session.
+pub fn codex_resume_repo(cwd: &str) -> bool {
+    Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Caller capabilities: MCP cannot request or be advised to force a resume.
