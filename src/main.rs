@@ -2379,6 +2379,21 @@ mod named_tests {
         assert_eq!(base(Some("~/t3data")), home.join("t3data"));
         assert_eq!(base(Some("  /srv/t3  ")), std::path::Path::new("/srv/t3"));
         assert_eq!(base(Some("rel/t3")), cwd.join("rel/t3"));
+        assert_eq!(base(Some("./rel/./x/../t3/")), cwd.join("rel/t3"));
+        assert_eq!(base(Some("~/a/../t3")), home.join("t3"));
+        assert_eq!(base(Some("/../srv/t3")), std::path::Path::new("/srv/t3"));
+        // T3 removes `link/..` as text; following the symlink would land in
+        // the link target's parent, a different home.
+        let root = scratch();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b/child")).unwrap();
+        std::os::unix::fs::symlink(root.join("b/child"), root.join("a/link")).unwrap();
+        let through_link = root.join("a/link/../t3home");
+        assert_eq!(
+            send::t3_base(home, Some(through_link.into())),
+            root.join("a/t3home")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
     /// Routing reads `T3CODE_HOME`, so each case runs in a child test process
     /// with an environment this test owns: unset, and set to a custom folder.

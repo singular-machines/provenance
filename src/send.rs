@@ -277,28 +277,42 @@ fn live_record(home: &Path, target: &Sender) -> Option<crate::live::Record> {
 /// T3 Code's data directory from `T3CODE_HOME`, resolved as T3 resolves it:
 /// unset, empty or blank means `~/.t3`; surrounding blanks are trimmed; `~`
 /// and `~/` expand to the home folder; a relative path is from the current
-/// folder.
+/// folder; and `.` and `..` are resolved as text, like Node's `path.resolve`,
+/// so `link/..` is never followed through a symlink.
 pub fn t3_base(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
-    let default = || home.join(".t3");
-    let Some(configured) = configured else {
-        return default();
+    let path = match configured.as_ref().map(|c| (c, c.to_str())) {
+        None => home.join(".t3"),
+        Some((_, Some(text))) => match text.trim() {
+            "" => home.join(".t3"),
+            "~" => home.to_path_buf(),
+            text => match text.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(text),
+            },
+        },
+        Some((raw, None)) => PathBuf::from(raw),
     };
-    let path = match configured.to_str() {
-        Some(text) => {
-            let text = text.trim();
-            if text.is_empty() {
-                return default();
-            } else if text == "~" {
-                home.to_path_buf()
-            } else if let Some(rest) = text.strip_prefix("~/") {
-                home.join(rest)
-            } else {
-                PathBuf::from(text)
+    resolve_lexically(&path)
+}
+
+/// An absolute `path` with `.` and `..` removed without touching the disk.
+fn resolve_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let absolute = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut out = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
             }
+            other => out.push(other),
         }
-        None => PathBuf::from(configured),
-    };
-    std::path::absolute(&path).unwrap_or(path)
+    }
+    out
 }
 
 fn t3_route(home: &Path, base: &Path, session_id: &str) -> Option<Delivery> {
