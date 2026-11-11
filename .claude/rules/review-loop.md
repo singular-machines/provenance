@@ -1,12 +1,5 @@
-# Review format and local checks
+# review-loop extension for provenance
 
-This repository uses the auto-review skill's review format even though that
-skill describes itself as for CTS repositories. Follow its verdict line format
-with first line `Verdict: approve` or `Verdict: changes needed`, and use verdict labels: `code-review:clean`, `code-review:needs-fix`, and
-`code-review:resolved`.
+Install at `.claude/rules/review-loop.md`. Loaded by the generic cts-brain skill `review-loop` at start.
 
-Run these local checks:
-
-- `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
+Review format, verdict labels, local checks and core-flow paths are in `.claude/rules/auto-review.md`. Give the reviewer both files in the round brief.
