@@ -43,6 +43,10 @@ pub enum Delivery {
     },
     /// Resume the session headless in its folder, with the message as its prompt.
     Resume { cwd: String, argv: Vec<String> },
+    /// Over SSH to provenance on the machine the session ran on, which
+    /// delivers it itself. `resumes` when that machine said it would resume
+    /// the session headless.
+    Relay { machine: String, resumes: bool },
     /// The message can't be delivered, and why.
     Refuse(String),
 }
@@ -556,6 +560,9 @@ fn deliver(d: &Delivery, text: &str, relay: Relay<'_>) -> Result<String> {
                 Some(relay),
             )
         }
+        Delivery::Relay { machine, .. } => {
+            bail!("a message for machine {machine} goes through `provenance relay`")
+        }
         Delivery::Refuse(why) => bail!("can't message this session: {why}"),
     }
 }
@@ -615,7 +622,9 @@ pub fn choose<'a>(
         why.clear();
         for m in sessions {
             match plan(m, true) {
-                d @ Delivery::Resume { .. } => return Ok((m, d)),
+                d @ (Delivery::Resume { .. } | Delivery::Relay { resumes: true, .. }) => {
+                    return Ok((m, d));
+                }
                 Delivery::Refuse(reason) => why.push((m, reason)),
                 _ => {}
             }
@@ -675,6 +684,7 @@ pub fn describe(d: &Delivery) -> &'static str {
         Delivery::CodexQueue(_) => "codex queue",
         Delivery::T3Thread { .. } => "T3 Code's thread queue",
         Delivery::Resume { .. } => "a headless resume",
+        Delivery::Relay { .. } => "a relay to another machine",
         Delivery::Refuse(_) => "nothing",
     }
 }
@@ -697,6 +707,12 @@ pub enum Mail {
         named_address: Option<NamedAddress>,
         from: String,
         sender: Option<Sender>,
+        /// The machine a relayed message came from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_machine: Option<String>,
+        /// The machine a message was relayed to; this is the sender's copy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_machine: Option<String>,
         text: String,
         at: DateTime<Utc>,
     },
@@ -775,14 +791,19 @@ pub fn record_reply(
     me: Option<&Sender>,
     id: &str,
     text: &str,
-) -> Result<Option<Sender>> {
+) -> Result<(Option<Sender>, Option<String>)> {
     let Some(me) = me else {
         bail!(
             "reply works only inside the session the message was sent to, with provenance's session hooks installed"
         );
     };
     let path = mailbox(dir, me.harness, &me.session_id);
-    let Some(Mail::Message { sender, .. }) = find_message(&path, id) else {
+    let Some(Mail::Message {
+        sender,
+        from_machine,
+        ..
+    }) = find_message(&path, id)
+    else {
         bail!("no message {id} was sent to this session");
     };
     append(
@@ -793,7 +814,7 @@ pub fn record_reply(
             at: Utc::now(),
         },
     )?;
-    Ok(sender)
+    Ok((sender, from_machine))
 }
 
 /// The first reply to a message in a mailbox.
@@ -1415,6 +1436,8 @@ mod tests {
                 named_address: None,
                 from: "you".into(),
                 sender: Some(sender.clone()),
+                from_machine: None,
+                to_machine: None,
                 text: "hi".into(),
                 at: Utc::now(),
             },
@@ -1427,7 +1450,7 @@ mod tests {
         assert!(record_reply(&dir, Some(&recipient), "m-2", "no such").is_err());
         assert_eq!(
             record_reply(&dir, Some(&recipient), "m-1", "done").unwrap(),
-            Some(sender)
+            (Some(sender), None)
         );
         assert_eq!(reply_to(&path, "m-1").as_deref(), Some("done"));
         std::fs::remove_dir_all(&dir).unwrap();
