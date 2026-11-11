@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>provenance log</title>
+<style>
+:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--border:#d0d7de;--card:#f6f8fa;--night:rgba(31,35,40,.05);--sel:#ddf4ff;--merged:#1a7f37;--closed:#cf222e;--running:#0969da;--needs:#9a6700;--open:#8c959f;--accent:#0969da;--lab:300px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--border:#30363d;--card:#161b22;--night:rgba(255,255,255,.04);--sel:#1c2b3f;--merged:#3fb950;--closed:#f85149;--running:#58a6ff;--needs:#d29922;--open:#6e7681;--accent:#58a6ff}}
+@media (max-width:720px){:root{--lab:190px}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+h1{font-size:18px;margin:0 6px 0 0}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg button{background:none;border:0;color:var(--muted);font:inherit;font-size:12px;padding:4px 10px;cursor:pointer}
+.seg button.on{background:var(--card);color:var(--fg);font-weight:600}
+.sum{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.chip{font-size:12px;padding:2px 9px;border-radius:999px;border:1px solid var(--border);color:var(--muted);background:none;font-family:inherit}
+.chip b{color:var(--fg)}
+button.chip{cursor:pointer;border-color:var(--needs);color:var(--needs)}
+button.chip.quiet{border-color:var(--border);border-style:dashed;color:var(--muted)}
+.chart{border:1px solid var(--border);border-radius:6px;position:relative;overflow:hidden}
+.axis,.row{display:grid;grid-template-columns:var(--lab) 1fr}
+.axis{height:28px;border-bottom:1px solid var(--border);position:relative;z-index:1}
+.ticks{position:relative}
+.tick{position:absolute;top:7px;font-size:11px;color:var(--muted);transform:translateX(-50%);white-space:nowrap}
+.tick.we{opacity:.55}
+.row{height:40px;border-bottom:1px solid color-mix(in srgb,var(--border) 45%,transparent);cursor:pointer;position:relative;z-index:1}
+.row:hover .lab{background:color-mix(in srgb,var(--sel) 55%,transparent)}
+.row.sel .lab{background:var(--sel);box-shadow:inset 3px 0 var(--accent)}
+.row.sel .lane{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 60%,transparent)}
+.lab{padding:4px 10px;min-width:0;overflow:hidden}
+.l1,.l2{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ref{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-right:6px}
+.l2{font-size:11px;color:var(--muted)}
+.grp{height:28px;padding:9px 10px 0;font-size:12px;font-weight:600;position:relative;z-index:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.grp .m{font-weight:400;color:var(--muted);margin-left:6px}
+.lane{position:relative}
+.bg{position:absolute;top:0;bottom:0;left:var(--lab);right:0;pointer-events:none}
+.night{position:absolute;top:0;bottom:0;background:var(--night)}
+.future{position:absolute;top:0;bottom:0;right:0;background:repeating-linear-gradient(45deg,transparent 0 6px,color-mix(in srgb,var(--border) 50%,transparent) 6px 7px)}
+.gl{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb,var(--border) 75%,transparent)}
+.now{position:absolute;top:0;bottom:0;border-left:2px solid var(--accent);z-index:2}
+.now span{position:absolute;bottom:4px;right:4px;white-space:nowrap;font-size:10px;color:var(--accent);background:var(--bg);padding:0 3px}
+.bar{position:absolute;top:14px;height:12px;border-radius:6px;min-width:6px}
+.bar.carry{border-top-left-radius:0;border-bottom-left-radius:0}
+.bar.carry::before{content:"";position:absolute;left:-6px;top:0;border:6px solid transparent;border-right:6px solid var(--c);border-left:0}
+.bar.live::after{content:"";position:absolute;right:-7px;top:-1px;border:7px solid transparent;border-left:7px solid var(--c);border-right:0}
+.merged{--c:var(--merged)}.closed{--c:var(--closed)}.running{--c:var(--running)}.needs,.stale{--c:var(--needs)}.open{--c:var(--open)}
+.bar{background:var(--c)}
+.bar.stale{background:none;border:2px dashed var(--c);height:10px;top:15px}
+.end{position:absolute;top:10px;font-size:13px;font-weight:700;color:var(--c)}
+.st{color:var(--c)}
+.st.merged,.st.closed,.st.open{color:var(--muted)}
+.tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.2);max-width:340px;display:none;z-index:5}
+.tip b{display:block;margin-bottom:2px}
+.m{color:var(--muted)}
+.detail{margin-top:10px;border:1px solid var(--border);border-radius:6px;padding:12px 16px;display:grid;grid-template-columns:1fr auto;gap:4px 16px}
+.detail h2{margin:0;font-size:14px}
+.detail .m{font-size:12px}
+.acts{grid-row:1/5;grid-column:2;display:flex;flex-direction:column;gap:6px}
+.btn{font:inherit;font-size:12px;border:1px solid var(--border);background:var(--card);color:var(--fg);border-radius:6px;padding:5px 10px;cursor:pointer;text-align:left;text-decoration:none}
+code{font-family:var(--mono);font-size:11.5px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:10px}
+.sw{display:inline-block;width:18px;height:8px;border-radius:4px;vertical-align:middle;margin-right:4px;background:var(--c)}
+.sw.stale{background:none;border:2px dashed var(--c);height:8px}
+.foot{font-size:11px;color:var(--muted);margin-top:6px}
+.empty{padding:24px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="top"><h1 id="title"></h1><div class="seg" id="win"></div><div class="seg" id="grp"><button data-v="pr" class="on">By PR</button><button data-v="session">By session</button></div></div>
+<div class="sum" id="sum"></div>
+<div class="chart" id="chart"></div>
+<div class="detail" id="detail" hidden></div>
+<div class="legend"><span><i class="sw merged"></i>merged</span><span><i class="sw closed"></i>closed</span><span><i class="sw running"></i>open, agent running</span><span><i class="sw open"></i>open</span><span><i class="sw needs"></i>open, needs you</span><span><i class="sw stale needs"></i>open, gone quiet</span><span>◀ opened before the window</span><span>shaded: night (20:00–08:00) · hatched: not yet happened</span></div>
+<div class="foot" id="foot"></div>
+<script>
+"use strict";
+const D=/*DATA*/null;
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const H=36e5,DAY=24*H;
+const NOW=new Date(D.generated_at),START=new Date(D.start),TODAY=new Date(D.today);
+const DN=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"],MN=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const hm=d=>String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+const sameDay=(a,b)=>a.toDateString()===b.toDateString();
+const when=d=>{const days=Math.round((new Date(NOW.toDateString())-new Date(d.toDateString()))/DAY);
+  return days===0?hm(d):days>0&&days<7?`${DN[d.getDay()]} ${hm(d)}`:`${d.getDate()} ${MN[d.getMonth()]}${d.getFullYear()!==NOW.getFullYear()?" "+d.getFullYear():""}`};
+const full=d=>`${DN[d.getDay()]} ${d.getDate()} ${MN[d.getMonth()]} ${hm(d)}`;
+const dur=(a,b)=>{let m=Math.max(0,Math.round((b-a)/6e4)),d=Math.floor(m/1440),h=Math.floor(m%1440/60);m%=60;
+  return d?(h?`${d}d ${h}h`:`${d}d`):h?(m?`${h}h${String(m).padStart(2,"0")}m`:`${h}h`):`${m}m`};
+const E=D.entries.map(e=>{const end=e.state==="merged"?(e.merged_at||e.closed_at):e.state==="closed"?e.closed_at:null;
+  return {...e,key:`${e.repo}#${e.number}`,o:new Date(e.created_at),c:end?new Date(end):null}});
+const names={};for(const e of E){const n=e.repo.split("/").pop();(names[n]=names[n]||new Set).add(e.repo)}
+const short=e=>{const n=e.repo.split("/").pop();return `${names[n].size===1?n:e.repo}#${e.number}`};
+const kind=e=>e.state!=="open"?e.state:e.group==="quiet"?"stale":e.group==="needs-you"?"needs":e.status==="running"?"running":"open";
+const sessionKey=e=>e.agent?`${e.agent.harness}/${e.agent.session_id}`:"";
+let win=D.days>1?"window":"today",grp="pr",showQuiet=false;
+let sel=(E.find(e=>e.group==="needs-you")||E[0]||{}).key;
+
+const winBtns=document.getElementById("win");
+if(D.days>1){winBtns.innerHTML=`<button data-v="today">Today</button><button data-v="window" class="on">${esc(D.days)} days</button>`}else winBtns.remove();
+document.getElementById("foot").innerHTML=`Generated by <code>provenance log --html</code> at ${esc(full(NOW))}, in your browser's time zone. Status is a snapshot: run <code>provenance log</code> for live status.`;
+
+function inWindow(e){return win==="window"||e.state==="open"||e.c>=TODAY}
+function rows(){return E.filter(e=>inWindow(e)&&(showQuiet||e.group!=="quiet"))}
+function range(list){
+  if(win==="window")return[START,new Date(TODAY.getTime()+DAY)];
+  let a=new Date(TODAY.getTime()+8*H);
+  for(const e of list){const t=e.o>=TODAY?e.o:e.c&&e.c>=TODAY?e.c:null;if(t&&t<a)a=new Date(Math.floor(t/H)*H)}
+  if(a<TODAY)a=TODAY;
+  let b=new Date(Math.max(Math.ceil(NOW/H)*H+H,a.getTime()+8*H));
+  if(b>TODAY.getTime()+DAY)b=new Date(TODAY.getTime()+DAY);
+  return[a,b];
+}
+function statusText(e){
+  if(!e.c)return e.status;
+  return `${e.status} ${win==="window"&&!sameDay(e.c,NOW)?when(e.c):hm(e.c)}`;
+}
+function render(){
+  const list=rows(),[A,B]=range(list),X=t=>Math.max(0,Math.min(1,(t-A)/(B-A)))*100;
+  document.getElementById("title").textContent=win==="window"?D.label:`Today (${DN[NOW.getDay()]} ${NOW.getDate()} ${MN[NOW.getMonth()]})`;
+  const all=E.filter(inWindow),n=f=>all.filter(f).length,quiet=n(e=>e.group==="quiet");
+  document.getElementById("sum").innerHTML=
+    `<span class="chip"><b>${all.length}</b> PRs</span>`+
+    [["merged",e=>e.state==="merged"],["closed",e=>e.state==="closed"],["open",e=>e.state==="open"]].filter(([,f])=>n(f)).map(([w,f])=>`<span class="chip"><b>${n(f)}</b> ${w}</span>`).join("")+
+    all.filter(e=>e.group==="needs-you").map(e=>`<button class="chip" data-key="${esc(e.key)}">⚑ ${esc(short(e))} ${esc(e.status)}</button>`).join("")+
+    (quiet?`<button class="chip quiet" id="quiet">${showQuiet?"Hide":"Show"} ${quiet} gone quiet (no activity for ${esc(D.stale_days)}+ days)</button>`:"");
+  const chart=document.getElementById("chart");
+  if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;document.getElementById("detail").hidden=true;return}
+  if(!list.some(e=>e.key===sel))sel=(list.find(e=>e.group==="needs-you")||list[0]).key;
+  const lane=Math.max(200,chart.clientWidth-parseInt(getComputedStyle(chart).getPropertyValue("--lab")));
+  let ticks="",bg="";
+  const span=(B-A)/H;
+  if(span<=36){const step=span/(lane/60)>1?2:1;
+    for(let t=Math.ceil(A/H)*H;t<=B;t+=step*H){const d=new Date(t);if(X(d)>97)continue;ticks+=`<div class="tick" style="left:${X(d)}%">${String(d.getHours()).padStart(2,"0")}:00</div>`;bg+=`<div class="gl" style="left:${X(d)}%"></div>`}}
+  else{const days=Math.round(span/24),step=Math.max(1,Math.ceil(days/Math.floor(lane/58)));
+    for(let i=0;i<days;i++){const d0=new Date(A.getFullYear(),A.getMonth(),A.getDate()+i),noon=new Date(d0.getTime()+12*H);
+      if(days<=31)bg+=`<div class="night" style="left:${X(d0)}%;width:${X(new Date(d0.getTime()+8*H))-X(d0)}%"></div><div class="night" style="left:${X(new Date(d0.getTime()+20*H))}%;width:${X(new Date(d0.getTime()+DAY))-X(new Date(d0.getTime()+20*H))}%"></div>`;
+      if(i%step)continue;
+      const we=d0.getDay()===0||d0.getDay()===6;
+      ticks+=`<div class="tick${we?" we":""}" style="left:${X(step>1?d0:noon)}%">${DN[d0.getDay()]} ${d0.getDate()}${d0.getDate()===1||i===0&&days>7?" "+MN[d0.getMonth()]:""}</div>`;
+      bg+=`<div class="gl" style="left:${X(d0)}%"></div>`}}
+  if(NOW<B)bg+=`<div class="future" style="left:${X(NOW)}%"></div>`;
+  bg+=`<div class="now" style="left:${X(NOW)}%"><span>now ${hm(NOW)}</span></div>`;
+  const row=e=>{const k=kind(e),l=X(e.o),r=X(e.c||NOW),live=!e.c;
+    const end=e.c?`<span class="end ${k}" style="left:calc(${r}% + 3px)">${k==="merged"?"✓":"✗"}</span>`:"";
+    const who=grp==="pr"?esc(e.agent?e.agent.name:"no session found (likely you)")+" · ":"";
+    return `<div class="row${e.key===sel?" sel":""}" data-key="${esc(e.key)}"><div class="lab"><div class="l1"><span class="ref">${esc(short(e))}</span>${esc(e.title)}</div><div class="l2">${who}<span class="st ${k}">${esc(statusText(e))}</span></div></div><div class="lane"><div class="bar ${k}${e.o<A?" carry":""}${live?" live":""}" style="left:${l}%;width:calc(${Math.max(0,r-l)}% - ${live?7:0}px)"></div>${end}</div></div>`};
+  let body="";
+  // Same order as the terminal: needs you, in flight, gone quiet, done; newest first.
+  if(grp==="pr")body=list.map(row).join("");
+  else{const order=[...new Set(list.map(sessionKey))];
+    for(const s of order){const es=list.filter(e=>sessionKey(e)===s),a=es[0].agent;
+      const head=a?`${esc(a.name)}<span class="m">${esc([a.app,a.machine&&"on "+a.machine,a.session_id.slice(0,8)+"…"].filter(Boolean).join(" · "))}</span>${a.state?` <span class="m">· ${esc(a.state.replace("-"," "))}</span>`:""}`:`No session found <span class="m">(likely you)</span>`;
+      body+=`<div class="grp">${head}</div>`+es.map(row).join("")}}
+  chart.innerHTML=`<div class="bg">${bg}</div><div class="axis"><div></div><div class="ticks">${ticks}</div></div>${body}<div class="tip" id="tip"></div>`;
+  detail();
+}
+function detail(){
+  const e=E.find(x=>x.key===sel),box=document.getElementById("detail");
+  if(!e){box.hidden=true;return}
+  box.hidden=false;const k=kind(e),a=e.agent;
+  const url=/^https:\/\/github\.com\//.test(e.url)?e.url:"";
+  box.innerHTML=`<h2><span class="ref">${esc(e.key)}</span>${esc(e.title)}</h2>
+  <div class="m">${a?esc([a.name,a.app,a.machine&&"on "+a.machine,"session "+a.session_id.slice(0,8)+"…",a.matched_by==="stamp"?"stamped":"matched by branch"].filter(Boolean).join(" · ")):"No session found (likely you)"} · <span class="st ${k}">${esc(e.status)}</span></div>
+  <div class="m">Opened ${esc(full(e.o))}${e.c?` · ${esc(e.state)} ${esc(full(e.c))} (${esc(dur(e.o,e.c))})`:` · open for ${esc(dur(e.o,NOW))}`}</div>
+  <div class="m">Last activity ${esc(full(new Date(e.last_activity)))}</div>
+  <div class="acts">${url?`<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}<button class="btn" id="copy">Copy <code>provenance go ${esc(e.key)}</code></button></div>`;
+  document.getElementById("copy").onclick=ev=>{navigator.clipboard&&navigator.clipboard.writeText(`provenance go ${e.key}`).then(()=>{ev.currentTarget.textContent="Copied"},()=>{})};
+}
+document.addEventListener("click",ev=>{
+  const b=ev.target.closest(".seg button");
+  if(b){b.parentElement.querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));if(b.parentElement.id==="win")win=b.dataset.v;else grp=b.dataset.v;render();return}
+  if(ev.target.closest("#quiet")){showQuiet=!showQuiet;render();return}
+  const r=ev.target.closest("[data-key]");if(r){sel=r.dataset.key;render()}});
+document.addEventListener("mousemove",ev=>{
+  const tip=document.getElementById("tip");if(!tip)return;
+  const r=ev.target.closest(".row");if(!r){tip.style.display="none";return}
+  const e=E.find(x=>x.key===r.dataset.key),box=document.getElementById("chart").getBoundingClientRect();
+  tip.innerHTML=`<b>${esc(e.title)}</b><div class="m">${esc(e.key)}</div><div>${esc(e.agent?[e.agent.name,e.agent.app].filter(Boolean).join(" · "):"No session found (likely you)")}</div><div class="m">Opened ${esc(full(e.o))}<br>${e.c?`${esc(e.state)} ${esc(full(e.c))} · ${esc(dur(e.o,e.c))}`:esc(e.status)}</div>`;
+  tip.style.display="block";let x=ev.clientX-box.left+14;if(x>box.width-350)x=ev.clientX-box.left-354;
+  tip.style.left=Math.max(4,x)+"px";tip.style.top=(ev.clientY-box.top+14)+"px"});
+addEventListener("resize",render);
+render();
+</script>
+</body>
+</html>

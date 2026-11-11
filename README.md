@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/singular-machines/provenance/actions/workflows/ci.yml/badge.svg)](https://github.com/singular-machines/provenance/actions/workflows/ci.yml) ![Rust](https://img.shields.io/badge/Rust-2024-dea584?logo=rust&logoColor=white) ![Claude Code](https://img.shields.io/badge/Claude_Code-supported-d97757) ![Codex](https://img.shields.io/badge/Codex-supported-10a37f) ![OpenCode](https://img.shields.io/badge/OpenCode-supported-555) ![Pi](https://img.shields.io/badge/Pi-supported-6f42c1) [![License](https://img.shields.io/badge/license-MIT_or_Apache--2.0-blue)](#license)
 
-[Quick start](#quick-start) · [Reading the table](#reading-the-table) · [How it works](#how-it-works) · [Install hooks](#install-hooks) · [Privacy](#privacy) · [Roadmap](#roadmap) · [License](#license)
+[Quick start](#quick-start) · [Reading the table](#reading-the-table) · [Timeline](#timeline) · [How it works](#how-it-works) · [Install hooks](#install-hooks) · [Privacy](#privacy) · [Roadmap](#roadmap) · [License](#license)
 
 <img src="docs/demo.gif" alt="Typing provenance prs lists open PRs grouped by repository, each with the app, harness and ID of its session and whether it is running or waiting for you; then provenance go acme/storefront#896 resumes that PR's ended Claude Code session in its folder" width="860">
 
@@ -57,6 +57,10 @@ provenance install      # optional: exact stamps and live status
 | `provenance prs --verbose` | Also count matches by stamp, repo and folder path |
 | `provenance prs --json` | Every matching session per PR, for scripts and agents |
 | `provenance prs --refresh` | Search GitHub now instead of using the 2-minute cache |
+| `provenance log` | What your PRs did today, and which need you now |
+| `provenance log --since 7d` | Over a longer window: `today`, `yesterday`, `7d` (up to `366d`) or a date such as `2026-11-05` |
+| `provenance log --html` | Write the timeline as an HTML page and open it (`--html <path>` writes it there instead) |
+| `provenance log --json` | The same entries for scripts and agents |
 | `provenance go <PR>` | Open the session behind a PR (`123`, `owner/name#123` or a PR URL), open or merged, by anyone |
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
@@ -174,6 +178,37 @@ With `--json`, each row’s `created_at` contains the raw UTC timestamp (for exa
 
 Status marks need [`provenance install`](#install-hooks) for Claude Code, Codex and Pi. OpenCode sessions get them from OpenCode's own database, with nothing installed: an idle OpenCode session shows as waiting while OpenCode is running, and one left busy shows as stopped once no OpenCode process runs. OpenCode sessions never show as running, because a surviving OpenCode service can't tell provenance whether that session's turn is still going. In a terminal, PR numbers are links to the PRs, and web session IDs link to the sessions. Merged and closed PRs are tagged `[merged]` or `[closed]`, and `--json` gives each PR's `state`. Titles use the terminal's width. Piped output is plain text, and `NO_COLOR` turns colour off.
 
+## Timeline
+
+`provenance log` answers "what did my agents do today, and what's waiting on me?". It lists every open PR, plus every PR merged or closed in the window, grouped by what they need:
+
+```text
+Today (Wed 11 Nov) · 6 PRs: 3 merged, 1 closed, 2 open · 1 needs you
+
+NEEDS YOU
+  14:02  ● opened                         api#212  Add retry to webhook sender
+         Claude Code (Opus 5.5) · T3 Code · waiting for you
+
+IN FLIGHT
+  12:20  ● opened                         web#901  Migrate checkout to new API
+         Codex (GPT-6.1 Sol) · CLI · running
+
+DONE
+  13:40  ✓ Tue 16:00 → merged (21h40m)    provenance#48  Respect Claude socket holds
+         Claude Code (Opus 5.5) · T3 Code
+```
+
+| Group | What's in it |
+|---|---|
+| Needs you | Open, and its session is waiting for you or stopped mid-turn |
+| In flight | Open, with activity in the last `--stale-days` (default 3) |
+| Gone quiet | Open, with no activity for `--stale-days`: no push, comment or review on GitHub, and no session activity. The newest 5 are listed; `--all` lists the rest |
+| Done | Merged or closed in the window |
+
+Each row names the session's harness and model, read from its log (Claude Code's last main-thread reply, Codex's last turn). OpenCode and Pi sessions, and sessions known only from a stamp, show the harness alone. A PR with no session found is most likely your own. Times are local; a window starts at local midnight.
+
+`--html` writes one self-contained page, with no server and nothing loaded from the network: a bar per PR on a time axis, from opened to merged or closed, with nights shaded. Switch between today and the whole window, and between one row per PR and one group per session. Click a row for its details, a link to the PR and the `provenance go` command. PRs gone quiet are dashed and hidden until you show them. The page is a snapshot, so run `provenance log` again for live status.
+
 ## How it works
 
 `provenance prs` lists your open PRs through `gh` (or merged or closed ones with `--state`) and links each one to sessions in three ways, strongest first. The table marks `repo` and `path` matches with `~`; `--json` gives the `kind` of every match.
@@ -274,6 +309,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - [x] `provenance go`: switch to or reopen the session behind a PR
 - [x] `provenance send` and an MCP server with `send` and `reply` tools (Claude Code and Codex)
 - [ ] `send` to OpenCode and Pi sessions
+- [x] `provenance log`: a timeline of your PRs and what needs you
 - [ ] `provenance show`: a session's recent turns
 
 ## License

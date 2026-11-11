@@ -38,7 +38,7 @@ impl Style {
         }
     }
 
-    fn paint(&self, codes: &str, text: &str) -> String {
+    pub fn paint(&self, codes: &str, text: &str) -> String {
         if self.color && !codes.is_empty() && !text.is_empty() {
             format!("\x1b[{codes}m{text}\x1b[0m")
         } else {
@@ -46,7 +46,7 @@ impl Style {
         }
     }
 
-    fn link(&self, url: &str, text: &str) -> String {
+    pub fn link(&self, url: &str, text: &str) -> String {
         if self.links && !url.is_empty() {
             format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
         } else {
@@ -411,11 +411,11 @@ fn footer(rows: &[PrRow], repos: usize, style: &Style, cached: Option<&str>) -> 
 }
 
 /// Terminal cells, not chars: CJK and emoji take two, combining marks none.
-fn width(s: &str) -> usize {
+pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-fn pad(s: &str, w: usize) -> String {
+pub fn pad(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w.saturating_sub(width(s))))
 }
 
@@ -471,6 +471,9 @@ mod tests {
                 number,
                 state: PrState::Open,
                 created_at: now() - Duration::days(2),
+                merged_at: None,
+                closed_at: None,
+                updated_at: None,
                 title: title.into(),
                 url: format!("https://github.com/{repo}/pull/{number}"),
                 head_branch: "feat".into(),

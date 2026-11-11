@@ -77,6 +77,14 @@ pub struct PullRequest {
     pub state: PrState,
     /// When GitHub opened the PR. Required so older caches are fetched again.
     pub created_at: DateTime<Utc>,
+    /// When it was merged; GitHub also sets `closed_at` then.
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
+    /// Last change of any kind: a push, comment, review or label.
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
     pub title: String,
     pub url: String,
     pub head_branch: String,
@@ -93,7 +101,7 @@ query($q: String!, $endCursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        id number state createdAt title url headRefName headRefOid baseRefName baseRefOid
+        id number state createdAt mergedAt closedAt updatedAt title url headRefName headRefOid baseRefName baseRefOid
         repository { nameWithOwner defaultBranchRef { name } }
         headRepository { nameWithOwner defaultBranchRef { name } }
       }
@@ -106,7 +114,7 @@ const PR_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number state createdAt title url headRefName headRefOid baseRefName baseRefOid
+      id number state createdAt mergedAt closedAt updatedAt title url headRefName headRefOid baseRefName baseRefOid
       repository { nameWithOwner defaultBranchRef { name } }
       headRepository { nameWithOwner defaultBranchRef { name } }
     }
@@ -160,6 +168,9 @@ struct Node {
     number: Option<u64>,
     state: Option<PrState>,
     created_at: Option<DateTime<Utc>>,
+    merged_at: Option<DateTime<Utc>>,
+    closed_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
     title: Option<String>,
     url: Option<String>,
     head_ref_name: Option<String>,
@@ -251,7 +262,39 @@ pub fn list_prs(
     refresh: bool,
     now: DateTime<Utc>,
 ) -> Result<Fetched> {
-    let search_path = cache::path(cache_dir, &search_cache_name(search, state));
+    let mut q = format!("is:pr {} archived:false {search}", state.qualifier());
+    let open = state == StateFilter::Open;
+    if !open {
+        // One page, newest first: merged history can run to thousands.
+        q.push_str(" sort:updated-desc");
+    }
+    let name = search_cache_name(search, state);
+    fetch_search(&q, open, &name, cache_dir, refresh, now)
+}
+
+/// Every PR for `search` in any state that changed at or after `since`.
+pub fn list_prs_since(
+    search: &str,
+    since: DateTime<chrono::FixedOffset>,
+    cache_dir: &Path,
+    refresh: bool,
+    now: DateTime<Utc>,
+) -> Result<Fetched> {
+    let since = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let q = format!("is:pr archived:false {search} updated:>={since}");
+    let name = format!("since-{}", cache::key(&q));
+    fetch_search(&q, true, &name, cache_dir, refresh, now)
+}
+
+fn fetch_search(
+    q: &str,
+    paginate: bool,
+    cache_name: &str,
+    cache_dir: &Path,
+    refresh: bool,
+    now: DateTime<Utc>,
+) -> Result<Fetched> {
+    let search_path = cache::path(cache_dir, cache_name);
     if !refresh
         && let Some(c) = cache::read::<CachedSearch>(&search_path)
         && (now - c.fetched_at).num_seconds() < TTL_SECS
@@ -264,13 +307,9 @@ pub fn list_prs(
         });
     }
 
-    let mut q = format!("is:pr {} archived:false {search}", state.qualifier());
     let mut args = vec!["api".to_string(), "graphql".into()];
-    if state == StateFilter::Open {
+    if paginate {
         args.push("--paginate".into());
-    } else {
-        // One page, newest first: merged history can run to thousands.
-        q.push_str(" sort:updated-desc");
     }
     args.extend([
         "-f".into(),
@@ -500,6 +539,9 @@ fn pull_request(n: Node) -> Option<PullRequest> {
         number,
         state: n.state.unwrap_or_default(),
         created_at: n.created_at?,
+        merged_at: n.merged_at,
+        closed_at: n.closed_at,
+        updated_at: n.updated_at,
         title: n.title.unwrap_or_default(),
         url: n.url.unwrap_or_default(),
         head_branch: head,
