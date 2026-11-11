@@ -79,17 +79,17 @@ fn local_midnight(day: NaiveDate) -> DateTime<Local> {
 }
 
 /// Where a PR stands for the person reading the log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Group {
     /// Open, and its session waits for you or stopped mid-turn.
     NeedsYou,
+    /// Merged or closed in the window.
+    Done,
     /// Open, with recent activity.
     InFlight,
     /// Open, but nothing happened for `--stale-days`: possibly forgotten.
     Quiet,
-    /// Merged or closed in the window.
-    Done,
 }
 
 /// The session behind a PR, as the log shows it.
@@ -140,6 +140,15 @@ impl Entry {
     /// Its newest event: merged or closed, else opened.
     fn event_at(&self) -> DateTime<Utc> {
         self.ended_at().unwrap_or(self.created_at)
+    }
+
+    /// What orders a group, newest first: open PRs by their last activity,
+    /// the rest by their newest event.
+    fn sort_time(&self) -> DateTime<Utc> {
+        match self.group {
+            Group::InFlight | Group::Quiet => self.last_activity,
+            Group::NeedsYou | Group::Done => self.event_at(),
+        }
     }
 }
 
@@ -207,7 +216,11 @@ pub fn entries(
             Some(e)
         })
         .collect();
-    out.sort_by(|a, b| a.group.cmp(&b.group).then(b.event_at().cmp(&a.event_at())));
+    out.sort_by(|a, b| {
+        a.group
+            .cmp(&b.group)
+            .then(b.sort_time().cmp(&a.sort_time()))
+    });
     out
 }
 
@@ -305,10 +318,16 @@ const CYAN: &str = "36";
 /// Widest a title gets when the terminal width is unknown.
 const TITLE_MAX: usize = 60;
 const TITLE_MIN: usize = 20;
-/// Quiet PRs listed before the rest are summed up, unless `--all`.
-const QUIET_SHOWN: usize = 5;
+/// How many PRs a group lists before the rest are summed up, unless `--all`.
+fn shown(group: Group) -> usize {
+    match group {
+        Group::NeedsYou => usize::MAX,
+        Group::Done | Group::InFlight => 8,
+        Group::Quiet => 5,
+    }
+}
 
-/// The attention list: needs you, in flight, gone quiet, done.
+/// The attention list: needs you, done, still open, gone quiet.
 pub fn render_terminal(
     entries: &[Entry],
     window: &Window,
@@ -365,20 +384,19 @@ pub fn render_terminal(
         life: String,
         pr: String,
     }
-    let hidden = if all {
-        0
-    } else {
-        quiet.saturating_sub(QUIET_SHOWN)
-    };
-    let mut quiet_seen = 0;
+    let mut listed: HashMap<Group, usize> = HashMap::new();
+    let mut hidden: HashMap<Group, usize> = HashMap::new();
     let lines: Vec<Line> = entries
         .iter()
         .filter(|e| {
-            if e.group != Group::Quiet {
-                return true;
+            let n = listed.entry(e.group).or_default();
+            if all || *n < shown(e.group) {
+                *n += 1;
+                true
+            } else {
+                *hidden.entry(e.group).or_default() += 1;
+                false
             }
-            quiet_seen += 1;
-            all || quiet_seen <= QUIET_SHOWN
         })
         .map(|e| {
             let (glyph, life) = match e.ended_at() {
@@ -436,18 +454,30 @@ pub fn render_terminal(
         .max(TITLE_MIN);
 
     let indent = " ".repeat(2 + time_w + 2);
+    // "… and 3 more", after a group that was cut short.
+    let more = |group: Option<Group>| -> String {
+        let Some((g, n)) = group.and_then(|g| hidden.get(&g).map(|n| (g, *n))) else {
+            return String::new();
+        };
+        let what = match g {
+            Group::Done => "done",
+            Group::Quiet => "with no recent activity",
+            Group::NeedsYou | Group::InFlight => "open",
+        };
+        let line = format!("… and {n} more {what} (--all)");
+        format!("{indent}{}\n", style.paint(DIM, &line))
+    };
     let mut current = None;
     for l in &lines {
         if current != Some(l.e.group) {
-            if current == Some(Group::Quiet) && hidden > 0 {
-                out.push_str(&more(&indent, hidden, style));
-            }
+            out.push_str(&more(current));
             current = Some(l.e.group);
             let (name, color) = match l.e.group {
                 Group::NeedsYou => ("NEEDS YOU", YELLOW_BOLD),
-                Group::InFlight => ("IN FLIGHT", "1;36"),
-                Group::Quiet => ("GONE QUIET", BOLD),
+                Group::Done if window.days == 1 => ("DONE TODAY", "1;32"),
                 Group::Done => ("DONE", "1;32"),
+                Group::InFlight => ("STILL OPEN", "1;36"),
+                Group::Quiet => ("GONE QUIET", BOLD),
             };
             out.push('\n');
             out.push_str(&style.paint(color, name));
@@ -489,9 +519,7 @@ pub fn render_terminal(
         };
         out.push_str(&format!("{indent}{}{status}\n", style.paint(DIM, &who)));
     }
-    if current == Some(Group::Quiet) && hidden > 0 {
-        out.push_str(&more(&indent, hidden, style));
-    }
+    out.push_str(&more(current));
     let mut foot = Vec::new();
     if let Some(age) = cached {
         foot.push(format!("cached {age} ago (--refresh)"));
@@ -501,11 +529,6 @@ pub fn render_terminal(
     out.push_str(&style.paint(DIM, &foot.join("  ·  ")));
     out.push('\n');
     out
-}
-
-fn more(indent: &str, hidden: usize, style: &Style) -> String {
-    let line = format!("… and {hidden} more with no recent activity (--all)");
-    format!("{indent}{}\n", style.paint(DIM, &line))
 }
 
 #[derive(serde::Serialize)]
@@ -682,11 +705,11 @@ mod tests {
             summary,
             vec![
                 (1, Group::NeedsYou, "waiting for you"),
+                (4, Group::Done, "merged"),
+                (5, Group::Done, "closed"),
                 (2, Group::InFlight, "running"),
                 (7, Group::InFlight, "open"),
                 (3, Group::Quiet, "no activity 9d"),
-                (4, Group::Done, "merged"),
-                (5, Group::Done, "closed"),
             ]
         );
         assert_eq!(
@@ -786,7 +809,7 @@ mod tests {
             text.contains("3 PRs: 1 merged, 2 open · 1 needs you"),
             "{text}"
         );
-        let order: Vec<usize> = ["NEEDS YOU", "IN FLIGHT", "DONE"]
+        let order: Vec<usize> = ["NEEDS YOU", "DONE TODAY", "STILL OPEN"]
             .iter()
             .map(|h| text.find(h).unwrap())
             .collect();
@@ -841,6 +864,56 @@ mod tests {
         let text = render_terminal(&got, &window, now, &style, None, true);
         assert_eq!(text.matches("web#").count(), 8, "{text}");
         assert!(!text.contains("more with no recent activity"), "{text}");
+    }
+
+    #[test]
+    fn done_and_open_lists_are_capped_too() {
+        let now = at("2026-11-11T14:20:00Z");
+        let mut rows: Vec<PrRow> = (1..=10)
+            .map(|n| {
+                row(
+                    "o/web",
+                    n,
+                    PrState::Merged,
+                    "2026-11-11T09:00:00Z",
+                    Some("2026-11-11T10:00:00Z"),
+                    None,
+                )
+            })
+            .collect();
+        rows.extend((11..=19).map(|n| {
+            row(
+                "o/web",
+                n,
+                PrState::Open,
+                "2026-11-11T12:00:00Z",
+                None,
+                None,
+            )
+        }));
+        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None);
+        let style = Style {
+            color: false,
+            links: false,
+            width: Some(120),
+            verbose: false,
+        };
+        let window = Window {
+            start: local_midnight(now.with_timezone(&Local).date_naive()),
+            days: 1,
+        };
+        let text = render_terminal(&got, &window, now, &style, None, false);
+        assert_eq!(text.matches("web#").count(), 16, "{text}");
+        let at_ = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        assert!(at_("DONE TODAY") < at_("… and 2 more done (--all)"));
+        assert!(at_("… and 2 more done (--all)") < at_("STILL OPEN"));
+        assert!(at_("STILL OPEN") < at_("… and 1 more open (--all)"));
+        let text = render_terminal(&got, &window, now, &style, None, true);
+        assert_eq!(text.matches("web#").count(), 19, "{text}");
+        assert!(!text.contains("more"), "{text}");
     }
 
     #[test]

@@ -74,7 +74,7 @@ enum Cmd {
         /// Print JSON instead of a list.
         #[arg(long, conflicts_with = "html")]
         json: bool,
-        /// List every PR that has gone quiet, not just the newest few.
+        /// List every PR in every group, not just the newest few.
         #[arg(long)]
         all: bool,
         /// Search GitHub now instead of using results cached in the last 2 minutes.
