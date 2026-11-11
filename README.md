@@ -189,25 +189,27 @@ NEEDS YOU
   14:02  ● opened                         api#212  Add retry to webhook sender
          Claude Code (Opus 5.5) · T3 Code · waiting for you
 
-IN FLIGHT
-  12:20  ● opened                         web#901  Migrate checkout to new API
-         Codex (GPT-6.1 Sol) · CLI · running
-
-DONE
+DONE TODAY
   13:40  ✓ Tue 16:00 → merged (21h40m)    provenance#48  Respect Claude socket holds
          Claude Code (Opus 5.5) · T3 Code
+
+STILL OPEN
+  12:20  ● opened                         web#901  Migrate checkout to new API
+         Codex (GPT-6.1 Sol) · CLI · running
 ```
 
-| Group | What's in it |
-|---|---|
-| Needs you | Open, and its session is waiting for you or stopped mid-turn |
-| In flight | Open, with activity in the last `--stale-days` (default 3) |
-| Gone quiet | Open, with no activity for `--stale-days`: no push, comment or review on GitHub, and no session activity. The newest 5 are listed; `--all` lists the rest |
-| Done | Merged or closed in the window |
+| Group | What's in it | Listed |
+|---|---|---|
+| Needs you | Open, and its session is waiting for you or stopped mid-turn | All |
+| Done | Merged or closed in the window, newest first | Newest 8 |
+| Still open | Open, with activity in the last `--stale-days` (default 3), most recently active first | 8 |
+| Gone quiet | Open, with no activity for `--stale-days`: no push, comment or review on GitHub, and no session activity | 5 |
+
+`--all` lists every PR in every group.
 
 Each row names the session's harness and model, read from its log (Claude Code's last main-thread reply, Codex's last turn). OpenCode and Pi sessions, and sessions known only from a stamp, show the harness alone. A PR with no session found is most likely your own. Times are local; a window starts at local midnight.
 
-`--html` writes one self-contained page, with no server and nothing loaded from the network: a bar per PR on a time axis, from opened to merged or closed, with nights shaded. Switch between today and the whole window, and between one row per PR and one group per session. Click a row for its details, a link to the PR and the `provenance go` command. PRs gone quiet are dashed and hidden until you show them. The page is a snapshot, so run `provenance log` again for live status.
+`--html` writes one self-contained page, with no server and nothing loaded from the network: a bar per PR on a time axis, from opened to merged or closed, with nights shaded. Switch between today and the whole window, and between one row per PR and one group per session. The page uses the same sections, with long ones cut short behind a "Show N more" button. A PR opened before the window gets a thin bar that says when it was opened, with a dot at its last activity. Click a row for its details, a link to the PR and the `provenance go` command. PRs gone quiet are dashed and hidden until you show them. The page is a snapshot, so run `provenance log` again for live status.
 
 ## How it works
 
