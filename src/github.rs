@@ -338,6 +338,37 @@ fn fetch_search(
     })
 }
 
+/// Two searches' results as one list. A PR in both keeps the copy GitHub
+/// changed last, then the one fetched last, so a cached copy never hides a
+/// newer state. The list is as old as its oldest part, and counts as cached
+/// if either part was.
+pub fn merge_fetched(a: Fetched, b: Fetched) -> Fetched {
+    let mut prs = a.prs;
+    let mut index: HashMap<String, usize> = prs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.id.clone(), i))
+        .collect();
+    for p in b.prs {
+        match index.get(&p.id) {
+            Some(&i) => {
+                if (p.updated_at, b.fetched_at) > (prs[i].updated_at, a.fetched_at) {
+                    prs[i] = p;
+                }
+            }
+            None => {
+                index.insert(p.id.clone(), prs.len());
+                prs.push(p);
+            }
+        }
+    }
+    Fetched {
+        prs,
+        fetched_at: a.fetched_at.min(b.fetched_at),
+        from_cache: a.from_cache || b.from_cache,
+    }
+}
+
 /// The cache file for one search in one state: a search's result differs by state.
 fn search_cache_name(search: &str, state: StateFilter) -> String {
     format!(
@@ -716,5 +747,68 @@ mod tests {
         record_commit_sets(&mut prs, &mut known, sets);
         assert_eq!(prs[0].head_sha, "new");
         assert_eq!(known[&pr_key(&prs[0])][0].session_id, "t1");
+    }
+
+    #[test]
+    fn merged_searches_keep_the_freshest_copy_of_each_pr() {
+        let t = |m: u32| Utc.with_ymd_and_hms(2026, 11, 11, 12, m, 0).unwrap();
+        let pr = |id: &str, state: PrState, updated: u32| PullRequest {
+            id: id.into(),
+            head_sha: "h".into(),
+            base_sha: "b".into(),
+            repo: "o/r".into(),
+            head_repo: None,
+            number: 1,
+            state,
+            created_at: t(0),
+            merged_at: None,
+            closed_at: None,
+            updated_at: Some(t(updated)),
+            title: id.into(),
+            url: String::new(),
+            head_branch: "f".into(),
+            base_branch: "main".into(),
+            default_branches: vec![],
+            stamps: vec![],
+        };
+        let fetched = |prs, at: u32, from_cache| Fetched {
+            prs,
+            fetched_at: t(at),
+            from_cache,
+        };
+        let states = |f: &Fetched| -> Vec<(String, PrState)> {
+            f.prs.iter().map(|p| (p.id.clone(), p.state)).collect()
+        };
+        // A cached open copy, then the PR is merged and a fresh search sees it.
+        let open = fetched(
+            vec![pr("A", PrState::Open, 1), pr("OLD", PrState::Open, 0)],
+            2,
+            true,
+        );
+        let recent = fetched(vec![pr("A", PrState::Merged, 3)], 4, false);
+        let got = merge_fetched(open, recent);
+        assert_eq!(
+            states(&got),
+            vec![("A".into(), PrState::Merged), ("OLD".into(), PrState::Open)]
+        );
+        assert!(got.from_cache);
+        assert_eq!(got.fetched_at, t(2));
+        // The other way round: the open search is the fresh one.
+        let open = fetched(vec![pr("A", PrState::Open, 5)], 6, false);
+        let recent = fetched(
+            vec![pr("A", PrState::Merged, 3), pr("B", PrState::Closed, 3)],
+            4,
+            true,
+        );
+        assert_eq!(
+            states(&merge_fetched(open, recent)),
+            vec![("A".into(), PrState::Open), ("B".into(), PrState::Closed)]
+        );
+        // Same change time: the later fetch wins.
+        let open = fetched(vec![pr("A", PrState::Open, 3)], 4, true);
+        let recent = fetched(vec![pr("A", PrState::Merged, 3)], 5, false);
+        let got = merge_fetched(open, recent);
+        assert_eq!(states(&got), vec![("A".into(), PrState::Merged)]);
+        assert!(got.from_cache);
     }
 }

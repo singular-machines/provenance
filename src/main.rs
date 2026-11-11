@@ -473,14 +473,7 @@ fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
             || github::list_prs(&search, github::StateFilter::Open, dir, args.refresh, now),
             || github::list_prs_since(&search, since, dir, args.refresh, now),
         );
-        let (mut open, recent) = (open?, recent?);
-        let seen: std::collections::HashSet<String> =
-            open.prs.iter().map(|p| p.id.clone()).collect();
-        open.prs
-            .extend(recent.prs.into_iter().filter(|p| !seen.contains(&p.id)));
-        open.fetched_at = open.fetched_at.min(recent.fetched_at);
-        open.from_cache &= recent.from_cache;
-        Ok(open)
+        Ok(github::merge_fetched(open?, recent?))
     })?;
     let entries = log::entries(
         rows,
