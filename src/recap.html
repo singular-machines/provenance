@@ -65,13 +65,15 @@ button.chip.quiet{border-color:var(--border);border-style:dashed;color:var(--mut
 .end{position:absolute;top:10px;font-size:13px;font-weight:700;color:var(--c)}
 .st{color:var(--c)}
 .st.merged,.st.closed,.st.open{color:var(--muted)}
-.tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.2);max-width:340px;display:none;z-index:5}
-.tip b{display:block;margin-bottom:2px}
 .m{color:var(--muted)}
-.detail{margin-top:10px;border:1px solid var(--border);border-radius:6px;padding:12px 16px;display:grid;grid-template-columns:1fr auto;gap:4px 16px}
-.detail h2{margin:0;font-size:14px}
-.detail .m{font-size:12px}
-.acts{grid-row:1/5;grid-column:2;display:flex;flex-direction:column;gap:6px}
+.panel{position:relative;z-index:3;background:var(--bg);border-bottom:1px solid var(--border);box-shadow:inset 3px 0 var(--accent);padding:12px 16px 14px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 20px;cursor:default}
+.panel h2{margin:0;font-size:14px}
+.panel .m{font-size:12px}
+.info{display:flex;flex-direction:column;gap:6px;min-width:0}
+.said{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere;max-height:10.5em;overflow:auto;border-left:3px solid var(--needs);background:var(--card);border-radius:0 6px 6px 0;padding:6px 10px;font-size:12.5px}
+.said-h{font-size:11px;font-weight:600;color:var(--needs)}
+.acts{display:flex;flex-direction:column;gap:6px;align-self:start}
+.sub{position:relative;z-index:1;padding:8px 10px 4px;font-size:11px;color:var(--muted);background:var(--bg);border-bottom:1px solid color-mix(in srgb,var(--border) 45%,transparent)}
 .btn{font:inherit;font-size:12px;border:1px solid var(--border);background:var(--card);color:var(--fg);border-radius:6px;padding:5px 10px;cursor:pointer;text-align:left;text-decoration:none}
 code{font-family:var(--mono);font-size:11.5px}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:10px}
@@ -85,7 +87,6 @@ code{font-family:var(--mono);font-size:11.5px}
 <div class="top"><h1 id="title"></h1><div class="seg" id="win"></div><div class="seg" id="grp"><button data-v="pr" class="on">By PR</button><button data-v="session">By session</button></div></div>
 <div class="sum" id="sum"></div>
 <div class="chart" id="chart"></div>
-<div class="detail" id="detail" hidden></div>
 <div class="legend"><span><i class="sw merged"></i>merged</span><span><i class="sw closed"></i>closed</span><span><i class="sw running"></i>open, agent running</span><span><i class="sw open"></i>open</span><span><i class="sw needs"></i>open, needs you</span><span><i class="sw stale needs"></i>open, gone quiet</span><span>thin bar: open since before the window</span><span>● last activity</span><span>shaded: night (20:00–08:00) · hatched: not yet happened</span></div>
 <div class="foot" id="foot"></div>
 <script>
@@ -117,7 +118,7 @@ const sessionKey=e=>e.agent?`${e.agent.harness}/${e.agent.session_id}`:"";
 let win=D.days>1?"window":"today",grp="pr",showQuiet=false;
 // Sections whose full list is shown: "done", "open", "quiet".
 const expanded=new Set();
-let sel=(E.find(e=>e.group==="needs-you")||E[0]||{}).key;
+let sel=(E.find(e=>e.group==="needs-you")||{}).key;
 
 const winBtns=document.getElementById("win");
 if(D.days>1){winBtns.innerHTML=`<button data-v="today">Today</button><button data-v="window" class="on">${esc(D.days)} days</button>`}else winBtns.remove();
@@ -150,8 +151,7 @@ function render(){
     (n(e=>e.group==="needs-you")?`<span class="chip needs">⚑ <b>${n(e=>e.group==="needs-you")}</b> need${n(e=>e.group==="needs-you")===1?"s":""} you</span>`:"")+
     (quiet?`<button class="chip quiet" id="quiet">${showQuiet?"Hide":"Show"} ${quiet} gone quiet (no activity for ${esc(D.stale_days)}+ days)</button>`:"");
   const chart=document.getElementById("chart");
-  if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;document.getElementById("detail").hidden=true;return}
-  if(!list.some(e=>e.key===sel))sel=(list.find(e=>e.group==="needs-you")||list[0]).key;
+  if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;return}
   const lane=Math.max(200,chart.clientWidth-parseInt(getComputedStyle(chart).getPropertyValue("--lab")));
   let ticks="",bg="";
   const span=(B-A)/H;
@@ -172,7 +172,7 @@ function render(){
     const who=grp==="pr"?" · "+esc(e.agent?e.agent.name:"no session"):"";
     const last=new Date(e.last_activity),lx=X(last);
     const dot=live&&last>A&&lx-l>1.5&&r-lx>1.5?`<span class="dot" title="Last activity ${esc(full(last))}" style="left:${lx}%"></span>`:"";
-    return `<div class="row${e.key===sel?" sel":""}" data-key="${esc(e.key)}"><div class="lab"><div class="l1">${esc(e.title)}</div><div class="l2"><span class="st ${k}">${esc(statusText(e))}</span> · <span class="ref">${esc(short(e))}</span>${who}</div></div><div class="lane"><div class="bar ${k}${e.o<A?" carry":""}${live?" live":""}${live&&e.o<A?" thin":""}" style="left:${l}%;width:calc(${Math.max(0,r-l)}% - ${live&&e.o>=A?7:0}px)"></div>${e.o<A?`<span class="since">open since ${esc(when(e.o))}</span>`:""}${dot}${end}</div></div>`};
+    return `<div class="row${e.key===sel?" sel":""}" data-key="${esc(e.key)}" aria-expanded="${e.key===sel}"><div class="lab"><div class="l1">${esc(e.title)}</div><div class="l2"><span class="st ${k}">${esc(statusText(e))}</span> · <span class="ref">${esc(short(e))}</span>${who}</div></div><div class="lane"><div class="bar ${k}${e.o<A?" carry":""}${live?" live":""}${live&&e.o<A?" thin":""}" style="left:${l}%;width:calc(${Math.max(0,r-l)}% - ${live&&e.o>=A?7:0}px)"></div>${e.o<A?`<span class="since">open since ${esc(when(e.o))}</span>`:""}${dot}${end}</div></div>${e.key===sel?panel(e):""}`};
   let body="";
   // Same sections and order as the terminal; long ones show their newest few.
   if(grp==="pr"){
@@ -180,42 +180,41 @@ function render(){
       ["done",win==="today"||D.days===1?"Done today":"Done",e=>e.state!=="open",6],
       ["open","Still open",e=>e.group==="in-flight",5],
       ["quiet","Gone quiet",e=>e.group==="quiet",5]];
+    // Asks older than the stale cutoff sink below a note, under the fresh ones.
+    const longWait=e=>e.agent&&NOW-new Date(e.agent.last_seen)>=D.stale_days*DAY;
     for(const [id,name,f,cap] of secs){const items=list.filter(f);if(!items.length)continue;
       const shown=expanded.has(id)?items:items.slice(0,cap);
-      body+=`<div class="sec ${id==="needs"?"needs":""}">${name}<span class="m">${items.length}</span></div>`+shown.map(row).join("")+
+      const first=id==="needs"?shown.findIndex(longWait):-1;
+      body+=`<div class="sec ${id==="needs"?"needs":""}">${name}<span class="m">${items.length}</span></div>`+
+        shown.map((e,i)=>(i===first?`<div class="sub">Waiting over ${esc(D.stale_days)} days: still yours to answer, or close them</div>`:"")+row(e)).join("")+
         (shown.length<items.length?`<button class="more" data-more="${id}">Show ${items.length-shown.length} more${id==="done"?"":id==="open"?", most recently active first":" with no recent activity"}</button>`:"");}}
   else{const order=[...new Set(list.map(sessionKey))];
     for(const s of order){const es=list.filter(e=>sessionKey(e)===s),a=es[0].agent;
       const head=a?`${esc(a.name)}<span class="m">${esc([a.app,a.machine&&"on "+a.machine,a.session_id.slice(0,8)+"…"].filter(Boolean).join(" · "))}</span>${a.state?` <span class="m">· ${esc(a.state.replace("-"," "))}</span>`:""}`:`No session found <span class="m">(likely you)</span>`;
       body+=`<div class="grp">${head}</div>`+es.map(row).join("")}}
-  chart.innerHTML=`<div class="bg">${bg}</div><div class="axis"><div></div><div class="ticks">${ticks}</div></div>${body}<div class="tip" id="tip"></div>`;
-  detail();
+  chart.innerHTML=`<div class="bg">${bg}</div><div class="axis"><div></div><div class="ticks">${ticks}</div></div>${body}`;
 }
-function detail(){
-  const e=E.find(x=>x.key===sel),box=document.getElementById("detail");
-  if(!e){box.hidden=true;return}
-  box.hidden=false;const k=kind(e),a=e.agent;
+// The open row's details and what you can do next, shown under the row.
+function panel(e){
+  const k=kind(e),a=e.agent;
   const url=/^https:\/\/github\.com\//.test(e.url)?e.url:"";
-  box.innerHTML=`<h2><span class="ref">${esc(e.key)}</span>${esc(e.title)}</h2>
-  <div class="m">${a?esc([a.name,a.app,a.machine&&"on "+a.machine,"session "+a.session_id.slice(0,8)+"…",a.matched_by==="stamp"?"stamped":"matched by branch"].filter(Boolean).join(" · ")):"No session found (likely you)"} · <span class="st ${k}">${esc(e.status)}</span></div>
-  <div class="m">Opened ${esc(full(e.o))}${e.c?` · ${esc(e.state)} ${esc(full(e.c))} (${esc(dur(e.o,e.c))})`:` · open for ${esc(dur(e.o,NOW))}`}</div>
-  <div class="m">Last activity ${esc(full(new Date(e.last_activity)))}</div>
-  <div class="acts">${url?`<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}<button class="btn" id="copy">Copy <code>provenance go ${esc(e.key)}</code></button></div>`;
-  document.getElementById("copy").onclick=ev=>{navigator.clipboard&&navigator.clipboard.writeText(`provenance go ${e.key}`).then(()=>{ev.currentTarget.textContent="Copied"},()=>{})};
+  const copy=(cmd,label)=>`<button class="btn" data-copy="${esc(cmd)}">${label} <code>${esc(cmd)}</code></button>`;
+  const said=a&&a.last_message?`<div class="said-h">${e.group==="needs-you"?`Last message · ${esc(dur(new Date(a.last_seen),NOW))} ago`:"Last message"}</div><div class="said">${esc(a.last_message)}</div>`:"";
+  return `<div class="panel"><div class="info"><h2><span class="ref">${esc(e.key)}</span>${esc(e.title)}</h2>
+  <div class="m">${a?esc([a.name,a.app,a.machine&&"on "+a.machine,"session "+a.session_id.slice(0,8)+"…",a.matched_by==="stamp"?"stamped":"matched by branch"].filter(Boolean).join(" · ")):"No session found (likely you)"} · <span class="st ${k}">${esc(statusText(e))}</span></div>
+  ${said}
+  <div class="m">Opened ${esc(full(e.o))}${e.c?` · ${esc(e.state)} ${esc(full(e.c))} (${esc(dur(e.o,e.c))})`:` · open for ${esc(dur(e.o,NOW))}`} · last activity ${esc(full(new Date(e.last_activity)))}</div></div>
+  <div class="acts">${url?`<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}${a?copy(`provenance go ${e.key}`,"Copy"):""}${e.state==="open"?copy(`gh pr close ${e.number} -R ${e.repo}`,"Copy"):""}</div></div>`;
 }
 document.addEventListener("click",ev=>{
   const b=ev.target.closest(".seg button");
   if(b){b.parentElement.querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));if(b.parentElement.id==="win")win=b.dataset.v;else grp=b.dataset.v;render();return}
   if(ev.target.closest("#quiet")){showQuiet=!showQuiet;render();return}
   const m=ev.target.closest("[data-more]");if(m){expanded.add(m.dataset.more);render();return}
-  const r=ev.target.closest("[data-key]");if(r){sel=r.dataset.key;render()}});
-document.addEventListener("mousemove",ev=>{
-  const tip=document.getElementById("tip");if(!tip)return;
-  const r=ev.target.closest(".row");if(!r){tip.style.display="none";return}
-  const e=E.find(x=>x.key===r.dataset.key),box=document.getElementById("chart").getBoundingClientRect();
-  tip.innerHTML=`<b>${esc(e.title)}</b><div class="m">${esc(e.key)}</div><div>${esc(e.agent?[e.agent.name,e.agent.app].filter(Boolean).join(" · "):"No session found (likely you)")}</div><div class="m">Opened ${esc(full(e.o))}<br>${e.c?`${esc(e.state)} ${esc(full(e.c))} · ${esc(dur(e.o,e.c))}`:esc(e.status)}</div>`;
-  tip.style.display="block";let x=ev.clientX-box.left+14;if(x>box.width-350)x=ev.clientX-box.left-354;
-  tip.style.left=Math.max(4,x)+"px";tip.style.top=(ev.clientY-box.top+14)+"px"});
+  const c=ev.target.closest("[data-copy]");
+  if(c){navigator.clipboard&&navigator.clipboard.writeText(c.dataset.copy).then(()=>{c.firstChild.textContent="Copied "},()=>{});return}
+  // Clicking a row opens its panel; clicking it again closes it.
+  const r=ev.target.closest(".row");if(r){sel=sel===r.dataset.key?null:r.dataset.key;render()}});
 addEventListener("resize",render);
 render();
 </script>

@@ -107,6 +107,9 @@ pub struct Agent {
     pub matched_by: MatchKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// What the session last said, read only for sessions that need you.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -142,12 +145,17 @@ impl Entry {
         self.ended_at().unwrap_or(self.created_at)
     }
 
-    /// What orders a group, newest first: open PRs by their last activity,
-    /// the rest by their newest event.
+    /// What orders a group, newest first: PRs that need you by when their
+    /// session last did something, so long waits sink; other open PRs by their
+    /// last activity; the rest by their newest event.
     fn sort_time(&self) -> DateTime<Utc> {
         match self.group {
+            Group::NeedsYou => self
+                .agent
+                .as_ref()
+                .map_or(self.last_activity, |a| a.last_seen),
             Group::InFlight | Group::Quiet => self.last_activity,
-            Group::NeedsYou | Group::Done => self.event_at(),
+            Group::Done => self.event_at(),
         }
     }
 }
@@ -162,19 +170,23 @@ pub fn harness_long(h: Harness) -> &'static str {
 }
 
 /// The log's entries: every open PR, and PRs merged or closed since `start`.
-/// `model_of` reads a session's model from its log.
+/// `model_of` reads a session's model from its log, and `last_message_of` what
+/// it last said, which is read only for open PRs whose session needs you.
 pub fn entries(
     rows: Vec<PrRow>,
     start: DateTime<Utc>,
     now: DateTime<Utc>,
     stale_days: u32,
     model_of: impl Fn(&Sighting) -> Option<String>,
+    last_message_of: impl Fn(&Sighting) -> Option<String>,
 ) -> Vec<Entry> {
     let mut out: Vec<Entry> = rows
         .into_iter()
         .filter_map(|r| {
+            let open = r.pr.state == PrState::Open;
             let agent = render::pick(&r).map(|m| {
                 let model = model_of(&m.sighting);
+                let needs_you = open && matches!(m.state, Some(State::Waiting | State::Stopped));
                 let harness = harness_long(m.sighting.harness);
                 Agent {
                     harness: m.sighting.harness,
@@ -189,6 +201,7 @@ pub fn entries(
                     last_seen: m.sighting.last_seen,
                     matched_by: m.kind,
                     machine: m.sighting.machine.clone(),
+                    last_message: needs_you.then(|| last_message_of(&m.sighting)).flatten(),
                 }
             });
             let pr = r.pr;
@@ -693,10 +706,26 @@ mod tests {
                 None,
                 None,
             ),
+            row(
+                "o/api",
+                8,
+                PrState::Open,
+                "2026-11-11T14:10:00Z",
+                None,
+                Some(Some(State::Stopped)),
+            ),
         ];
-        let got = entries(rows, start, now, 3, |s| {
-            (s.session_id == "s1").then(|| "claude-opus-5-5".to_string())
-        });
+        let mut rows = rows;
+        // Opened after #1, but its session has waited since 1 Nov: it sinks.
+        rows[7].sessions[0].sighting.last_seen = at("2026-11-01T10:00:00Z");
+        let got = entries(
+            rows,
+            start,
+            now,
+            3,
+            |s| (s.session_id == "s1").then(|| "claude-opus-5-5".to_string()),
+            |s| Some(format!("said by {}", s.session_id)),
+        );
         let summary: Vec<(u64, Group, &str)> = got
             .iter()
             .map(|e| (e.number, e.group, e.status.as_str()))
@@ -705,6 +734,7 @@ mod tests {
             summary,
             vec![
                 (1, Group::NeedsYou, "waiting for you"),
+                (8, Group::NeedsYou, "stopped mid-turn"),
                 (4, Group::Done, "merged"),
                 (5, Group::Done, "closed"),
                 (2, Group::InFlight, "running"),
@@ -716,7 +746,22 @@ mod tests {
             got[0].agent.as_ref().unwrap().name,
             "Claude Code (Opus 5.5)"
         );
-        assert_eq!(got[1].agent.as_ref().unwrap().name, "Claude Code");
+        assert_eq!(got[2].agent.as_ref().unwrap().name, "Claude Code");
+        // Only sessions that need you have their last message read.
+        let said: Vec<(u64, Option<&str>)> = got
+            .iter()
+            .filter_map(|e| Some((e.number, e.agent.as_ref()?.last_message.as_deref())))
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                (1, Some("said by s1")),
+                (8, Some("said by s8")),
+                (4, None),
+                (2, None),
+                (3, None),
+            ]
+        );
     }
 
     #[test]
@@ -793,7 +838,7 @@ mod tests {
                 Some(Some(State::Running)),
             ),
         ];
-        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None);
+        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None, |_| None);
         let style = Style {
             color: false,
             links: false,
@@ -842,7 +887,7 @@ mod tests {
                 )
             })
             .collect();
-        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None);
+        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None, |_| None);
         assert!(got.iter().all(|e| e.group == Group::Quiet));
         let style = Style {
             color: false,
@@ -891,7 +936,7 @@ mod tests {
                 None,
             )
         }));
-        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None);
+        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None, |_| None);
         let style = Style {
             color: false,
             links: false,
@@ -928,7 +973,7 @@ mod tests {
             None,
         )];
         rows[0].pr.title = "</script><img src=x onerror=alert(1)>".into();
-        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None);
+        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None, |_| None);
         let window = Window {
             start: local_midnight(now.with_timezone(&Local).date_naive()),
             days: 1,
