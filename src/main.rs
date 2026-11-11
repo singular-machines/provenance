@@ -1003,7 +1003,7 @@ fn send_acceptance(sent: &Sent) -> String {
         )
     } else if sent.how == "codex queue" {
         format!(
-            "Message {} was queued for {}. Receipt is not confirmed. Codex must consume the queue; a running codex exec may finish without reading it. Later exec resume consumption is not guaranteed.",
+            "Message {} was queued for {}. Receipt is not confirmed. The session must read the queue in a turn to act on it.",
             sent.id, sent.to
         )
     } else {
@@ -1076,7 +1076,7 @@ fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String>
         ))
     } else if matches!(route, send::Delivery::CodexQueue(_)) {
         Ok(format!(
-            "Reply to {id} queued for {}. Receipt is not confirmed. Codex must consume the queue; codex exec consumption is not guaranteed.",
+            "Reply to {id} queued for {}. Receipt is not confirmed. The session must read the queue in a turn to act on it.",
             label(Some(&to))
         ))
     } else {
@@ -2458,6 +2458,11 @@ mod reply_cli_tests {
             .as_deref(),
             Some("answer")
         );
+        let receipt = reply_message(&home, "m-owned", "answer").unwrap();
+        assert!(receipt.contains(
+            "Receipt is not confirmed. The session must read the queue in a turn to act on it."
+        ));
+        assert!(!receipt.contains("codex exec"));
         let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
         assert!(transport.contains("queue --thread original-sender"));
         assert!(transport.contains("Reply to message m-owned"));
@@ -2491,7 +2496,9 @@ fn queue_acceptance_does_not_claim_receipt() {
     };
     for text in [send_acceptance(&sent), mcp_send_text(&sent)] {
         assert!(text.contains("Receipt is not confirmed"));
-        assert!(text.contains("exec"));
+        assert!(text.contains("The session must read the queue in a turn to act on it."));
+        assert!(!text.contains("codex exec"));
+        assert!(!text.contains("resume"));
         assert!(!text.starts_with("Sent "));
     }
 }
