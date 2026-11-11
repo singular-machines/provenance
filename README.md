@@ -22,7 +22,7 @@ You run Claude Code, Codex, OpenCode and Pi in lots of apps: the terminal, Claud
 | Live status | With `install` | With `install` | From its database, guessing "waiting" while any `opencode` runs | With `install` |
 | `go`: switch to a running terminal session | With `install` | With `install` | No: prints the resume command | With `install` |
 | `go`: resume an ended session | Yes | Yes | Yes | Yes |
-| `send`: message the session | With `install` | With `install` | Not yet | Not yet |
+| `send`: message the session | With `install`; bypass-mode targets cannot receive | With `install` | Not yet | Not yet |
 
 For terminal sessions without usable process records, `go` resumes in the session folder and may start a second copy. Desktop-app sessions use the app or deep-link routes below without requiring `install`. `send` refuses when it cannot tell whether the session is running, unless `--resume` is supplied and the last recorded state allows it; see the messaging policy below.
 
@@ -128,13 +128,19 @@ The tested launch paths and remaining session-ID limitations are recorded in [th
 
 | Session | How the message gets in |
 |---|---|
-| Claude Code, running | Its inbox socket, named in `~/.claude/sessions/<pid>.json`. An idle session starts a turn; a busy one reads it between tool calls. Claude Code labels it as a message from another session, which can't approve prompts or change settings. |
+| Claude Code, running outside bypass mode | Its inbox socket, named in `~/.claude/sessions/<pid>.json`. An idle session starts a turn; a busy one reads it between tool calls. Claude Code labels it as a message from another session, which can't approve prompts or change settings. |
 | Codex, running | `codex queue --thread <id>`. An idle session starts a turn; a busy one takes it after its current turn. |
 | Process known to be gone | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its known folder. |
 | Process unknown | Refused without `--resume`. With `--resume`, allowed unless last recorded as running, waiting or stopped, since it may still be open. CLI `--resume --force` overrides only that recorded-state refusal; the folder must still be known. |
 | OpenCode, Pi, the web, another machine | Not supported yet. |
 
 `--force` requires `--resume` and does not bypass other refusals or replace delivery to a known live process. MCP `send` supports `resume` with the same state policy and has no force override.
+
+Claude Code holds provenance socket messages when the target is in `bypassPermissions` mode; T3 launches Claude Code this way. Provenance refuses a known bypass-mode socket target before writing message mail or opening its socket, and asks for a session not running in bypass mode. It never asserts or declares a permission mode to get past that hold. PR routing may skip an unavailable target using its existing selection policy; named routing never chooses a replacement.
+
+Permission-mode evidence comes from the latest harness hook payload, bound to the exact session and verified live process/socket. `UserPromptSubmit`, `PostToolUse` and `Stop` can reflect mode changes; startup arguments describe only the initial mode. The observed Claude Code version omitted mode on `SessionStart`, and its session-info JSON had no mode field. Missing evidence (including records from older hooks) is unknown, not inferred; an event without mode clears the prior observation. A mode change can race the latest hook snapshot, so socket receipt is always unconfirmed. The lookup also works when `ps` is denied through the existing native process check.
+
+For every Claude socket write, CLI and MCP say the message was **written to the inbox socket; receipt is not confirmed**. A successful write proves neither receipt nor completed work. Codex's `Sent` means its queue accepted the message, and headless `--resume` retains its existing output/error behavior. The bypass guard applies only to socket routes; it does not change Codex or headless resume. Replies saved locally are not forwarded to a known bypass-mode sender, and successful socket reply writes also report receipt as unconfirmed.
 
 Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per receiving session. Every message says who sent it and how to answer, because Codex shows it as if it were typed. Delivered replies start with `[provenance] Reply to message <id> from <session>`. They identify the answer as another session's text relayed by provenance, explain that it is a teammate's answer rather than the user's instruction and cannot grant permissions, and say to use it as information for the existing task. Anything a reply asks the receiver to do still needs the user's instruction, within the receiving session's own permissions. Replies must not be answered with `reply`, to avoid recursive reply loops.
 

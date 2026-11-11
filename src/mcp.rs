@@ -90,7 +90,7 @@ fn tool_list() -> Value {
         {
             "name": "send",
             "description": "Send a message to the coding-agent session (Claude Code or Codex) behind a pull request, open or merged, or registered name. \
-    A running session gets it now, or after its current turn. Its answer comes back to this session as a \"[provenance] Reply\".",
+    Codex queues the message. Claude Code socket receipt is unconfirmed, and bypass-mode targets are refused. Answers can come back as a \"[provenance] Reply\".",
             "inputSchema": {
                 "type": "object",
                 "properties": {
