@@ -296,9 +296,18 @@ fn parse_ts(ts: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// Timestamp of the last complete log line that has one, read from the end
-/// of the file in growing chunks so huge logs aren't read in full.
+/// Timestamp of the last complete log line that has one.
 fn last_logged_time(path: &Path) -> Option<DateTime<Utc>> {
+    last_line_with(path, |l| {
+        serde_json::from_str::<Timestamped>(l)
+            .ok()
+            .and_then(|t| parse_ts(&t.timestamp))
+    })
+}
+
+/// The last complete log line for which `find` gives a value, read from the
+/// end of the file in growing chunks so huge logs aren't read in full.
+fn last_line_with<T>(path: &Path, find: impl Fn(&str) -> Option<T>) -> Option<T> {
     use std::io::{Read, Seek, SeekFrom};
     const MAX_TAIL: u64 = 16 << 20;
     let mut file = File::open(path).ok()?;
@@ -314,16 +323,101 @@ fn last_logged_time(path: &Path) -> Option<DateTime<Utc>> {
         if start > 0 && !lines.is_empty() {
             lines.remove(0); // may begin mid-line
         }
-        let found = lines.iter().rev().find_map(|l| {
-            serde_json::from_str::<Timestamped>(l)
-                .ok()
-                .and_then(|t| parse_ts(&t.timestamp))
-        });
+        let found = lines.iter().rev().find_map(|l| find(l));
         if found.is_some() || start == 0 || chunk >= MAX_TAIL {
             return found;
         }
         chunk *= 4;
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeModelLine {
+    #[serde(default)]
+    is_sidechain: bool,
+    message: Option<ClaudeMessage>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeMessage {
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexTurnLine {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: CodexTurn,
+}
+
+#[derive(Deserialize)]
+struct CodexTurn {
+    model: Option<String>,
+}
+
+/// The model a session last used, from its log: Claude Code's last main-thread
+/// reply, or Codex's last turn context. `None` for harnesses or logs without one.
+pub fn model(harness: Harness, log: &Path) -> Option<String> {
+    match harness {
+        Harness::ClaudeCode => last_line_with(log, |l| {
+            if !l.contains("\"model\":\"") {
+                return None;
+            }
+            let line: ClaudeModelLine = serde_json::from_str(l).ok()?;
+            let model = line.message?.model?;
+            // Error replies are logged with a `<synthetic>` model.
+            (!line.is_sidechain && !model.starts_with('<')).then_some(model)
+        }),
+        Harness::Codex => last_line_with(log, |l| {
+            if !l.contains("\"turn_context\"") {
+                return None;
+            }
+            let line: CodexTurnLine = serde_json::from_str(l).ok()?;
+            (line.kind == "turn_context").then_some(line.payload.model?)
+        }),
+        Harness::OpenCode | Harness::Pi => None,
+    }
+}
+
+/// A model ID as people say it: `claude-opus-5-5` is "Opus 5.5" and
+/// `gpt-6.1-sol` is "GPT-6.1 Sol". Unknown shapes are shown as they are.
+pub fn model_name(id: &str) -> String {
+    let id = id.split('[').next().unwrap_or(id);
+    if let Some(rest) = id.strip_prefix("claude-") {
+        let mut parts = rest.split('-');
+        let Some(family) = parts
+            .next()
+            .filter(|f| f.chars().all(|c| c.is_ascii_alphabetic()))
+        else {
+            return id.to_string();
+        };
+        // Version numbers follow; a long date suffix doesn't belong to them.
+        let version: Vec<&str> = parts
+            .take_while(|p| p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        if version.is_empty() {
+            return id.to_string();
+        }
+        return format!("{} {}", capitalize(family), version.join("."));
+    }
+    if let Some(rest) = id.strip_prefix("gpt-") {
+        let mut parts = rest.split('-');
+        let version = parts.next().unwrap_or_default();
+        let name: Vec<String> = parts.map(capitalize).collect();
+        return std::iter::once(format!("GPT-{version}"))
+            .chain(name)
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    id.to_string()
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 pub fn codex_app(originator: Option<&str>, cwd: &str) -> String {
@@ -729,5 +823,57 @@ mod tests {
         .unwrap();
         assert_eq!(load_all(&home, Some(&cache)).len(), 2);
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn model_names_read_as_people_say_them() {
+        assert_eq!(model_name("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_name("claude-sonnet-4-5-20250929"), "Sonnet 4.5");
+        assert_eq!(model_name("claude-opus-4-1[1m]"), "Opus 4.1");
+        assert_eq!(model_name("gpt-6.1-sol"), "GPT-6.1 Sol");
+        assert_eq!(model_name("gpt-6-luna"), "GPT-6 Luna");
+        assert_eq!(model_name("claude-instant"), "claude-instant");
+        assert_eq!(model_name("qwen3-coder"), "qwen3-coder");
+    }
+
+    #[test]
+    fn model_is_the_last_main_thread_one_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("prov-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = dir.join("c.jsonl");
+        std::fs::write(
+            &claude,
+            [
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5-5"}}"#,
+                r#"{"type":"assistant","message":{"model":"claude-opus-5-5"}}"#,
+                r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5"}}"#,
+                r#"{"type":"assistant","message":{"model":"<synthetic>"}}"#,
+                r#"{"type":"user","message":{"content":"hi"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            model(Harness::ClaudeCode, &claude).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let codex = dir.join("x.jsonl");
+        std::fs::write(
+            &codex,
+            [
+                r#"{"type":"session_meta","payload":{"id":"s"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6-luna"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#,
+                r#"{"type":"response_item","payload":{"text":"\"turn_context\""}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            model(Harness::Codex, &codex).as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        assert_eq!(model(Harness::Pi, &codex), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -3,6 +3,7 @@ mod github;
 mod go;
 mod install;
 mod live;
+mod log;
 mod matching;
 mod mcp;
 mod names;
@@ -52,6 +53,33 @@ enum Cmd {
         /// Also show how many sessions were matched by stamp, repo and folder path.
         #[arg(long, short)]
         verbose: bool,
+    },
+    /// What your PRs did today (or over a longer window), and which need you now.
+    Log {
+        /// today, yesterday, a number of days such as 7d, or a date such as 2026-11-05.
+        #[arg(long, default_value = "today")]
+        since: String,
+        /// Only this repository (owner/name).
+        #[arg(long)]
+        repo: Option<String>,
+        /// GitHub author to search for.
+        #[arg(long, default_value = "@me")]
+        author: String,
+        /// Days without activity after which an open PR needs you.
+        #[arg(long, default_value_t = 3, value_name = "DAYS")]
+        stale_days: u32,
+        /// Write the timeline as an HTML page and open it, or write it to PATH.
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+        html: Option<PathBuf>,
+        /// Print JSON instead of a list.
+        #[arg(long, conflicts_with = "html")]
+        json: bool,
+        /// List every PR that has gone quiet, not just the newest few.
+        #[arg(long)]
+        all: bool,
+        /// Search GitHub now instead of using results cached in the last 2 minutes.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Open the session behind a PR (open, merged or closed): switch to it if it's running, else resume it.
     Go {
@@ -183,6 +211,28 @@ fn dispatch(cli: Cli) -> Result<()> {
             refresh,
             verbose,
         } => prs(&home()?, repo, &author, state, json, refresh, verbose),
+        Cmd::Log {
+            since,
+            repo,
+            author,
+            stale_days,
+            html,
+            json,
+            all,
+            refresh,
+        } => log_cmd(
+            &home()?,
+            &LogArgs {
+                since,
+                repo,
+                author,
+                stale_days,
+                html,
+                json,
+                all,
+                refresh,
+            },
+        ),
         Cmd::Go { pr, print } => go(&home()?, &pr, print),
         Cmd::Send {
             pr,
@@ -394,6 +444,109 @@ fn prs(
             )
         );
     }
+    Ok(())
+}
+
+struct LogArgs {
+    since: String,
+    repo: Option<String>,
+    author: String,
+    stale_days: u32,
+    html: Option<PathBuf>,
+    json: bool,
+    all: bool,
+    refresh: bool,
+}
+
+fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
+    let now = Utc::now();
+    let window = log::Window::parse(&args.since, now.with_timezone(&chrono::Local))?;
+    let mut search = format!("author:{}", args.author);
+    if let Some(r) = &args.repo {
+        search.push_str(&format!(" repo:{r}"));
+    }
+    let since = window.start.fixed_offset();
+    let Loaded { fetched, rows, .. } = load(home, |dir| {
+        // Open PRs whatever their age, so forgotten ones show; and every PR
+        // that changed in the window, for what was merged or closed.
+        let (open, recent) = rayon::join(
+            || github::list_prs(&search, github::StateFilter::Open, dir, args.refresh, now),
+            || github::list_prs_since(&search, since, dir, args.refresh, now),
+        );
+        Ok(github::merge_fetched(open?, recent?))
+    })?;
+    let entries = log::entries(
+        rows,
+        window.start.with_timezone(&Utc),
+        now,
+        args.stale_days,
+        |s| {
+            s.log_path
+                .as_deref()
+                .and_then(|p| sessions::model(s.harness, p))
+        },
+    );
+    if args.json {
+        let out = serde_json::json!({
+            "start": window.start,
+            "days": window.days,
+            "generated_at": now,
+            "stale_days": args.stale_days,
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if entries.is_empty()
+        && let Some(r) = &args.repo
+        && github::repo_exists(r) == Some(false)
+    {
+        anyhow::bail!("no repository {r} on GitHub (or `gh` can't see it)");
+    }
+    if let Some(path) = &args.html {
+        let page = log::render_html(&entries, &window, now, args.stale_days)?;
+        let open = path.as_os_str().is_empty();
+        let path = if open {
+            cache::dir(home).join("log.html")
+        } else {
+            path.clone()
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&path, page).with_context(|| format!("writing {}", path.display()))?;
+        println!("{}", path.display());
+        if open {
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            let opened = std::process::Command::new(opener)
+                .arg(&path)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !opened {
+                eprintln!("couldn't open it with {opener}; open the file above in a browser");
+            }
+        }
+        return Ok(());
+    }
+    let cached = fetched
+        .from_cache
+        .then(|| render::ago(fetched.fetched_at, now));
+    print!(
+        "{}",
+        log::render_terminal(
+            &entries,
+            &window,
+            now,
+            &render::Style::detect(false),
+            cached.as_deref(),
+            args.all,
+        )
+    );
     Ok(())
 }
 
