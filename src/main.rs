@@ -905,6 +905,14 @@ fn deliver_message(
     if let Some(why) = send::socket_refusal(home, &target, &delivery) {
         anyhow::bail!("can't message {}: {why}", label(Some(&target)));
     }
+    if s.harness == sessions::Harness::Codex
+        && matches!(delivery, send::Delivery::Resume { .. })
+        && !send::codex_resume_repo(&s.cwd)
+    {
+        anyhow::bail!(
+            "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written"
+        );
+    }
     let address = match &named {
         Some(n) => format!("@{} ({})", n.name, names::identity(&target)),
         None => pr.clone().unwrap_or_default(),
@@ -993,6 +1001,11 @@ fn send_acceptance(sent: &Sent) -> String {
             "Message {} was written to the inbox socket for {}. Receipt is not confirmed.",
             sent.id, sent.to
         )
+    } else if sent.how == "codex queue" {
+        format!(
+            "Message {} was queued for {}. Receipt is not confirmed. Codex must consume the queue; a running codex exec may finish without reading it. Later exec resume consumption is not guaranteed.",
+            sent.id, sent.to
+        )
     } else {
         format!("Sent {} to {} via {}.", sent.id, sent.to, sent.how)
     }
@@ -1061,6 +1074,11 @@ fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String>
             "Reply to {id} was written to the inbox socket for {}. Receipt is not confirmed.",
             label(Some(&to))
         ))
+    } else if matches!(route, send::Delivery::CodexQueue(_)) {
+        Ok(format!(
+            "Reply to {id} queued for {}. Receipt is not confirmed. Codex must consume the queue; codex exec consumption is not guaranteed.",
+            label(Some(&to))
+        ))
     } else {
         Ok(format!("Reply to {id} sent to {}.", label(Some(&to))))
     }
@@ -1071,7 +1089,7 @@ fn mcp_send_text(sent: &Sent) -> String {
     if let Some(note) = &sent.note {
         out.push_str(&format!("\n{note}"));
     }
-    out.push_str(if sent.from_session && sent.socket_write {
+    out.push_str(if sent.from_session && (sent.socket_write || sent.how == "codex queue") {
             "\n\nIf the target receives and answers this message, its reply can arrive here as a \"[provenance] Reply\" message."
         } else if sent.from_session {
             "\n\nThe session that received this message will send its answer here as a \"[provenance] Reply\" message."
@@ -1489,6 +1507,14 @@ mod send_cli_tests {
                 matches!(caller, send::Caller::Cli { .. })
             );
         }
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&home)
+                .status()
+                .unwrap()
+                .success()
+        );
         // Only the fake codex on PATH may run: it emits stderr and exits 97.
         let error = send_resolved(
             &home,
@@ -2450,4 +2476,61 @@ mod reply_cli_tests {
         assert!(result.contains("saved, but"));
         assert!(result.contains("isn't running"));
     }
+}
+#[test]
+fn queue_acceptance_does_not_claim_receipt() {
+    let sent = Sent {
+        id: "m-q".into(),
+        to: "Codex session test".into(),
+        how: "codex queue",
+        socket_write: false,
+        note: None,
+        mailbox: PathBuf::new(),
+        output: String::new(),
+        from_session: true,
+    };
+    for text in [send_acceptance(&sent), mcp_send_text(&sent)] {
+        assert!(text.contains("Receipt is not confirmed"));
+        assert!(text.contains("exec"));
+        assert!(!text.starts_with("Sent "));
+    }
+}
+
+#[test]
+fn non_git_resume_refuses_before_mailbox_or_transport() {
+    let home = std::env::temp_dir().join(format!("zz-resume-{}", send::new_id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let sighting = sessions::Sighting {
+        harness: Harness::Codex,
+        session_id: "zz-fixture".into(),
+        app: "Terminal".into(),
+        cwd: home.to_string_lossy().into_owned(),
+        branch: String::new(),
+        repo_url: None,
+        last_seen: Utc::now(),
+        log_path: None,
+        machine: None,
+        url: None,
+    };
+    let outgoing = Outgoing {
+        sighting,
+        delivery: send::Delivery::Resume {
+            cwd: home.to_string_lossy().into_owned(),
+            argv: send::headless_argv(Harness::Codex, "zz-fixture"),
+        },
+        sender: None,
+        pr: None,
+        named: None,
+        note: None,
+    };
+    let error = deliver_message(&home, outgoing, "hello", &|_, _, _, _, _, _, _| {
+        panic!("transport must not run")
+    })
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("--skip-git-repo-check"));
+    assert!(error.contains("no mailbox entry"));
+    assert!(!send::mail_dir(&home).exists());
+    std::fs::remove_dir_all(home).unwrap();
 }

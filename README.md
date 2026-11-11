@@ -131,7 +131,7 @@ The tested launch paths and remaining session-ID limitations are recorded in [th
 | Session | How the message gets in |
 |---|---|
 | Claude Code, running outside bypass mode | Its inbox socket, named in `~/.claude/sessions/<pid>.json`. An idle session starts a turn; a busy one reads it between tool calls. Claude Code labels it as a message from another session, which can't approve prompts or change settings. |
-| Codex, running | `codex queue --thread <id>`. An idle session starts a turn; a busy one takes it after its current turn. |
+| Codex, running | `codex queue --thread <id>`. Queue acceptance does not confirm receipt. A standalone `codex exec` uses its own in-process server; later `exec resume` consumption is unverified. |
 | Process known to be gone | Refused, unless `--resume`: then `claude -p --resume` or `codex exec resume` runs one headless turn in its known folder. |
 | Process unknown | Refused without `--resume`. With `--resume`, allowed unless last recorded as running, waiting or stopped, since it may still be open. CLI `--resume --force` overrides only that recorded-state refusal; the folder must still be known. |
 | OpenCode, Pi, the web, another machine | Not supported yet. |
