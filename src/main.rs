@@ -806,8 +806,9 @@ fn send_resolved(
     caller: send::Caller,
     process: &dyn Fn(&matching::SessionMatch) -> go::Process,
 ) -> Result<Sent> {
+    let skipped = std::cell::RefCell::new(Vec::new());
     let plan = |m: &matching::SessionMatch, resume| {
-        plan_recipient(
+        let delivery = plan_recipient(
             home,
             &m.sighting,
             m.state,
@@ -815,7 +816,17 @@ fn send_resolved(
             sender,
             resume,
             caller,
-        )
+        );
+        if let send::Delivery::Refuse(reason) = &delivery
+            && !resume
+        {
+            let index = sessions
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, m))
+                .unwrap();
+            skipped.borrow_mut().push((index, reason.clone()));
+        }
+        delivery
     };
     let (m, delivery) = send::choose(sessions, resume, &plan).map_err(|why| {
         anyhow::anyhow!("can't message the session behind {repo}#{number}: {why}")
@@ -825,6 +836,27 @@ fn send_resolved(
     } else {
         None
     };
+    let note = [
+        note,
+        send::bypass_note(
+            &skipped
+                .borrow()
+                .iter()
+                .filter(|(index, _)| {
+                    *index
+                        < sessions
+                            .iter()
+                            .position(|candidate| std::ptr::eq(candidate, m))
+                            .unwrap()
+                })
+                .map(|(_, reason)| reason.clone())
+                .collect::<Vec<_>>(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let note = (!note.is_empty()).then(|| note.join(" "));
     deliver_message(
         home,
         Outgoing {

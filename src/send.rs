@@ -210,7 +210,21 @@ pub fn socket_refusal(home: &Path, target: &Sender, delivery: &Delivery) -> Opti
     {
         return None;
     }
-    Some("Claude Code holds socket messages from provenance when the target is in bypass mode; nothing was delivered. Use a session not running in bypass mode".into())
+    Some(format!(
+        "{BYPASS_REASON}; nothing was delivered. Use a session not running in bypass mode"
+    ))
+}
+
+pub const BYPASS_REASON: &str =
+    "Claude Code holds socket messages from provenance when the target is in bypass mode";
+
+/// Retain refusal evidence from selection without probing the session again.
+pub fn bypass_note(reasons: &[String]) -> Option<String> {
+    let count = reasons
+        .iter()
+        .filter(|r| r.starts_with(BYPASS_REASON))
+        .count();
+    (count > 0).then(|| format!("Skipped {count} newer matched session(s): {BYPASS_REASON}. Use a session not running in bypass mode."))
 }
 
 /// Choose an unpredictable, per-delivery boundary absent from the body.
@@ -553,7 +567,7 @@ pub fn mailbox(dir: &Path, harness: Harness, session_id: &str) -> PathBuf {
 /// Append one line, in one write, so concurrent writers don't interleave.
 pub fn append(path: &Path, mail: &Mail) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;
     }
     let mut line = serde_json::to_string(mail)?;
     line.push('\n');
@@ -562,7 +576,20 @@ pub fn append(path: &Path, mail: &Mail) -> Result<()> {
         .append(true)
         .open(path)
         .and_then(|mut f| f.write_all(line.as_bytes()))
-        .with_context(|| format!("writing {}", path.display()))
+        .map_err(|e| mailbox_error(path, e))
+}
+
+fn mailbox_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    let denied = matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES));
+    let context = if denied {
+        format!(
+            "writing mailbox {}: the session sandbox (for example, Codex workspace-write) may block writes under ~/.local/state/provenance/mail. The mailbox write failed; nothing was forwarded and the entry was not saved completely (a partial write may remain). Report this to the user; run the session with access to that folder. Do not change permissions",
+            path.display()
+        )
+    } else {
+        format!("writing mailbox {}", path.display())
+    };
+    anyhow::Error::new(error).context(context)
 }
 
 pub fn read(path: &Path) -> Vec<Mail> {
@@ -658,6 +685,60 @@ mod tests {
 
     fn a_socket(pid: u32, id: &str) -> Option<PathBuf> {
         (pid == 7 && id == "abc").then(|| PathBuf::from("/tmp/cc-socks/7.sock"))
+    }
+
+    #[test]
+    fn mailbox_permission_errors_explain_sandbox_and_preserve_cause() {
+        let path = Path::new("/synthetic/mail/codex-test.jsonl");
+        for code in [libc::EPERM, libc::EACCES] {
+            let error = mailbox_error(path, std::io::Error::from_raw_os_error(code));
+            let text = format!("{error:#}");
+            for expected in [
+                "/synthetic/mail/codex-test.jsonl",
+                "sandbox",
+                "workspace-write",
+                "nothing was forwarded",
+                "Report this to the user",
+                "access to that folder",
+                "Do not change permissions",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(code)
+            );
+        }
+        let text = mailbox_error(path, std::io::Error::from_raw_os_error(libc::ENOSPC)).to_string();
+        assert!(text.contains("/synthetic/mail/codex-test.jsonl"));
+        assert!(!text.contains("sandbox"));
+    }
+
+    #[test]
+    fn bypass_skip_note_keeps_selection_and_refusal_wording() {
+        let sessions = [
+            session(Harness::ClaudeCode, None),
+            session(Harness::Codex, None),
+        ];
+        let reasons = std::cell::RefCell::new(Vec::new());
+        let planner = |m: &SessionMatch, _| {
+            if m.sighting.harness == Harness::ClaudeCode {
+                let reason = format!("{BYPASS_REASON}; nothing was delivered");
+                reasons.borrow_mut().push(reason.clone());
+                Delivery::Refuse(reason)
+            } else {
+                Delivery::CodexQueue("older".into())
+            }
+        };
+        let (chosen, _) = choose(&sessions, false, &planner).unwrap();
+        assert!(std::ptr::eq(chosen, &sessions[1]));
+        let note = bypass_note(&reasons.borrow()).unwrap();
+        assert!(note.contains("Skipped 1 newer"));
+        assert!(note.contains(BYPASS_REASON));
+        assert!(bypass_note(&["not running".into()]).is_none());
     }
 
     #[test]
