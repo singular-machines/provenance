@@ -486,6 +486,11 @@ fn recap_cmd(home: &std::path::Path, args: &RecapArgs) -> Result<()> {
                 .as_deref()
                 .and_then(|p| sessions::model(s.harness, p))
         },
+        |s| {
+            s.log_path
+                .as_deref()
+                .and_then(|p| sessions::last_message(s.harness, p))
+        },
     );
     if args.json {
         let out = serde_json::json!({

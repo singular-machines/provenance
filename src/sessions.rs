@@ -380,6 +380,99 @@ pub fn model(harness: Harness, log: &Path) -> Option<String> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeReplyLine {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    is_sidechain: bool,
+    message: ClaudeReply,
+}
+
+#[derive(Deserialize)]
+struct ClaudeReply {
+    #[serde(default)]
+    content: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CodexReplyLine {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: CodexReply,
+}
+
+#[derive(Deserialize)]
+struct CodexReply {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    role: Option<String>,
+    #[serde(default)]
+    content: Vec<serde_json::Value>,
+}
+
+/// The longest last message kept, in characters.
+const LAST_MESSAGE_MAX: usize = 1200;
+
+/// What a session last said to its user: Claude Code's last main-thread text
+/// reply or `AskUserQuestion` questions, or Codex's last assistant message.
+/// Cut to `LAST_MESSAGE_MAX` characters. `None` for harnesses without one.
+pub fn last_message(harness: Harness, log: &Path) -> Option<String> {
+    let text = match harness {
+        Harness::ClaudeCode => last_line_with(log, |l| {
+            if !l.contains("\"assistant\"") {
+                return None;
+            }
+            let line: ClaudeReplyLine = serde_json::from_str(l).ok()?;
+            if line.kind != "assistant" || line.is_sidechain {
+                return None;
+            }
+            let mut parts = Vec::new();
+            for c in &line.message.content {
+                match c["type"].as_str() {
+                    Some("text") => parts.extend(c["text"].as_str().map(str::to_string)),
+                    Some("tool_use") if c["name"] == "AskUserQuestion" => {
+                        for q in c["input"]["questions"].as_array().into_iter().flatten() {
+                            parts.extend(q["question"].as_str().map(str::to_string));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let text = parts.join("\n\n");
+            (!text.trim().is_empty()).then_some(text)
+        }),
+        Harness::Codex => last_line_with(log, |l| {
+            if !l.contains("\"assistant\"") {
+                return None;
+            }
+            let line: CodexReplyLine = serde_json::from_str(l).ok()?;
+            let p = line.payload;
+            if line.kind != "response_item"
+                || p.kind.as_deref() != Some("message")
+                || p.role.as_deref() != Some("assistant")
+            {
+                return None;
+            }
+            let text: Vec<&str> = p
+                .content
+                .iter()
+                .filter(|c| c["type"] == "output_text")
+                .filter_map(|c| c["text"].as_str())
+                .collect();
+            let text = text.join("\n\n");
+            (!text.trim().is_empty()).then_some(text)
+        }),
+        Harness::OpenCode | Harness::Pi => None,
+    }?;
+    let text = text.trim();
+    Some(match text.char_indices().nth(LAST_MESSAGE_MAX) {
+        Some((i, _)) => format!("{}…", &text[..i]),
+        None => text.to_string(),
+    })
+}
+
 /// A model ID as people say it: `claude-opus-5-5` is "Opus 5.5" and
 /// `gpt-6.1-sol` is "GPT-6.1 Sol". Unknown shapes are shown as they are.
 pub fn model_name(id: &str) -> String {
@@ -823,6 +916,57 @@ mod tests {
         .unwrap();
         assert_eq!(load_all(&home, Some(&cache)).len(), 2);
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn last_message_is_the_last_reply_or_question() {
+        let dir = std::env::temp_dir().join(format!("prov-last-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = dir.join("c.jsonl");
+        let write = |lines: &[&str]| std::fs::write(&claude, lines.join("\n")).unwrap();
+        write(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Earlier"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"  Merge it?  "},{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":"ok"}}"#,
+        ]);
+        assert_eq!(
+            last_message(Harness::ClaudeCode, &claude).as_deref(),
+            Some("Merge it?")
+        );
+        write(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Earlier"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Which name?"},{"question":"Ship it?"}]}}]}}"#,
+        ]);
+        assert_eq!(
+            last_message(Harness::ClaudeCode, &claude).as_deref(),
+            Some("Which name?\n\nShip it?")
+        );
+        let long = "é".repeat(LAST_MESSAGE_MAX + 5);
+        write(&[&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{long}"}}]}}}}"#
+        )]);
+        let cut = last_message(Harness::ClaudeCode, &claude).unwrap();
+        assert_eq!(cut.chars().count(), LAST_MESSAGE_MAX + 1);
+        assert!(cut.ends_with('…'));
+        let codex = dir.join("x.jsonl");
+        std::fs::write(
+            &codex,
+            [
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done. Merge?"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"\"assistant\""}]}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            last_message(Harness::Codex, &codex).as_deref(),
+            Some("Done. Merge?")
+        );
+        assert_eq!(last_message(Harness::Pi, &codex), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
