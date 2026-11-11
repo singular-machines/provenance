@@ -57,10 +57,10 @@ provenance install      # optional: exact stamps and live status
 | `provenance prs --verbose` | Also count matches by stamp, repo and folder path |
 | `provenance prs --json` | Every matching session per PR, for scripts and agents |
 | `provenance prs --refresh` | Search GitHub now instead of using the 2-minute cache |
-| `provenance log` | What your PRs did today, and which need you now |
-| `provenance log --since 7d` | Over a longer window: `today`, `yesterday`, `7d` (up to `366d`) or a date such as `2026-11-05` |
-| `provenance log --html` | Write the timeline as an HTML page and open it (`--html <path>` writes it there instead) |
-| `provenance log --json` | The same entries for scripts and agents |
+| `provenance recap` | What your PRs did today, and which need you now |
+| `provenance recap --since 7d` | Over a longer window: `today`, `yesterday`, `7d` (up to `366d`) or a date such as `2026-11-05` |
+| `provenance recap --html` | Write the timeline as an HTML page and open it (`--html <path>` writes it there instead) |
+| `provenance recap --json` | The same entries for scripts and agents |
 | `provenance go <PR>` | Open the session behind a PR (`123`, `owner/name#123` or a PR URL), open or merged, by anyone |
 | `provenance go <PR> --print` | Show what `go` would run, without running it |
 | `provenance send <PR> "message"` | Message the session behind a PR (Claude Code or Codex) |
@@ -180,7 +180,7 @@ Status marks need [`provenance install`](#install-hooks) for Claude Code, Codex 
 
 ## Timeline
 
-`provenance log` answers "what did my agents do today, and what's waiting on me?". It lists every open PR, plus every PR merged or closed in the window, grouped by what they need:
+`provenance recap` answers "what did my agents do today, and what's waiting on me?". It lists every open PR, plus every PR merged or closed in the window, grouped by what they need:
 
 ```text
 Today (Wed 11 Nov) · 6 PRs: 3 merged, 1 closed, 2 open · 1 needs you
@@ -209,7 +209,7 @@ STILL OPEN
 
 Each row names the session's harness and model, read from its log (Claude Code's last main-thread reply, Codex's last turn). OpenCode and Pi sessions, and sessions known only from a stamp, show the harness alone. A PR with no session found is most likely your own. Times are local; a window starts at local midnight.
 
-`--html` writes one self-contained page, with no server and nothing loaded from the network: a bar per PR on a time axis, from opened to merged or closed, with nights shaded. Switch between today and the whole window, and between one row per PR and one group per session. The page uses the same sections, with long ones cut short behind a "Show N more" button. A PR opened before the window gets a thin bar that says when it was opened, with a dot at its last activity. Click a row for its details, a link to the PR and the `provenance go` command. PRs gone quiet are dashed and hidden until you show them. The page is a snapshot, so run `provenance log` again for live status.
+`--html` writes one self-contained page, with no server and nothing loaded from the network: a bar per PR on a time axis, from opened to merged or closed, with nights shaded. Switch between today and the whole window, and between one row per PR and one group per session. The page uses the same sections, with long ones cut short behind a "Show N more" button. A PR opened before the window gets a thin bar that says when it was opened, with a dot at its last activity. Click a row for its details, a link to the PR and the `provenance go` command. PRs gone quiet are dashed and hidden until you show them. The page is a snapshot, so run `provenance recap` again for live status.
 
 ## How it works
 
@@ -311,7 +311,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - [x] `provenance go`: switch to or reopen the session behind a PR
 - [x] `provenance send` and an MCP server with `send` and `reply` tools (Claude Code and Codex)
 - [ ] `send` to OpenCode and Pi sessions
-- [x] `provenance log`: a timeline of your PRs and what needs you
+- [x] `provenance recap`: a timeline of your PRs and what needs you
 - [ ] `provenance show`: a session's recent turns
 
 ## License

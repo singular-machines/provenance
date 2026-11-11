@@ -542,7 +542,7 @@ struct Page<'a> {
     entries: &'a [Entry],
 }
 
-const TEMPLATE: &str = include_str!("log.html");
+const TEMPLATE: &str = include_str!("recap.html");
 
 /// The timeline page: one self-contained file with the entries inlined.
 pub fn render_html(

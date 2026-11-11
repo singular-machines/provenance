@@ -3,10 +3,10 @@ mod github;
 mod go;
 mod install;
 mod live;
-mod log;
 mod matching;
 mod mcp;
 mod names;
+mod recap;
 mod render;
 mod send;
 mod sessions;
@@ -55,7 +55,7 @@ enum Cmd {
         verbose: bool,
     },
     /// What your PRs did today (or over a longer window), and which need you now.
-    Log {
+    Recap {
         /// today, yesterday, a number of days such as 7d, or a date such as 2026-11-05.
         #[arg(long, default_value = "today")]
         since: String,
@@ -211,7 +211,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             refresh,
             verbose,
         } => prs(&home()?, repo, &author, state, json, refresh, verbose),
-        Cmd::Log {
+        Cmd::Recap {
             since,
             repo,
             author,
@@ -220,9 +220,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             json,
             all,
             refresh,
-        } => log_cmd(
+        } => recap_cmd(
             &home()?,
-            &LogArgs {
+            &RecapArgs {
                 since,
                 repo,
                 author,
@@ -447,7 +447,7 @@ fn prs(
     Ok(())
 }
 
-struct LogArgs {
+struct RecapArgs {
     since: String,
     repo: Option<String>,
     author: String,
@@ -459,9 +459,9 @@ struct LogArgs {
     refresh: bool,
 }
 
-fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
+fn recap_cmd(home: &std::path::Path, args: &RecapArgs) -> Result<()> {
     let now = Utc::now();
-    let window = log::Window::parse(&args.since, now.with_timezone(&chrono::Local))?;
+    let window = recap::Window::parse(&args.since, now.with_timezone(&chrono::Local))?;
     let mut search = format!("author:{}", args.author);
     if let Some(r) = &args.repo {
         search.push_str(&format!(" repo:{r}"));
@@ -476,7 +476,7 @@ fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
         );
         Ok(github::merge_fetched(open?, recent?))
     })?;
-    let entries = log::entries(
+    let entries = recap::entries(
         rows,
         window.start.with_timezone(&Utc),
         now,
@@ -505,11 +505,11 @@ fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
         anyhow::bail!("no repository {r} on GitHub (or `gh` can't see it)");
     }
     if let Some(path) = &args.html {
-        let page = log::render_html(&entries, &window, now, args.stale_days)?;
+        let page = recap::render_html(&entries, &window, now, args.stale_days)?;
         let open = path.is_none();
         let path = path
             .clone()
-            .unwrap_or_else(|| cache::dir(home).join("log.html"));
+            .unwrap_or_else(|| cache::dir(home).join("recap.html"));
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -537,7 +537,7 @@ fn log_cmd(home: &std::path::Path, args: &LogArgs) -> Result<()> {
         .then(|| render::ago(fetched.fetched_at, now));
     print!(
         "{}",
-        log::render_terminal(
+        recap::render_terminal(
             &entries,
             &window,
             now,
@@ -2947,13 +2947,13 @@ fn non_git_resume_refuses_before_mailbox_or_transport() {
 }
 
 #[cfg(test)]
-mod log_cli_tests {
+mod recap_cli_tests {
     use super::*;
 
     fn html(args: &[&str]) -> Option<Option<PathBuf>> {
-        let argv = ["provenance", "log"].iter().chain(args);
+        let argv = ["provenance", "recap"].iter().chain(args);
         match Cli::try_parse_from(argv).unwrap().command {
-            Cmd::Log { html, .. } => html,
+            Cmd::Recap { html, .. } => html,
             _ => unreachable!(),
         }
     }
@@ -2967,6 +2967,6 @@ mod log_cli_tests {
             html(&["--html", "out/t.html"]),
             Some(Some(PathBuf::from("out/t.html")))
         );
-        assert!(Cli::try_parse_from(["provenance", "log", "--html", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["provenance", "recap", "--html", "--json"]).is_err());
     }
 }
