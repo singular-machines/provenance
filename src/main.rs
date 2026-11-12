@@ -409,7 +409,8 @@ fn peer_cmd(
         PeerCmd::Add { ssh, bin } => {
             println!("{}", peer_add(home, &ssh, bin.as_deref(), transport)?);
             let me = std::env::current_exe().context("finding the provenance binary")?;
-            match install::install_pull_agent(home, &me, PULL_EVERY_SECS) {
+            let path = std::env::var("PATH").unwrap_or_default();
+            match install::install_pull_agent(home, &me, &path, PULL_EVERY_SECS) {
                 Ok(line) => println!("{line}"),
                 Err(e) => println!(
                     "Replies that machine can't pass back won't be collected on their own ({e:#}); run `provenance peer pull`."
@@ -1747,8 +1748,8 @@ fn send_cmd(
     wait: Option<u64>,
 ) -> Result<()> {
     let result = send_message(home, pr, text, resume, send::Caller::Cli { force });
-    let pull = |machine: &str| {
-        let _ = peer_pull(home, Some(machine), &relay::ssh);
+    let pull = |machine: &str, id: &str| {
+        let _ = peer_pull(home, Some((machine, id)), &relay::ssh);
     };
     send_cmd_output(result, wait, &pull, &mut std::io::stdout().lock())
 }
@@ -1772,7 +1773,7 @@ fn send_acceptance(sent: &Sent) -> String {
 fn send_cmd_output(
     result: Result<Sent>,
     wait: Option<u64>,
-    pull: &dyn Fn(&str),
+    pull: &dyn Fn(&str, &str),
     out: &mut impl std::io::Write,
 ) -> Result<()> {
     let sent = result.map_err(|e| anyhow::anyhow!("{}", terminal_text(&format!("{e:#}"))))?;
@@ -1795,7 +1796,7 @@ fn send_cmd_output(
         if let Some(machine) = &sent.relayed_to
             && tick.is_multiple_of(3)
         {
-            pull(machine);
+            pull(machine, &sent.id);
             if cli_waited_reply(&sent, out)? {
                 return Ok(());
             }
@@ -2009,13 +2010,11 @@ fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Resu
         },
     )?;
     let how = match sender {
-        _ if !fresh => "already received".to_string(),
-        None => "saved for the terminal that sent it".to_string(),
+        None if fresh => "saved for the terminal that sent it".to_string(),
+        None => "already received".to_string(),
         Some(to) => {
             let from = format!("{} on machine {}", label(Some(&r.replier)), r.from_machine);
-            let records = live::load_records(home);
-            forward_reply(home, &records, &to, &r.id, &from, &r.text)
-                .unwrap_or_else(|e| format!("saved, but not forwarded: {e:#}"))
+            forward_once(home, &mailbox, &to, &r.id, &from)?
         }
     };
     Ok(relay::Outcome {
@@ -2023,6 +2022,39 @@ fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Resu
         how,
         ..relay::Outcome::default()
     })
+}
+
+/// Forward the saved reply to `id` to the session that sent it, unless it
+/// already got there. A failed forward isn't marked, so the next pull tries
+/// again; one that finds the session gone is, like a local reply.
+fn forward_once(
+    home: &std::path::Path,
+    mailbox: &std::path::Path,
+    to: &send::Sender,
+    id: &str,
+    from: &str,
+) -> Result<String> {
+    let _lock = send::forward_lock(&send::mail_dir(home))?;
+    if send::forwarded(mailbox, id) {
+        return Ok("already received".into());
+    }
+    let text = send::reply_to(mailbox, id).with_context(|| format!("no reply to {id} is saved"))?;
+    let records = live::load_records(home);
+    match forward_reply(home, &records, to, id, from, &text) {
+        Ok(status) => {
+            send::append_new(
+                mailbox,
+                &send::Mail::Forwarded {
+                    id: id.into(),
+                    at: Utc::now(),
+                },
+            )?;
+            Ok(status)
+        }
+        Err(e) => Ok(format!(
+            "saved, but not forwarded yet ({e:#}); the next `provenance peer pull` tries again"
+        )),
+    }
 }
 
 fn relayed_reply_note(machine: &str) -> String {
@@ -2067,65 +2099,84 @@ fn relay_collect_checked(home: &std::path::Path, c: &relay::Collect) -> Result<r
 }
 
 /// Collect the replies paired machines hold for messages relayed there from
-/// here and still waiting, from `only` that machine if given. Each one is
-/// accepted as `relay reply` would accept it. Returns a line per reply, and
-/// per machine that couldn't be asked.
+/// here and still waiting, and retry forwards that failed. `only` narrows it
+/// to one message on one machine. Each reply is accepted as `relay reply`
+/// would accept it. Returns a line per reply, and per machine that couldn't
+/// be asked.
 fn peer_pull(
     home: &std::path::Path,
-    only: Option<&str>,
+    only: Option<(&str, &str)>,
     transport: &relay::Transport<'_>,
 ) -> Result<Vec<String>> {
     let since = Utc::now() - chrono::Duration::hours(PULL_WINDOW_HOURS);
-    let awaiting = send::awaiting(&send::mail_dir(home), since);
+    let dir = send::mail_dir(home);
     let mut lines = Vec::new();
-    for peer in relay::load(home)? {
-        if only.is_some_and(|m| m != peer.machine) {
+    for (mailbox, replier, message, _) in send::unforwarded(&dir, since) {
+        let send::Mail::Message {
+            id,
+            sender: Some(to),
+            to_machine: Some(machine),
+            ..
+        } = message
+        else {
             continue;
+        };
+        let from = format!("{} on machine {machine}", label(Some(&replier)));
+        let how = forward_once(home, &mailbox, &to, &id, &from)?;
+        if how != "already received" {
+            lines.push(format!("Reply to {id} from machine {machine}: {how}"));
         }
-        let mut ids: Vec<String> = awaiting
+    }
+    let mut awaiting = send::awaiting(&dir, since);
+    awaiting.sort();
+    awaiting.dedup();
+    for peer in relay::load(home)? {
+        let ids: Vec<String> = awaiting
             .iter()
-            .filter(|(m, _)| *m == peer.machine)
+            .filter(|(m, id)| {
+                *m == peer.machine && only.is_none_or(|(om, oid)| om == m && oid == id)
+            })
             .map(|(_, id)| id.clone())
             .collect();
         if ids.is_empty() {
             continue;
         }
-        ids.truncate(relay::MAX_COLLECT);
-        let Some(me) = stamps::machine_name() else {
-            anyhow::bail!("this machine has no name to collect replies with");
-        };
-        let ask = relay::Collect {
-            protocol: relay::PROTOCOL,
-            from_machine: me,
-            ids,
-        };
-        let collected = match relay::call_collect(&peer, &ask, transport) {
-            Ok(c) => c,
-            Err(e) => {
-                lines.push(format!(
-                    "Couldn't collect replies from machine {}: {e:#}",
-                    peer.machine
-                ));
-                continue;
+        let me =
+            stamps::machine_name().context("this machine has no name to collect replies with")?;
+        for chunk in ids.chunks(relay::MAX_COLLECT) {
+            let ask = relay::Collect {
+                protocol: relay::PROTOCOL,
+                from_machine: me.clone(),
+                ids: chunk.to_vec(),
+            };
+            let collected = match relay::call_collect(&peer, &ask, transport) {
+                Ok(c) => c,
+                Err(e) => {
+                    lines.push(format!(
+                        "Couldn't collect replies from machine {}: {e:#}",
+                        peer.machine
+                    ));
+                    break;
+                }
+            };
+            for mut reply in collected.replies {
+                // The machine asked, whatever its answer calls itself.
+                reply.from_machine = peer.machine.clone();
+                let outcome = relay_reply(home, &reply);
+                lines.push(match (outcome.accepted, outcome.why) {
+                    (true, _) if outcome.how == "already received" => continue,
+                    (true, _) => format!(
+                        "Reply to {} collected from machine {}: {}",
+                        reply.id, peer.machine, outcome.how
+                    ),
+                    (false, why) => format!(
+                        "Reply to {} from machine {} refused: {}",
+                        reply.id,
+                        peer.machine,
+                        why.as_deref().unwrap_or("no reason given")
+                    ),
+                });
             }
-        };
-        for mut reply in collected.replies {
-            // The machine asked, whatever its answer calls itself.
-            reply.from_machine = peer.machine.clone();
-            let outcome = relay_reply(home, &reply);
-            lines.push(match (outcome.accepted, outcome.why) {
-                (true, _) if outcome.how == "already received" => continue,
-                (true, _) => format!(
-                    "Reply to {} collected from machine {}: {}",
-                    reply.id, peer.machine, outcome.how
-                ),
-                (false, why) => format!(
-                    "Reply to {} from machine {} refused: {}",
-                    reply.id,
-                    peer.machine,
-                    why.as_deref().unwrap_or("no reason given")
-                ),
-            });
         }
     }
     Ok(lines)
@@ -2266,7 +2317,7 @@ mod send_cli_tests {
         };
         let mailbox = sent.mailbox.clone();
         let mut output = Vec::new();
-        send_cmd_output(Ok(sent), Some(0), &|_| {}, &mut output).unwrap();
+        send_cmd_output(Ok(sent), Some(0), &|_, _| {}, &mut output).unwrap();
         assert_reply_frame(
             String::from_utf8(output)
                 .unwrap()
@@ -2327,7 +2378,7 @@ mod send_cli_tests {
             "Sent m-1 to Codex session test via fixture.\n{}\n",
             terminal_text(&sent.output)
         );
-        send_cmd_output(Ok(sent), None, &|_| {}, &mut cli).unwrap();
+        send_cmd_output(Ok(sent), None, &|_, _| {}, &mut cli).unwrap();
         let cli = String::from_utf8(cli).unwrap();
         assert_eq!(cli, expected);
         assert!(!cli.contains('\r'));
@@ -2442,7 +2493,7 @@ mod send_cli_tests {
         let error = send_cmd_output(
             result.map(|_| unreachable!()),
             None,
-            &|_| {},
+            &|_, _| {},
             &mut Vec::new(),
         )
         .unwrap_err()
@@ -4349,9 +4400,9 @@ mod named_tests {
         // Waiting pulls it.
         let asked = std::cell::Cell::new(0);
         let collect = collect_from(&there, &asked);
-        let pull = |machine: &str| {
+        let pull = |machine: &str, id: &str| {
             assert_eq!(machine, "m-remote");
-            peer_pull(&here, Some(machine), &collect).unwrap();
+            peer_pull(&here, Some((machine, id)), &collect).unwrap();
         };
         let mut out = Vec::new();
         let mailbox = sent.mailbox.clone();
@@ -4526,10 +4577,15 @@ mod named_tests {
     }
     #[test]
     fn the_pull_agent_is_written_escaped_and_removed() {
+        const USER_PATH: &str = "/Users/x/.npm-global/bin:/usr/bin";
         let home = scratch();
-        let line =
-            install::install_pull_agent(&home, std::path::Path::new("/opt/a&b/provenance"), 30)
-                .unwrap();
+        let line = install::install_pull_agent(
+            &home,
+            std::path::Path::new("/opt/a&b/provenance"),
+            USER_PATH,
+            30,
+        )
+        .unwrap();
         if cfg!(target_os = "macos") {
             assert!(line.contains(install::PULL_AGENT), "{line}");
             let plist = std::fs::read_to_string(install::pull_agent_path(&home)).unwrap();
@@ -4538,11 +4594,149 @@ mod named_tests {
                 "{plist}"
             );
             assert!(plist.contains("<integer>30</integer>"));
+            // Codex and t3 installed in user folders are found from launchd.
+            let path = install::pull_agent_path_var(&home, USER_PATH);
+            assert!(path.starts_with(&format!("{USER_PATH}:")), "{path}");
+            assert!(
+                path.contains(&format!("{}/.cargo/bin", home.display())),
+                "{path}"
+            );
+            assert_eq!(path.matches(":/usr/bin").count(), 1, "{path}");
+            assert!(
+                plist.contains(&format!("<key>PATH</key><string>{path}</string>")),
+                "{plist}"
+            );
             assert!(install::remove_pull_agent(&home, false).unwrap().is_some());
             assert!(!install::pull_agent_path(&home).exists());
         }
         assert!(install::remove_pull_agent(&home, false).unwrap().is_none());
         std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn a_reply_that_could_not_be_forwarded_is_retried_once_the_session_is_back() {
+        stamps::set_test_machine("m-here");
+        let here = scratch();
+        // The sending session's inbox isn't listening yet.
+        let (sender, _) =
+            socket_target_with_id(&here, None, "e4217d94-c60f-4ad7-9b6b-1b7b52976ea4");
+        let replier = send::Sender {
+            harness: Harness::Codex,
+            session_id: "remote-codex".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&here), replier.harness, &replier.session_id);
+        send::append(
+            &mailbox,
+            &send::Mail::Message {
+                id: "m-0000000000d1".into(),
+                pr: None,
+                named_address: None,
+                from: "me".into(),
+                sender: Some(send::Sender {
+                    harness: sender.harness,
+                    session_id: sender.session_id.clone(),
+                }),
+                from_machine: None,
+                to_machine: Some("m-remote".into()),
+                text: "q".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let reply = relay::ReplyEnvelope {
+            protocol: relay::PROTOCOL,
+            id: "m-0000000000d1".into(),
+            from_machine: "m-remote".into(),
+            replier,
+            text: "late answer".into(),
+        };
+        let first = relay_reply(&here, &reply);
+        assert!(first.accepted);
+        assert!(first.how.contains("not forwarded yet"), "{first:?}");
+        // Passed back again before the session is back: still not forwarded.
+        assert!(relay_reply(&here, &reply).how.contains("not forwarded yet"));
+        // The session is back; the next pull forwards it, without asking any machine.
+        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::write(
+            here.join(format!(".claude/sessions/{}.json", sender.pid.unwrap())),
+            serde_json::json!({"sessionId": sender.session_id, "messagingSocketPath": socket})
+                .to_string(),
+        )
+        .unwrap();
+        let never =
+            |_: &str, _: &str, _: &[u8]| -> Result<Vec<u8>> { panic!("nothing to collect") };
+        let lines = peer_pull(&here, None, &never).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("inbox socket"), "{lines:?}");
+        assert!(received(&listener).contains("late answer"));
+        // Forwarded once: later pulls and pass-backs leave it.
+        assert!(peer_pull(&here, None, &never).unwrap().is_empty());
+        assert_eq!(relay_reply(&here, &reply).how, "already received");
+        let _ = std::fs::remove_file(&socket);
+        std::fs::remove_dir_all(here).unwrap();
+    }
+    #[test]
+    fn every_awaited_message_is_asked_about_in_batches() {
+        let (here, there, _) = relay_pair();
+        let mailbox = send::mailbox(&send::mail_dir(&here), Harness::Codex, "remote-codex");
+        let ids: Vec<String> = (0..=relay::MAX_COLLECT)
+            .map(|n| format!("m-{n:012}"))
+            .collect();
+        for id in &ids {
+            send::append(
+                &mailbox,
+                &send::Mail::Message {
+                    id: id.clone(),
+                    pr: None,
+                    named_address: None,
+                    from: "terminal".into(),
+                    sender: None,
+                    from_machine: None,
+                    to_machine: Some("m-remote".into()),
+                    text: "q".into(),
+                    at: Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+        let last = ids.last().unwrap().clone();
+        let sizes = std::cell::RefCell::new(Vec::new());
+        let transport = |_: &str, _: &str, input: &[u8]| -> Result<Vec<u8>> {
+            let ask = relay::read_collect(input)?;
+            sizes.borrow_mut().push(ask.ids.len());
+            let replies = ask
+                .ids
+                .iter()
+                .filter(|id| **id == last)
+                .map(|id| relay::ReplyEnvelope {
+                    protocol: relay::PROTOCOL,
+                    id: id.clone(),
+                    from_machine: "m-remote".into(),
+                    replier: send::Sender {
+                        harness: Harness::Codex,
+                        session_id: "remote-codex".into(),
+                    },
+                    text: "the last one".into(),
+                })
+                .collect();
+            Ok(serde_json::to_vec(&relay::Collected {
+                replies,
+                why: None,
+            })?)
+        };
+        let lines = peer_pull(&here, None, &transport).unwrap();
+        assert_eq!(*sizes.borrow(), vec![relay::MAX_COLLECT, 1]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            send::reply_to(&mailbox, &last).as_deref(),
+            Some("the last one")
+        );
+        // `send --wait` asks only about its own message.
+        sizes.borrow_mut().clear();
+        peer_pull(&here, Some(("m-remote", &ids[0])), &transport).unwrap();
+        assert_eq!(*sizes.borrow(), vec![1]);
+        std::fs::remove_dir_all(here).unwrap();
+        std::fs::remove_dir_all(there).unwrap();
     }
     #[test]
     fn a_passed_back_reply_reaches_the_live_session_that_sent_it() {
@@ -4609,7 +4803,11 @@ mod named_tests {
             assert!(!outcome.accepted);
             assert!(outcome.why.as_deref().unwrap().contains(why), "{outcome:?}");
         }
-        assert_eq!(send::read(&mailbox).len(), 2, "one message, one reply");
+        assert_eq!(
+            send::read(&mailbox).len(),
+            3,
+            "one message, one reply, forwarded once"
+        );
         std::fs::remove_dir_all(here).unwrap();
     }
     #[test]
@@ -4736,7 +4934,7 @@ mod named_tests {
             .unwrap();
             assert!(sent.socket_write);
             let mut cli = Vec::new();
-            send_cmd_output(Ok(sent), None, &|_| {}, &mut cli).unwrap();
+            send_cmd_output(Ok(sent), None, &|_, _| {}, &mut cli).unwrap();
             let cli = String::from_utf8(cli).unwrap();
             assert!(cli.contains("written to the inbox socket"));
             assert!(cli.contains("Receipt is not confirmed"));

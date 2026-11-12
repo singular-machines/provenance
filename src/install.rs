@@ -606,7 +606,7 @@ pub fn pull_agent_path(home: &Path) -> PathBuf {
         .join(format!("{PULL_AGENT}.plist"))
 }
 
-fn pull_agent_plist(home: &Path, bin: &Path, every_secs: u64) -> String {
+fn pull_agent_plist(home: &Path, bin: &Path, path: &str, every_secs: u64) -> String {
     let xml = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -621,6 +621,8 @@ fn pull_agent_plist(home: &Path, bin: &Path, every_secs: u64) -> String {
   <key>Label</key><string>{PULL_AGENT}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>peer</string><string>pull</string><string>--quiet</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{}</string></dict>
   <key>StartInterval</key><integer>{every_secs}</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{}</string>
@@ -629,26 +631,51 @@ fn pull_agent_plist(home: &Path, bin: &Path, every_secs: u64) -> String {
 </plist>
 "#,
         xml(&bin.display().to_string()),
+        xml(path),
         xml(&log.display().to_string()),
         xml(&log.display().to_string()),
     )
 }
 
+/// The PATH the pull agent runs with: `path` (the shell's that ran
+/// `peer add`, where `codex` and `t3` were found) and the usual install
+/// folders, since launchd gives agents only the system's.
+pub fn pull_agent_path_var(home: &Path, path: &str) -> String {
+    let mut dirs: Vec<String> = path
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    for d in [
+        home.join(".cargo/bin").display().to_string(),
+        home.join(".local/bin").display().to_string(),
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+        "/usr/bin".into(),
+        "/bin".into(),
+    ] {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs.join(":")
+}
+
 /// Writes and loads the pull agent, replacing any earlier one.
-pub fn install_pull_agent(home: &Path, bin: &Path, every_secs: u64) -> Result<String> {
+pub fn install_pull_agent(home: &Path, bin: &Path, path: &str, every_secs: u64) -> Result<String> {
     if !cfg!(target_os = "macos") {
         return Ok(format!(
             "Replies that machine can't pass back are collected by `provenance peer pull`; run it every {every_secs} seconds (cron or a systemd timer) on this machine."
         ));
     }
-    let path = pull_agent_path(home);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let agent = pull_agent_path(home);
+    std::fs::create_dir_all(agent.parent().unwrap())?;
     std::fs::create_dir_all(home.join(".local/state/provenance"))?;
-    std::fs::write(&path, pull_agent_plist(home, bin, every_secs))
-        .with_context(|| format!("writing {}", path.display()))?;
+    let plist = pull_agent_plist(home, bin, &pull_agent_path_var(home, path), every_secs);
+    std::fs::write(&agent, plist).with_context(|| format!("writing {}", agent.display()))?;
     launchctl(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
-    if !launchctl(&["bootstrap", &gui_domain(), &path.display().to_string()]) {
-        bail!("launchctl couldn't load {}", path.display());
+    if !launchctl(&["bootstrap", &gui_domain(), &agent.display().to_string()]) {
+        bail!("launchctl couldn't load {}", agent.display());
     }
     Ok(format!(
         "Replies that machine can't pass back are collected every {every_secs} seconds by the launchd agent {PULL_AGENT}."
