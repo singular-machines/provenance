@@ -3,6 +3,8 @@
 //! local rules: only the machine running a session can tell whether it's
 //! live, held in bypass mode or hosted by T3 Code. Machines are paired
 //! explicitly with `provenance peer add`; nothing is relayed further.
+//! Replies go back the same way, or are collected by the sending machine
+//! when the receiving one can't reach it (`provenance peer pull`).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +19,11 @@ use crate::sessions::Harness;
 
 /// Bumped whenever the envelope or outcome changes incompatibly.
 /// 2: `relay reply` passes replies back to the sending machine.
-pub const PROTOCOL: u32 = 2;
+/// 3: `relay collect` hands replies to a sending machine that asks.
+pub const PROTOCOL: u32 = 3;
+
+/// Most message IDs one `relay collect` asks about.
+pub const MAX_COLLECT: usize = 500;
 
 /// Largest envelope `relay` reads from stdin.
 pub const MAX_ENVELOPE: u64 = 4 * 1024 * 1024;
@@ -86,6 +92,26 @@ pub struct ReplyEnvelope {
     /// The session that answered, which the message was delivered to.
     pub replier: Sender,
     pub text: String,
+}
+
+/// Asks a machine for the replies to messages this machine relayed there,
+/// as JSON on `relay collect`'s stdin: the way back when that machine can't
+/// reach this one over SSH.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Collect {
+    pub protocol: u32,
+    /// The asking machine: replies are given only to messages from it.
+    pub from_machine: String,
+    /// The messages it is still waiting on.
+    pub ids: Vec<String>,
+}
+
+/// `relay collect`'s answer: each reply as `relay reply` would have sent it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Collected {
+    pub replies: Vec<ReplyEnvelope>,
+    /// Why nothing could be collected.
+    pub why: Option<String>,
 }
 
 /// The receiving machine's answer.
@@ -262,12 +288,25 @@ pub fn call_reply(
     exchange(peer, "reply", &serde_json::to_vec(reply)?, transport)
 }
 
-fn exchange(
+/// Collects the replies a peer holds for messages relayed there from here.
+pub fn call_collect(
+    peer: &Peer,
+    collect: &Collect,
+    transport: &Transport<'_>,
+) -> Result<Collected> {
+    let collected: Collected = exchange(peer, "collect", &serde_json::to_vec(collect)?, transport)?;
+    if let Some(why) = &collected.why {
+        bail!("machine {} refused: {why}", peer.machine);
+    }
+    Ok(collected)
+}
+
+fn exchange<T: serde::de::DeserializeOwned>(
     peer: &Peer,
     subcommand: &str,
     input: &[u8],
     transport: &Transport<'_>,
-) -> Result<Outcome> {
+) -> Result<T> {
     if peer.protocol != PROTOCOL {
         bail!(
             "machine {} was paired with relay protocol {}, this provenance {} speaks {PROTOCOL}; install the same version on both machines and pair again",
@@ -290,6 +329,16 @@ pub fn read_envelope(input: impl Read) -> Result<Envelope> {
     let envelope: Envelope = read_limited(input)?;
     check_protocol(envelope.protocol)?;
     Ok(envelope)
+}
+
+/// Reads the request `relay collect` was sent.
+pub fn read_collect(input: impl Read) -> Result<Collect> {
+    let collect: Collect = read_limited(input)?;
+    check_protocol(collect.protocol)?;
+    if collect.ids.len() > MAX_COLLECT {
+        bail!("asked about more than {MAX_COLLECT} messages at once");
+    }
+    Ok(collect)
 }
 
 /// Reads the reply `relay reply` was sent.

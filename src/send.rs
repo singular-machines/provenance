@@ -721,6 +721,9 @@ pub enum Mail {
         text: String,
         at: DateTime<Utc>,
     },
+    /// A relayed reply reached the session that sent its message. Without
+    /// it, a failed forward is retried.
+    Forwarded { id: String, at: DateTime<Utc> },
 }
 
 pub fn mail_dir(home: &Path) -> PathBuf {
@@ -747,9 +750,7 @@ pub fn mailbox(dir: &Path, harness: Harness, session_id: &str) -> PathBuf {
 /// when a reply is matched. Returns whether it was appended.
 pub fn append_new(path: &Path, mail: &Mail) -> Result<bool> {
     use std::os::fd::AsRawFd;
-    let Mail::Message { id, .. } = mail else {
-        bail!("only messages are appended by ID");
-    };
+    let (Mail::Message { id, .. } | Mail::Reply { id, .. } | Mail::Forwarded { id, .. }) = mail;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;
     }
@@ -769,7 +770,12 @@ pub fn append_new(path: &Path, mail: &Mail) -> Result<bool> {
     let taken = existing
         .lines()
         .filter_map(|l| serde_json::from_str::<Mail>(l).ok())
-        .any(|m| matches!(m, Mail::Message { id: i, .. } if i == *id));
+        .any(|m| match (&m, mail) {
+            (Mail::Message { id: i, .. }, Mail::Message { .. })
+            | (Mail::Reply { id: i, .. }, Mail::Reply { .. })
+            | (Mail::Forwarded { id: i, .. }, Mail::Forwarded { .. }) => i == id,
+            _ => false,
+        });
     if taken {
         return Ok(false);
     }
@@ -893,6 +899,148 @@ pub fn record_reply(
         },
     )?;
     Ok((sender, from_machine))
+}
+
+/// Every mailbox here, with the session it belongs to.
+fn mailboxes(dir: &Path) -> Vec<(Sender, PathBuf)> {
+    let harnesses = [
+        Harness::ClaudeCode,
+        Harness::Codex,
+        Harness::OpenCode,
+        Harness::Pi,
+    ];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".jsonl")?
+                .to_string();
+            harnesses.iter().find_map(|&harness| {
+                let h = serde_json::to_value(harness).ok()?;
+                let session_id = name.strip_prefix(&format!("{}-", h.as_str()?))?;
+                (mailbox(dir, harness, session_id) == path).then(|| {
+                    let sender = Sender {
+                        harness,
+                        session_id: session_id.to_string(),
+                    };
+                    (sender, path.clone())
+                })
+            })
+        })
+        .collect()
+}
+
+/// Messages relayed from here since `since` that have no reply yet, as
+/// (machine, message ID).
+pub fn awaiting(dir: &Path, since: DateTime<Utc>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (_, path) in mailboxes(dir) {
+        let mail = read(&path);
+        for m in &mail {
+            if let Mail::Message {
+                id,
+                to_machine: Some(machine),
+                at,
+                ..
+            } = m
+                && *at >= since
+                && !mail
+                    .iter()
+                    .any(|r| matches!(r, Mail::Reply { id: i, .. } if i == id))
+            {
+                out.push((machine.clone(), id.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Replies saved here to messages `machine` relayed here, among `ids`, as
+/// (the session that answered, message ID, its first reply).
+pub fn collectable(dir: &Path, machine: &str, ids: &[String]) -> Vec<(Sender, String, String)> {
+    let mut out = Vec::new();
+    for (session, path) in mailboxes(dir) {
+        let mail = read(&path);
+        for m in &mail {
+            if let Mail::Message {
+                id,
+                from_machine: Some(from),
+                ..
+            } = m
+                && from == machine
+                && ids.contains(id)
+                && let Some(text) = mail.iter().find_map(|r| match r {
+                    Mail::Reply { id: i, text, .. } if i == id => Some(text.clone()),
+                    _ => None,
+                })
+            {
+                out.push((session.clone(), id.clone(), text));
+            }
+        }
+    }
+    out
+}
+
+/// Replies to messages relayed from here since `since` that never reached
+/// the session that sent them, as (mailbox, the session that answered, the
+/// message, its first reply).
+pub fn unforwarded(dir: &Path, since: DateTime<Utc>) -> Vec<(PathBuf, Sender, Mail, String)> {
+    let mut out = Vec::new();
+    for (replier, path) in mailboxes(dir) {
+        let mail = read(&path);
+        for m in &mail {
+            if let Mail::Message {
+                id,
+                sender: Some(_),
+                to_machine: Some(_),
+                at,
+                ..
+            } = m
+                && *at >= since
+                && !mail
+                    .iter()
+                    .any(|f| matches!(f, Mail::Forwarded { id: i, .. } if i == id))
+                && let Some(text) = mail.iter().find_map(|r| match r {
+                    Mail::Reply { id: i, text, .. } if i == id => Some(text.clone()),
+                    _ => None,
+                })
+            {
+                out.push((path.clone(), replier.clone(), m.clone(), text));
+            }
+        }
+    }
+    out
+}
+
+pub fn forwarded(path: &Path, id: &str) -> bool {
+    read(path)
+        .iter()
+        .any(|m| matches!(m, Mail::Forwarded { id: i, .. } if i == id))
+}
+
+/// Held while a relayed reply is forwarded, so a reply passed back and one
+/// collected at the same time reach the session once.
+pub fn forward_lock(dir: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = dir.join("forward.lock");
+    std::fs::create_dir_all(dir).map_err(|e| mailbox_error(&path, e))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| mailbox_error(&path, e))?;
+    // SAFETY: flock on a descriptor this function returns; released on drop.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(mailbox_error(&path, std::io::Error::last_os_error()));
+    }
+    Ok(file)
 }
 
 /// The first reply to a message in a mailbox.

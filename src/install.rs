@@ -162,6 +162,7 @@ pub fn install(home: &Path, bin: &Path, dry_run: bool) -> Result<Vec<String>> {
 pub fn uninstall(home: &Path, dry_run: bool) -> Result<Vec<String>> {
     let p = Paths::new(home);
     let mut done = Vec::new();
+    done.extend(remove_pull_agent(home, dry_run)?);
     if git_global_get("hook.provenance.command").is_some() {
         if !dry_run {
             git_global(&["--remove-section", "hook.provenance"])?;
@@ -596,6 +597,123 @@ fn config_hooks_supported() -> bool {
 }
 
 /// Single-quote for sh.
+/// The launchd agent that runs `provenance peer pull` while machines are
+/// paired, for replies a paired machine can't pass back (macOS only).
+pub const PULL_AGENT: &str = "io.github.singular-machines.provenance.pull";
+
+pub fn pull_agent_path(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{PULL_AGENT}.plist"))
+}
+
+fn pull_agent_plist(home: &Path, bin: &Path, path: &str, every_secs: u64) -> String {
+    let xml = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let log = home.join(".local/state/provenance/pull.log");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{PULL_AGENT}</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>peer</string><string>pull</string><string>--quiet</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{}</string></dict>
+  <key>StartInterval</key><integer>{every_secs}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        xml(&bin.display().to_string()),
+        xml(path),
+        xml(&log.display().to_string()),
+        xml(&log.display().to_string()),
+    )
+}
+
+/// The PATH the pull agent runs with: `path` (the shell's that ran
+/// `peer add`, where `codex` and `t3` were found) and the usual install
+/// folders, since launchd gives agents only the system's.
+pub fn pull_agent_path_var(home: &Path, path: &str) -> String {
+    let mut dirs: Vec<String> = path
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    for d in [
+        home.join(".cargo/bin").display().to_string(),
+        home.join(".local/bin").display().to_string(),
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+        "/usr/bin".into(),
+        "/bin".into(),
+    ] {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs.join(":")
+}
+
+/// Writes and loads the pull agent, replacing any earlier one.
+pub fn install_pull_agent(home: &Path, bin: &Path, path: &str, every_secs: u64) -> Result<String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(format!(
+            "Replies that machine can't pass back are collected by `provenance peer pull`; run it every {every_secs} seconds (cron or a systemd timer) on this machine."
+        ));
+    }
+    let agent = pull_agent_path(home);
+    std::fs::create_dir_all(agent.parent().unwrap())?;
+    std::fs::create_dir_all(home.join(".local/state/provenance"))?;
+    let plist = pull_agent_plist(home, bin, &pull_agent_path_var(home, path), every_secs);
+    std::fs::write(&agent, plist).with_context(|| format!("writing {}", agent.display()))?;
+    launchctl(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
+    if !launchctl(&["bootstrap", &gui_domain(), &agent.display().to_string()]) {
+        bail!("launchctl couldn't load {}", agent.display());
+    }
+    Ok(format!(
+        "Replies that machine can't pass back are collected every {every_secs} seconds by the launchd agent {PULL_AGENT}."
+    ))
+}
+
+/// Unloads and deletes the pull agent, if there is one.
+pub fn remove_pull_agent(home: &Path, dry_run: bool) -> Result<Option<String>> {
+    let path = pull_agent_path(home);
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !dry_run {
+        launchctl(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(Some(format!(
+        "launchd: removed the agent that collects replies ({})",
+        path.display()
+    )))
+}
+
+fn gui_domain() -> String {
+    // SAFETY: getuid has no preconditions.
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+/// Runs launchctl; whether it succeeded. Never run by tests.
+fn launchctl(args: &[&str]) -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn quote(p: &Path) -> String {
     format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
 }
