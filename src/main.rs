@@ -1153,8 +1153,12 @@ fn send_remote(
                 .note
                 .into_iter()
                 .chain([format!(
-                    "It was delivered on machine {}, but this machine's copy wasn't saved: {e:#}. Don't resend it.",
-                    peer.machine
+                    "It was delivered on machine {}, but this machine's copy in {} wasn't saved ({}). Don't resend it.",
+                    peer.machine,
+                    mailbox.display(),
+                    // The root cause only: the mailbox error's own wording is
+                    // written for a failure before delivery.
+                    e.root_cause()
                 )])
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -3264,7 +3268,10 @@ mod named_tests {
     }
     /// Two "machines" in one test: `here` sends, `there` runs `relay deliver`
     /// through a transport that hands it the envelope directly.
+    /// Pins this thread's machine name too, so `PROVENANCE_MACHINE` can't
+    /// make the simulated remote look local.
     fn relay_pair() -> (PathBuf, PathBuf, relay::Peer) {
+        stamps::set_test_machine("m-here");
         let here = scratch();
         let there = scratch();
         let peer = relay::Peer {
@@ -3641,9 +3648,12 @@ mod named_tests {
         );
         std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o700)).unwrap();
         let sent = sent.unwrap();
-        let note = sent.note.unwrap();
+        let note = sent.note.clone().unwrap();
         assert!(note.contains("delivered on machine m-remote"), "{note}");
         assert!(note.contains("Don't resend it"), "{note}");
+        let report = mcp_send_text(&sent);
+        assert!(!report.contains("nothing was forwarded"), "{report}");
+        assert!(report.contains("Permission denied"), "{report}");
         assert!(received(&listener).contains("delivered anyway"));
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
