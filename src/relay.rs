@@ -185,16 +185,28 @@ pub fn ssh(destination: &str, remote_command: &str, input: &[u8]) -> Result<Vec<
     if !valid_destination(destination) {
         bail!("{destination:?} isn't an SSH destination provenance will use");
     }
-    let argv = ssh_argv(destination, remote_command);
+    run_with_input(&ssh_argv(destination, remote_command), destination, input)
+}
+
+/// Runs `argv` with `input` on its stdin. Stdin is written on its own thread
+/// so a large envelope can't deadlock against the child's output, and the
+/// child is always waited for, so its exit status and stderr explain a
+/// failure rather than the broken pipe they caused.
+fn run_with_input(argv: &[String], destination: &str, input: &[u8]) -> Result<Vec<u8>> {
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("running ssh")?;
-    child.stdin.take().unwrap().write_all(input)?;
+        .with_context(|| format!("running {}", argv[0]))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
     let out = child.wait_with_output()?;
+    let written = writer
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("the stdin writer panicked")));
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if out.status.code() == Some(255) {
@@ -205,6 +217,7 @@ pub fn ssh(destination: &str, remote_command: &str, input: &[u8]) -> Result<Vec<
             out.status
         );
     }
+    written.with_context(|| format!("sending the message to {destination}"))?;
     Ok(out.stdout)
 }
 
@@ -275,6 +288,34 @@ mod tests {
         assert_eq!(argv[argv.len() - 3], "--");
         assert_eq!(argv[argv.len() - 2], "mbp");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn an_early_exit_reports_its_stderr_not_a_broken_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("prov-ssh-{}", crate::send::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ssh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'fixture host is offline' >&2\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = vec![fake.display().to_string()];
+        let error = run_with_input(&argv, "mbp", &vec![b'x'; 1 << 20])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "couldn't reach mbp over SSH: fixture host is offline"
+        );
+        let ok = dir.join("ok");
+        std::fs::write(&ok, "#!/bin/sh\nwc -c\n").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = run_with_input(&[ok.display().to_string()], "mbp", &vec![b'x'; 1 << 20]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "1048576");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

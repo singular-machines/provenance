@@ -741,6 +741,45 @@ pub fn mailbox(dir: &Path, harness: Harness, session_id: &str) -> PathBuf {
 }
 
 /// Append one line, in one write, so concurrent writers don't interleave.
+/// Appends a message unless the mailbox already has one with its ID, holding
+/// an exclusive lock on the file while it checks. A relayed message keeps
+/// the ID its sender chose, so a repeat must not shadow an earlier message
+/// when a reply is matched. Returns whether it was appended.
+pub fn append_new(path: &Path, mail: &Mail) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    let Mail::Message { id, .. } = mail else {
+        bail!("only messages are appended by ID");
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| mailbox_error(path, e))?;
+    // SAFETY: flock on a descriptor this function owns; released on drop.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(mailbox_error(path, std::io::Error::last_os_error()));
+    }
+    let mut existing = String::new();
+    file.read_to_string(&mut existing)
+        .map_err(|e| mailbox_error(path, e))?;
+    let taken = existing
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Mail>(l).ok())
+        .any(|m| matches!(m, Mail::Message { id: i, .. } if i == *id));
+    if taken {
+        return Ok(false);
+    }
+    let mut line = serde_json::to_string(mail)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .map_err(|e| mailbox_error(path, e))?;
+    Ok(true)
+}
+
 pub fn append(path: &Path, mail: &Mail) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;

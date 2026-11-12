@@ -1113,37 +1113,59 @@ fn send_remote(
             outcome.why.as_deref().unwrap_or("refused without a reason")
         );
     }
-    let recipient = outcome.recipient.with_context(|| {
-        format!(
-            "machine {} accepted {} without naming its recipient",
-            peer.machine, envelope.id
-        )
-    })?;
-    let mailbox = send::mailbox(
-        &send::mail_dir(home),
-        recipient.harness,
-        &recipient.session_id,
-    );
-    send::append(
-        &mailbox,
-        &send::Mail::Message {
-            id: envelope.id.clone(),
-            pr,
-            named_address: None,
-            from: label(sender.as_ref()),
-            sender: sender.clone(),
-            from_machine: None,
-            to_machine: Some(peer.machine.clone()),
-            text: text.into(),
-            at: Utc::now(),
-        },
-    )?;
+    // Delivered there: from here on a local failure is reported alongside
+    // the delivery, never as if nothing was sent.
+    let (mailbox, saved) = match &outcome.recipient {
+        Some(recipient) => {
+            let mailbox = send::mailbox(
+                &send::mail_dir(home),
+                recipient.harness,
+                &recipient.session_id,
+            );
+            let saved = send::append(
+                &mailbox,
+                &send::Mail::Message {
+                    id: envelope.id.clone(),
+                    pr,
+                    named_address: None,
+                    from: label(sender.as_ref()),
+                    sender: sender.clone(),
+                    from_machine: None,
+                    to_machine: Some(peer.machine.clone()),
+                    text: text.into(),
+                    at: Utc::now(),
+                },
+            );
+            (mailbox, saved)
+        }
+        None => (
+            PathBuf::new(),
+            Err(anyhow::anyhow!(
+                "machine {} didn't name the recipient",
+                peer.machine
+            )),
+        ),
+    };
+    let note = match saved {
+        Ok(()) => outcome.note,
+        Err(e) => Some(
+            outcome
+                .note
+                .into_iter()
+                .chain([format!(
+                    "It was delivered on machine {}, but this machine's copy wasn't saved: {e:#}. Don't resend it.",
+                    peer.machine
+                )])
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    };
     Ok(Sent {
         id: envelope.id,
         to: format!("{} on machine {}", outcome.to, peer.machine),
         how: outcome.how,
         socket_write: outcome.socket_write,
-        note: outcome.note,
+        note,
         mailbox,
         output: outcome.output,
         from_session: sender.is_some(),
@@ -1207,6 +1229,9 @@ fn relay_deliver_checked(home: &std::path::Path, e: &relay::Envelope) -> Result<
         return Ok(relay::Outcome::refused(
             "missing target transcript information",
         ));
+    }
+    if let Some(why) = resume_precondition(&s, &delivery) {
+        return Ok(relay::Outcome::refused(why));
     }
     if e.dry_run {
         return Ok(relay::Outcome {
@@ -1521,6 +1546,17 @@ fn deliver_message(
     deliver_message_as(home, outgoing, text, transport, None)
 }
 
+/// Why a planned delivery can't run, found without side effects, so a relay
+/// dry run refuses exactly what delivery would.
+fn resume_precondition(s: &sessions::Sighting, delivery: &send::Delivery) -> Option<&'static str> {
+    (s.harness == sessions::Harness::Codex
+        && matches!(delivery, send::Delivery::Resume { .. })
+        && !send::codex_resume_repo(&s.cwd))
+    .then_some(
+        "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written",
+    )
+}
+
 /// A message relayed from another machine keeps the ID its sender gave it,
 /// and says which machine it came from.
 struct Relayed<'a> {
@@ -1555,13 +1591,8 @@ fn deliver_message_as(
         Some(rerouted) => rerouted,
         None => delivery,
     };
-    if s.harness == sessions::Harness::Codex
-        && matches!(delivery, send::Delivery::Resume { .. })
-        && !send::codex_resume_repo(&s.cwd)
-    {
-        anyhow::bail!(
-            "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written"
-        );
+    if let Some(why) = resume_precondition(&s, &delivery) {
+        anyhow::bail!("{why}");
     }
     let address = match &named {
         Some(n) => format!("@{} ({})", n.name, names::identity(&target)),
@@ -1572,20 +1603,28 @@ fn deliver_message_as(
         None => (send::new_id(), label(sender.as_ref()), None),
     };
     let mailbox = send::mailbox(&send::mail_dir(home), s.harness, &s.session_id);
-    send::append(
-        &mailbox,
-        &send::Mail::Message {
-            id: id.clone(),
-            pr,
-            named_address: named,
-            from: from.clone(),
-            sender: sender.clone(),
-            from_machine,
-            to_machine: None,
-            text: text.into(),
-            at: Utc::now(),
-        },
-    )?;
+    let relayed_from = from_machine.clone();
+    let mail = send::Mail::Message {
+        id: id.clone(),
+        pr,
+        named_address: named,
+        from: from.clone(),
+        sender: sender.clone(),
+        from_machine,
+        to_machine: None,
+        text: text.into(),
+        at: Utc::now(),
+    };
+    match relayed_from {
+        Some(machine) => {
+            if !send::append_new(&mailbox, &mail)? {
+                anyhow::bail!(
+                    "message ID {id} from machine {machine} is already in this session's mailbox; nothing was delivered"
+                );
+            }
+        }
+        None => send::append(&mailbox, &mail)?,
+    }
     let output = transport(
         &delivery,
         &id,
@@ -3476,6 +3515,7 @@ mod named_tests {
     }
     #[test]
     fn pairing_checks_the_machine_and_protocol_before_saving() {
+        stamps::set_test_machine("m-here");
         let home = scratch();
         let answer = std::cell::RefCell::new(String::new());
         let transport = |destination: &str, command: &str, _: &[u8]| -> Result<Vec<u8>> {
@@ -3494,15 +3534,13 @@ mod named_tests {
                 .to_string()
                 .contains("protocol")
         );
-        if let Some(me) = stamps::machine_name() {
-            *answer.borrow_mut() = hello(relay::PROTOCOL, &me);
-            assert!(
-                peer_add(&home, "mbp", None, &transport)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("is this machine")
-            );
-        }
+        *answer.borrow_mut() = hello(relay::PROTOCOL, "m-here");
+        assert!(
+            peer_add(&home, "mbp", None, &transport)
+                .unwrap_err()
+                .to_string()
+                .contains("is this machine")
+        );
         *answer.borrow_mut() = hello(relay::PROTOCOL, "bad name!");
         assert!(peer_add(&home, "mbp", None, &transport).is_err());
         assert!(peer_add(&home, "-oProxyCommand=x", None, &transport).is_err());
@@ -3518,6 +3556,141 @@ mod named_tests {
         assert_eq!(peers.len(), 1, "pairing again replaces");
         assert_eq!(peers[0].bin, "/u/.cargo/bin/provenance");
         std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn a_relayed_id_already_in_the_mailbox_is_refused_and_not_delivered() {
+        stamps::set_test_machine("m-here");
+        let (here, there, _) = relay_pair();
+        let (r, listener) = listening_target(&there);
+        listener.set_nonblocking(true).unwrap();
+        let local_sender = send::Sender {
+            harness: Harness::Codex,
+            session_id: "local-sender".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&there), r.harness, &r.session_id);
+        send::append(
+            &mailbox,
+            &send::Mail::Message {
+                id: "m-0000000000aa".into(),
+                pr: None,
+                named_address: None,
+                from: "local".into(),
+                sender: Some(local_sender.clone()),
+                from_machine: None,
+                to_machine: None,
+                text: "earlier".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let envelope = relay::Envelope {
+            protocol: relay::PROTOCOL,
+            id: "m-0000000000aa".into(),
+            target: relay::Target::Name {
+                name: "Socket Target".into(),
+            },
+            pr: None,
+            from_machine: "m-elsewhere".into(),
+            sender: None,
+            text: "reused".into(),
+            resume: false,
+            dry_run: false,
+        };
+        let outcome = relay_deliver(&there, &envelope);
+        assert!(!outcome.accepted);
+        assert!(
+            outcome
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("already in this session's mailbox"),
+            "{outcome:?}"
+        );
+        assert!(listener.accept().is_err(), "nothing reached the session");
+        assert_eq!(send::read(&mailbox).len(), 1);
+        let me = send::Sender {
+            harness: r.harness,
+            session_id: r.session_id.clone(),
+        };
+        assert_eq!(
+            send::record_reply(&send::mail_dir(&there), Some(&me), "m-0000000000aa", "ok").unwrap(),
+            (Some(local_sender), None),
+            "the earlier local message still owns the ID"
+        );
+        std::fs::remove_file(listener.local_addr().unwrap().as_pathname().unwrap()).unwrap();
+        std::fs::remove_dir_all(here).unwrap();
+        std::fs::remove_dir_all(there).unwrap();
+    }
+    #[test]
+    fn a_delivery_whose_local_copy_fails_is_still_reported_as_delivered() {
+        use std::os::unix::fs::PermissionsExt;
+        stamps::set_test_machine("m-here");
+        let (here, there, _) = relay_pair();
+        let (_, listener) = listening_target(&there);
+        let mail = send::mail_dir(&here);
+        std::fs::create_dir_all(&mail).unwrap();
+        std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let sent = send_message_via(
+            &here,
+            "@Socket Target@m-remote",
+            "delivered anyway",
+            false,
+            send::Caller::Mcp,
+            &to_machine(&there, &seen),
+        );
+        std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sent = sent.unwrap();
+        let note = sent.note.unwrap();
+        assert!(note.contains("delivered on machine m-remote"), "{note}");
+        assert!(note.contains("Don't resend it"), "{note}");
+        assert!(received(&listener).contains("delivered anyway"));
+        std::fs::remove_dir_all(here).unwrap();
+        std::fs::remove_dir_all(there).unwrap();
+    }
+    #[test]
+    fn a_dry_run_refuses_a_codex_resume_that_delivery_would_refuse() {
+        stamps::set_test_machine("m-here");
+        let there = scratch();
+        let pid = std::process::id();
+        let (_, started, _) = live::ps_info(pid).unwrap();
+        let mut r = record("codex-ended", Harness::Codex, pid, &started);
+        r.last_event = "SessionEnd".into();
+        r.cwd = there.display().to_string();
+        let transcript = there.join("rollout.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        r.transcript_path = Some(transcript.display().to_string());
+        let dir = live::live_dir(&there);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("codex.json"), serde_json::to_vec(&r).unwrap()).unwrap();
+        let envelope = |dry_run| relay::Envelope {
+            protocol: relay::PROTOCOL,
+            id: "m-0000000000bb".into(),
+            target: relay::Target::Session {
+                harness: Harness::Codex,
+                session_id: "codex-ended".into(),
+            },
+            pr: None,
+            from_machine: "m-elsewhere".into(),
+            sender: None,
+            text: "hi".into(),
+            resume: true,
+            dry_run,
+        };
+        for dry_run in [true, false] {
+            let outcome = relay_deliver(&there, &envelope(dry_run));
+            assert!(!outcome.accepted, "dry_run={dry_run}: {outcome:?}");
+            assert!(
+                outcome
+                    .why
+                    .as_deref()
+                    .unwrap()
+                    .contains("requires a git repository"),
+                "dry_run={dry_run}: {outcome:?}"
+            );
+        }
+        assert!(!send::mail_dir(&there).exists());
+        std::fs::remove_dir_all(there).unwrap();
     }
     #[test]
     fn remote_addresses_parse_from_the_last_at() {
