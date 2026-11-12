@@ -1113,6 +1113,21 @@ fn send_remote(
         resume,
         dry_run: false,
     };
+    let message = send::Mail::Message {
+        id: envelope.id.clone(),
+        pr,
+        named_address: None,
+        from: label(sender.as_ref()),
+        sender: sender.clone(),
+        from_machine: None,
+        to_machine: Some(peer.machine.clone()),
+        text: text.into(),
+        at: Utc::now(),
+    };
+    // That machine may answer before this call returns (a resumed turn
+    // replies synchronously), so the message is held for `relay reply`
+    // until the recipient is known.
+    let _held = send::Relaying::hold(&send::mail_dir(home), &message)?;
     let outcome = relay::call(peer, &envelope, transport)?;
     if !outcome.accepted {
         anyhow::bail!(
@@ -1129,20 +1144,8 @@ fn send_remote(
                 recipient.harness,
                 &recipient.session_id,
             );
-            let saved = send::append(
-                &mailbox,
-                &send::Mail::Message {
-                    id: envelope.id.clone(),
-                    pr,
-                    named_address: None,
-                    from: label(sender.as_ref()),
-                    sender: sender.clone(),
-                    from_machine: None,
-                    to_machine: Some(peer.machine.clone()),
-                    text: text.into(),
-                    at: Utc::now(),
-                },
-            );
+            // Already there if its reply came back first.
+            let saved = send::append_new(&mailbox, &message).map(|_| ());
             (mailbox, saved)
         }
         None => (
@@ -1191,11 +1194,12 @@ fn relay_deliver(home: &std::path::Path, envelope: &relay::Envelope) -> relay::O
         .unwrap_or_else(|e| relay::Outcome::refused(format!("{e:#}")))
 }
 
+fn valid_relayed_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 fn relay_deliver_checked(home: &std::path::Path, e: &relay::Envelope) -> Result<relay::Outcome> {
-    if e.id.is_empty()
-        || e.id.len() > 64
-        || !e.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    if !valid_relayed_id(&e.id) {
         anyhow::bail!("relayed message ID {:?} is malformed", e.id);
     }
     if !stamps::valid_alias(&e.from_machine) {
@@ -1884,30 +1888,43 @@ fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Resu
     if !stamps::valid_alias(&r.from_machine) {
         anyhow::bail!("reply names an unusable machine");
     }
-    let mailbox = send::mailbox(
-        &send::mail_dir(home),
-        r.replier.harness,
-        &r.replier.session_id,
-    );
-    let Some(send::Mail::Message {
-        to_machine: Some(to_machine),
-        sender,
-        ..
-    }) = send::find_message(&mailbox, &r.id)
-    else {
-        anyhow::bail!(
+    if !valid_relayed_id(&r.id) {
+        anyhow::bail!("reply names a malformed message ID {:?}", r.id);
+    }
+    let dir = send::mail_dir(home);
+    let mailbox = send::mailbox(&dir, r.replier.harness, &r.replier.session_id);
+    // A reply that beats the relay call's return finds the held message;
+    // the replier is then its recipient, as that machine resolved it.
+    let message = send::find_message(&mailbox, &r.id).or_else(|| {
+        let held = send::Relaying::find(&dir, &r.id)?;
+        matches!(&held, send::Mail::Message { to_machine: Some(m), .. } if *m == r.from_machine)
+            .then_some(held)
+    });
+    let refused = || {
+        anyhow::anyhow!(
             "no message {} was relayed from here to {}",
             r.id,
             names::identity(&r.replier)
-        );
+        )
     };
-    if to_machine != r.from_machine {
+    let message = message.ok_or_else(refused)?;
+    let send::Mail::Message {
+        to_machine: Some(to_machine),
+        sender,
+        ..
+    } = &message
+    else {
+        return Err(refused());
+    };
+    if *to_machine != r.from_machine {
         anyhow::bail!(
             "message {} was relayed to machine {to_machine}, not {}",
             r.id,
             r.from_machine
         );
     }
+    let sender = sender.clone();
+    send::append_new(&mailbox, &message)?;
     send::append(
         &mailbox,
         &send::Mail::Reply {
@@ -3524,6 +3541,18 @@ mod named_tests {
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
     }
+    /// Every file under `dir`.
+    fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => walkdir(&e.path()),
+                _ => vec![e.path()],
+            })
+            .collect()
+    }
     #[test]
     fn remote_refusals_unpaired_machines_and_force_send_nothing() {
         let (here, there, _) = relay_pair();
@@ -3569,7 +3598,9 @@ mod named_tests {
         .to_string();
         assert!(error.contains("--force isn't relayed"), "{error}");
         assert_eq!(seen.borrow().len(), 1);
-        assert!(!send::mail_dir(&here).exists());
+        // Nothing kept here: at most the empty folder for held messages.
+        let files: Vec<_> = walkdir(&send::mail_dir(&here));
+        assert!(files.is_empty(), "{files:?}");
         assert!(!send::mail_dir(&there).exists());
         drop(transport);
         std::fs::remove_dir_all(here).unwrap();
@@ -3781,17 +3812,38 @@ mod named_tests {
         let (_, listener) = listening_target(&there);
         let mail = send::mail_dir(&here);
         std::fs::create_dir_all(&mail).unwrap();
-        std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mode = |m| std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(m)).unwrap();
         let seen = std::cell::RefCell::new(Vec::new());
+        let deliver = to_machine(&there, &seen);
+        // Unwritable before sending: refused, and nothing goes.
+        mode(0o500);
+        let refused = send_message_via(
+            &here,
+            "@Socket Target@m-remote",
+            "never sent",
+            false,
+            send::Caller::Mcp,
+            &deliver,
+        );
+        assert!(format!("{:#}", refused.err().unwrap()).contains("Permission denied"));
+        assert!(seen.borrow().is_empty());
+        // Unwritable once that machine has it: reported as delivered.
+        mode(0o700);
+        let late = |destination: &str, command: &str, input: &[u8]| {
+            let out = deliver(destination, command, input);
+            mode(0o500);
+            out
+        };
         let sent = send_message_via(
             &here,
             "@Socket Target@m-remote",
             "delivered anyway",
             false,
             send::Caller::Mcp,
-            &to_machine(&there, &seen),
+            &late,
         );
-        std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o700)).unwrap();
+        mode(0o700);
+        drop(deliver);
         let sent = sent.unwrap();
         let note = sent.note.clone().unwrap();
         assert!(note.contains("delivered on machine m-remote"), "{note}");
@@ -3926,6 +3978,88 @@ mod named_tests {
         let mut sent = sent;
         sent.from_session = true;
         assert!(mcp_send_text(&sent).contains("comes back here"));
+        std::fs::remove_dir_all(here).unwrap();
+        std::fs::remove_dir_all(there).unwrap();
+    }
+    #[test]
+    fn a_reply_written_before_the_relay_call_returns_still_comes_back() {
+        let (here, there, _) = relay_pair();
+        pair_back(&there);
+        let (r, listener) = listening_target(&there);
+        let me = send::Sender {
+            harness: r.harness,
+            session_id: r.session_id.clone(),
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let deliver = to_machine(&there, &seen);
+        let replied = std::cell::RefCell::new(String::new());
+        // Like a resumed turn: the recipient answers inside `relay deliver`.
+        let transport = |destination: &str, command: &str, input: &[u8]| {
+            let out = deliver(destination, command, input)?;
+            received(&listener);
+            stamps::set_test_machine("m-remote");
+            let id = seen.borrow()[0].id.clone();
+            *replied.borrow_mut() = reply_recorded(
+                &there,
+                &live::load_records(&there),
+                Some(&me),
+                &id,
+                "early pong",
+                &to_sender(&here),
+            )?;
+            stamps::set_test_machine("m-here");
+            Ok(out)
+        };
+        let sent = send_message_via(
+            &here,
+            "@Socket Target@m-remote",
+            "ping",
+            false,
+            send::Caller::Cli { force: false },
+            &transport,
+        )
+        .unwrap();
+        drop(deliver);
+        let replied = replied.into_inner();
+        assert!(
+            replied.contains("saved for the terminal that sent it"),
+            "{replied}"
+        );
+        assert_eq!(sent.note, None, "the sender's copy is saved once");
+        assert_eq!(
+            send::reply_to(&sent.mailbox, &sent.id).as_deref(),
+            Some("early pong")
+        );
+        let ours = send::read(&sent.mailbox);
+        assert_eq!(ours.len(), 2, "one message, one reply: {ours:?}");
+        // Held only during the call: afterwards only the recipient's copy matches.
+        assert!(
+            !send::mail_dir(&here)
+                .join("relaying")
+                .join(format!("{}.json", sent.id))
+                .exists()
+        );
+        let other = relay::ReplyEnvelope {
+            protocol: relay::PROTOCOL,
+            id: sent.id.clone(),
+            from_machine: "m-remote".into(),
+            replier: send::Sender {
+                harness: Harness::Codex,
+                session_id: "another".into(),
+            },
+            text: "late".into(),
+        };
+        assert!(!relay_reply(&here, &other).accepted);
+        let traversal = relay::ReplyEnvelope {
+            id: "../x".into(),
+            ..other
+        };
+        assert!(
+            relay_reply(&here, &traversal)
+                .why
+                .unwrap()
+                .contains("malformed")
+        );
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
     }

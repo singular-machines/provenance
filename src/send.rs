@@ -816,6 +816,45 @@ pub fn read(path: &Path) -> Vec<Mail> {
 }
 
 /// The message with this ID in one mailbox.
+/// A message being relayed to another machine, held only until that machine
+/// answers with its recipient, so a reply written before then still matches.
+pub struct Relaying(PathBuf);
+
+impl Relaying {
+    fn path(dir: &Path, id: &str) -> PathBuf {
+        dir.join("relaying").join(format!("{id}.json"))
+    }
+
+    pub fn hold(dir: &Path, mail: &Mail) -> Result<Self> {
+        let Mail::Message { id, .. } = mail else {
+            bail!("only messages are relayed");
+        };
+        let path = Self::path(dir, id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| mailbox_error(&path, e))?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(&serde_json::to_vec(mail)?))
+            .map_err(|e| mailbox_error(&path, e))?;
+        Ok(Self(path))
+    }
+
+    /// The held message `id`, while its relay call is still running. The
+    /// caller validates `id` first: it names a file.
+    pub fn find(dir: &Path, id: &str) -> Option<Mail> {
+        serde_json::from_slice(&std::fs::read(Self::path(dir, id)).ok()?).ok()
+    }
+}
+
+impl Drop for Relaying {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub fn find_message(path: &Path, id: &str) -> Option<Mail> {
     read(path)
         .into_iter()
