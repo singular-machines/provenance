@@ -113,12 +113,22 @@ pub fn innermost(
 /// `PROVENANCE_MACHINE`, the `provenance.machine` global git setting (an
 /// alias, or the random ID stored there), else a new random ID, saved there.
 pub fn machine_name() -> Option<String> {
+    #[cfg(test)]
+    if let Some(m) = TEST_MACHINE.with(|m| m.borrow().clone()) {
+        return Some(m);
+    }
     if let Some(m) = std::env::var("PROVENANCE_MACHINE")
         .ok()
         .filter(|m| valid_alias(m))
     {
         return Some(m);
     }
+    stored_machine()
+}
+
+/// The machine name kept in global git config, created on first use.
+#[cfg(not(test))]
+fn stored_machine() -> Option<String> {
     if let Some(m) = configured_machine().filter(|m| valid_alias(m)) {
         return Some(m);
     }
@@ -128,7 +138,27 @@ pub fn machine_name() -> Option<String> {
     Some(id)
 }
 
-pub fn configured_machine() -> Option<String> {
+/// Tests never read or write the user's git config for this.
+#[cfg(test)]
+fn stored_machine() -> Option<String> {
+    Some("m-test-here".into())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MACHINE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes `machine_name` report `name` on this test's thread, whatever
+/// `PROVENANCE_MACHINE` says.
+#[cfg(test)]
+pub fn set_test_machine(name: &str) {
+    TEST_MACHINE.with(|m| *m.borrow_mut() = Some(name.into()));
+}
+
+#[cfg(not(test))]
+fn configured_machine() -> Option<String> {
     let out = Command::new("git")
         .args(["config", "--global", "--get", "provenance.machine"])
         .output()

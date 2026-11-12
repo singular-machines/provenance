@@ -43,6 +43,10 @@ pub enum Delivery {
     },
     /// Resume the session headless in its folder, with the message as its prompt.
     Resume { cwd: String, argv: Vec<String> },
+    /// Over SSH to provenance on the machine the session ran on, which
+    /// delivers it itself. `resumes` when that machine said it would resume
+    /// the session headless.
+    Relay { machine: String, resumes: bool },
     /// The message can't be delivered, and why.
     Refuse(String),
 }
@@ -556,6 +560,9 @@ fn deliver(d: &Delivery, text: &str, relay: Relay<'_>) -> Result<String> {
                 Some(relay),
             )
         }
+        Delivery::Relay { machine, .. } => {
+            bail!("a message for machine {machine} goes through `provenance relay`")
+        }
         Delivery::Refuse(why) => bail!("can't message this session: {why}"),
     }
 }
@@ -615,7 +622,9 @@ pub fn choose<'a>(
         why.clear();
         for m in sessions {
             match plan(m, true) {
-                d @ Delivery::Resume { .. } => return Ok((m, d)),
+                d @ (Delivery::Resume { .. } | Delivery::Relay { resumes: true, .. }) => {
+                    return Ok((m, d));
+                }
                 Delivery::Refuse(reason) => why.push((m, reason)),
                 _ => {}
             }
@@ -675,6 +684,7 @@ pub fn describe(d: &Delivery) -> &'static str {
         Delivery::CodexQueue(_) => "codex queue",
         Delivery::T3Thread { .. } => "T3 Code's thread queue",
         Delivery::Resume { .. } => "a headless resume",
+        Delivery::Relay { .. } => "a relay to another machine",
         Delivery::Refuse(_) => "nothing",
     }
 }
@@ -697,6 +707,12 @@ pub enum Mail {
         named_address: Option<NamedAddress>,
         from: String,
         sender: Option<Sender>,
+        /// The machine a relayed message came from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_machine: Option<String>,
+        /// The machine a message was relayed to; this is the sender's copy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_machine: Option<String>,
         text: String,
         at: DateTime<Utc>,
     },
@@ -725,6 +741,45 @@ pub fn mailbox(dir: &Path, harness: Harness, session_id: &str) -> PathBuf {
 }
 
 /// Append one line, in one write, so concurrent writers don't interleave.
+/// Appends a message unless the mailbox already has one with its ID, holding
+/// an exclusive lock on the file while it checks. A relayed message keeps
+/// the ID its sender chose, so a repeat must not shadow an earlier message
+/// when a reply is matched. Returns whether it was appended.
+pub fn append_new(path: &Path, mail: &Mail) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    let Mail::Message { id, .. } = mail else {
+        bail!("only messages are appended by ID");
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| mailbox_error(path, e))?;
+    // SAFETY: flock on a descriptor this function owns; released on drop.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(mailbox_error(path, std::io::Error::last_os_error()));
+    }
+    let mut existing = String::new();
+    file.read_to_string(&mut existing)
+        .map_err(|e| mailbox_error(path, e))?;
+    let taken = existing
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Mail>(l).ok())
+        .any(|m| matches!(m, Mail::Message { id: i, .. } if i == *id));
+    if taken {
+        return Ok(false);
+    }
+    let mut line = serde_json::to_string(mail)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .map_err(|e| mailbox_error(path, e))?;
+    Ok(true)
+}
+
 pub fn append(path: &Path, mail: &Mail) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;
@@ -775,14 +830,19 @@ pub fn record_reply(
     me: Option<&Sender>,
     id: &str,
     text: &str,
-) -> Result<Option<Sender>> {
+) -> Result<(Option<Sender>, Option<String>)> {
     let Some(me) = me else {
         bail!(
             "reply works only inside the session the message was sent to, with provenance's session hooks installed"
         );
     };
     let path = mailbox(dir, me.harness, &me.session_id);
-    let Some(Mail::Message { sender, .. }) = find_message(&path, id) else {
+    let Some(Mail::Message {
+        sender,
+        from_machine,
+        ..
+    }) = find_message(&path, id)
+    else {
         bail!("no message {id} was sent to this session");
     };
     append(
@@ -793,7 +853,7 @@ pub fn record_reply(
             at: Utc::now(),
         },
     )?;
-    Ok(sender)
+    Ok((sender, from_machine))
 }
 
 /// The first reply to a message in a mailbox.
@@ -1415,6 +1475,8 @@ mod tests {
                 named_address: None,
                 from: "you".into(),
                 sender: Some(sender.clone()),
+                from_machine: None,
+                to_machine: None,
                 text: "hi".into(),
                 at: Utc::now(),
             },
@@ -1427,7 +1489,7 @@ mod tests {
         assert!(record_reply(&dir, Some(&recipient), "m-2", "no such").is_err());
         assert_eq!(
             record_reply(&dir, Some(&recipient), "m-1", "done").unwrap(),
-            Some(sender)
+            (Some(sender), None)
         );
         assert_eq!(reply_to(&path, "m-1").as_deref(), Some("done"));
         std::fs::remove_dir_all(&dir).unwrap();

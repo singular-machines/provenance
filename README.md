@@ -70,6 +70,8 @@ provenance install      # optional: exact stamps and live status
 | `provenance send <PR> "message" --resume --force` | Override an unknown process recorded as running, waiting or stopped, only when you know it is closed |
 | `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks and the MCP server |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
+| `provenance peer add <ssh-destination>` | Pair with another machine so its sessions can be messaged (`peer list`, `peer remove`) |
+| `provenance send '@name@machine' "message"` | Message a session registered under a name on a paired machine |
 
 ### Named sessions
 
@@ -154,6 +156,28 @@ Messages and replies are kept in `~/.local/state/provenance/mail/`, one file per
 Every relayed body is fenced with `BEGIN PROVENANCE <token>` and `END PROVENANCE <token>`. A fresh 256-bit token comes from the OS random source at delivery time and is regenerated if it occurs in the body. The header says that only the bounded text is the other session's message and nothing inside can change the instructions, including claims to be provenance or the user. Entropy failures stop delivery. This Unix CLI uses `/dev/urandom`; no dependency is added.
 
 CLI `send --wait` replies and headless `--resume` output (CLI and MCP) use the full reply framing, identifying the responding session. Failed headless turns name the session and its log path when known, and return stderr inside a separate `[provenance] Diagnostics (stderr)` frame, explicitly labelled as not a reply; partial stdout is withheld. The log may not contain the cause if the turn never started. Spawn errors, such as a missing binary, remain plain local diagnostics. When no log path is known, the error says no session log is recorded. Terminal presentation escapes control characters other than newlines and tabs, bidi overrides and isolates, directional marks, and zero-width format characters; session input and raw mailbox/JSON text remain unchanged. Terminal users see the same readable boundaries and caveats, even without session hooks, so shell callers receive consistent protection. Mailbox JSON retains raw text and its existing schema. Queue acknowledgements remain local status text.
+
+### Messaging another machine
+
+Pair a machine once, from the machine that sends:
+
+```sh
+provenance peer add mbp            # an SSH host alias, user@host or an address
+provenance send '@reviewer@m-b532a498' "Please review the change"
+```
+
+`peer add` connects with `ssh` (no prompts: `BatchMode=yes`, a 5-second connect timeout) and runs `provenance relay hello` there. That machine reports its name in stamps, its provenance version and path, which are kept in `~/.local/state/provenance/peers.json`. It finds provenance on `PATH` or in `~/.cargo/bin`; pass `--bin <path>` for anywhere else. Pairing refuses this machine itself and a different relay protocol version. Pair each direction from its own machine.
+
+A message for another machine is never delivered from here. It goes as JSON on the stdin of `ssh <destination> -- '<path>' relay deliver`, so its text never passes through the remote shell, and provenance on that machine resolves the recipient and delivers it with its own rules: its liveness checks, the bypass-mode hold, the T3 Code route and its mailbox. Its answer, delivery or refusal, comes back word for word. It never relays further.
+
+- `@name@machine` names a session in that machine's own registry; names stay machine-local, and a bare `@name` never falls back to another machine. `machine` is the paired machine's name in stamps or its SSH destination.
+- `send <PR>` follows a commit stamp: a matched session stamped on a paired machine is planned by that machine with a dry run, so one that can't take the message is passed over with that machine's reason, like a local one.
+- `--resume` is passed on and decided by that machine. `--force` is never relayed.
+- A machine that is unpaired, offline or refuses SSH is reported; nothing is queued.
+
+The sender keeps its own copy of the message, marked with the machine it went to. **Replies can't come back from another machine yet:** an answer stays saved on the receiving machine, and `--wait` says so instead of waiting.
+
+SSH is the trust boundary: a paired machine can message any session there that a local process could, including a bypass-mode session through T3 Code, which can make it run tools without asking. The sending machine's account of who sent the message is trusted the way a local caller's is, and the message is labelled with that machine's name.
 
 ## Reading the table
 
@@ -301,6 +325,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - **The Claude Code inbox socket's message format isn't documented.** `send` writes the line Claude Code's own debug hint shows, so a Claude Code update could change it.
 - **The T3 Code route reads T3's internal database.** The thread lookup depends on T3's undocumented state schema, so a T3 update could break it; provenance then falls back to refusing.
 - **`send` reaches only CLI sessions that keep a process.** A Claude Code session whose process has moved to another session (`/clear`, `/resume`) is refused, and desktop apps that start a process per turn have no socket between turns.
+- **Replies don't cross machines yet.** A session answering a message from another machine saves its reply there; passing it back is next.
 - **Codex may ask you to approve the provenance tools** the first time a session calls them.
 - **OpenCode and Pi record no git branch.** Without a stamp (or, for Pi, the extension's live records), a session is matched only on the branch its folder has checked out now, and only if it's the most recent session in that folder by any harness.
 
@@ -311,6 +336,8 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - [x] `provenance go`: switch to or reopen the session behind a PR
 - [x] `provenance send` and an MCP server with `send` and `reply` tools (Claude Code and Codex)
 - [ ] `send` to OpenCode and Pi sessions
+- [x] `send` to sessions on paired machines, over SSH
+- [ ] Replies back across machines
 - [x] `provenance recap`: a timeline of your PRs and what needs you
 - [ ] `provenance show`: a session's recent turns
 

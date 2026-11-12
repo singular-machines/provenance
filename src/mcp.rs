@@ -94,7 +94,7 @@ fn tool_list() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type":"string", "description":"Registered session name, e.g. PR Reviewer; mutually exclusive with pr"},
+                    "name": {"type":"string", "description":"Registered session name, e.g. PR Reviewer, or name@machine for a paired machine, e.g. PR Reviewer@mbp; mutually exclusive with pr"},
                     "pr": {"type": "string", "description": "PR number in this folder's repository, owner/name#number, or PR URL"},
                     "text": {"type": "string", "description": "The message"},
                     "resume": {"type": "boolean", "description": "Resume headless if no live process is known, the folder is known, and an unknown process is not recorded as running, waiting or stopped. No force override. Default false."}
