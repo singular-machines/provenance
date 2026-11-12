@@ -1127,7 +1127,7 @@ fn send_remote(
     // That machine may answer before this call returns (a resumed turn
     // replies synchronously), so the message is held for `relay reply`
     // until the recipient is known.
-    let _held = send::Relaying::hold(&send::mail_dir(home), &message)?;
+    let held = send::Relaying::hold(&send::mail_dir(home), &message)?;
     let outcome = relay::call(peer, &envelope, transport)?;
     if !outcome.accepted {
         anyhow::bail!(
@@ -1144,7 +1144,8 @@ fn send_remote(
                 recipient.harness,
                 &recipient.session_id,
             );
-            // Already there if its reply came back first.
+            // Already there if its reply came back first. Saved before the
+            // hold is dropped: `relayed_message` relies on that order.
             let saved = send::append_new(&mailbox, &message).map(|_| ());
             (mailbox, saved)
         }
@@ -1156,6 +1157,7 @@ fn send_remote(
             )),
         ),
     };
+    drop(held);
     let note = match saved {
         Ok(()) => outcome.note,
         Err(e) => Some(
@@ -1884,6 +1886,25 @@ fn relay_reply(home: &std::path::Path, reply: &relay::ReplyEnvelope) -> relay::O
     relay_reply_checked(home, reply).unwrap_or_else(|e| relay::Outcome::refused(format!("{e:#}")))
 }
 
+/// The message `r` answers: held while its relay call runs, then in the
+/// replier's mailbox. A reply that beats the call's return finds the held
+/// message; the replier is then its recipient, as that machine resolved it.
+/// The hold is read first: `send_remote` saves the mailbox copy before it
+/// drops the hold, so a hold already gone means the copy is there.
+/// `between` runs between the two reads, for tests.
+fn relayed_message(
+    dir: &std::path::Path,
+    mailbox: &std::path::Path,
+    r: &relay::ReplyEnvelope,
+    between: impl FnOnce(),
+) -> Option<send::Mail> {
+    let held = send::Relaying::find(dir, &r.id).filter(|held| {
+        matches!(held, send::Mail::Message { to_machine: Some(m), .. } if *m == r.from_machine)
+    });
+    between();
+    held.or_else(|| send::find_message(mailbox, &r.id))
+}
+
 fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Result<relay::Outcome> {
     if !stamps::valid_alias(&r.from_machine) {
         anyhow::bail!("reply names an unusable machine");
@@ -1893,13 +1914,7 @@ fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Resu
     }
     let dir = send::mail_dir(home);
     let mailbox = send::mailbox(&dir, r.replier.harness, &r.replier.session_id);
-    // A reply that beats the relay call's return finds the held message;
-    // the replier is then its recipient, as that machine resolved it.
-    let message = send::find_message(&mailbox, &r.id).or_else(|| {
-        let held = send::Relaying::find(&dir, &r.id)?;
-        matches!(&held, send::Mail::Message { to_machine: Some(m), .. } if *m == r.from_machine)
-            .then_some(held)
-    });
+    let message = relayed_message(&dir, &mailbox, r, || {});
     let refused = || {
         anyhow::anyhow!(
             "no message {} was relayed from here to {}",
@@ -4062,6 +4077,55 @@ mod named_tests {
         );
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
+    }
+    #[test]
+    fn a_reply_during_the_hold_to_mailbox_handover_still_matches() {
+        stamps::set_test_machine("m-here");
+        let here = scratch();
+        let dir = send::mail_dir(&here);
+        let replier = send::Sender {
+            harness: Harness::ClaudeCode,
+            session_id: "remote-session".into(),
+        };
+        let mailbox = send::mailbox(&dir, replier.harness, &replier.session_id);
+        let message = |id: &str| send::Mail::Message {
+            id: id.into(),
+            pr: None,
+            named_address: None,
+            from: "me".into(),
+            sender: None,
+            from_machine: None,
+            to_machine: Some("m-remote".into()),
+            text: "question".into(),
+            at: Utc::now(),
+        };
+        let reply = |id: &str| relay::ReplyEnvelope {
+            protocol: relay::PROTOCOL,
+            id: id.into(),
+            from_machine: "m-remote".into(),
+            replier: replier.clone(),
+            text: "answer".into(),
+        };
+        // The handover lands between the two reads, in either state the
+        // first read can see.
+        let held = send::Relaying::hold(&dir, &message("m-0000000000a1")).unwrap();
+        let found = relayed_message(&dir, &mailbox, &reply("m-0000000000a1"), || {
+            send::append_new(&mailbox, &message("m-0000000000a1")).unwrap();
+            drop(held);
+        });
+        assert!(found.is_some(), "held at the first read");
+        let held = send::Relaying::hold(&dir, &message("m-0000000000a2")).unwrap();
+        send::append_new(&mailbox, &message("m-0000000000a2")).unwrap();
+        drop(held);
+        assert!(relayed_message(&dir, &mailbox, &reply("m-0000000000a2"), || {}).is_some());
+        // A hold for another machine never matches.
+        let _held = send::Relaying::hold(&dir, &message("m-0000000000a3")).unwrap();
+        let other = relay::ReplyEnvelope {
+            from_machine: "m-other".into(),
+            ..reply("m-0000000000a3")
+        };
+        assert!(relayed_message(&dir, &mailbox, &other, || {}).is_none());
+        std::fs::remove_dir_all(here).unwrap();
     }
     #[test]
     fn a_passed_back_reply_reaches_the_live_session_that_sent_it() {
