@@ -70,7 +70,7 @@ provenance install      # optional: exact stamps and live status
 | `provenance send <PR> "message" --resume --force` | Override an unknown process recorded as running, waiting or stopped, only when you know it is closed |
 | `provenance install` / `uninstall` | Add or remove the commit-stamp and session hooks and the MCP server |
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
-| `provenance peer add <ssh-destination>` | Pair with another machine so its sessions can be messaged (`peer list`, `peer remove`) |
+| `provenance peer add <ssh-destination>` | Pair with another machine so its sessions can be messaged (`peer list`, `peer remove`, `peer pull`) |
 | `provenance send '@name@machine' "message"` | Message a session registered under a name on a paired machine |
 
 ### Named sessions
@@ -178,6 +178,8 @@ A message for another machine is never delivered from here. It goes as JSON on t
 The sender keeps its own copy of the message, marked with the machine it went to.
 
 A reply goes back the same way, if the receiving machine has the sending machine paired too: `reply` saves it on the receiving machine, then runs `provenance relay reply` on the sending machine over SSH. That machine accepts it only for a message it relayed to that machine, saves it next to its copy, and passes it to the session that sent it, or leaves it for the terminal that sent it, where `send --wait` picks it up. Without the reverse pairing, or when that machine is offline, the reply stays saved where it was written, and `reply` says so.
+
+When the receiving machine can't reach the sending one at all (for example, SSH is off on the sending machine), the sending machine collects the reply instead. `provenance peer pull` asks each paired machine, over the same SSH, for replies to messages relayed there in the last 24 hours that are still unanswered here; a machine with nothing awaited isn't contacted. `provenance relay collect` there returns only replies to messages that came from the asking machine, and each one is accepted here exactly as a passed-back reply would be. A reply that arrives both ways is delivered once. `send --wait` pulls every few seconds while it waits. On macOS, `peer add` also loads a launchd agent (`io.github.singular-machines.provenance.pull`, in `~/Library/LaunchAgents`) that runs `peer pull --quiet` every 30 seconds, logging collected replies to `~/.local/state/provenance/pull.log`; removing the last peer or `provenance uninstall` removes it. Elsewhere, run `provenance peer pull` from cron or a timer. Messages still go only from a machine that can reach the other: a machine that can't reach this one can't start a conversation with it.
 
 SSH is the trust boundary: a paired machine can message any session there that a local process could, including a bypass-mode session through T3 Code, which can make it run tools without asking. The sending machine's account of who sent the message is trusted the way a local caller's is, and the message is labelled with that machine's name.
 

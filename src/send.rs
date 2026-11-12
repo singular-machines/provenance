@@ -747,9 +747,7 @@ pub fn mailbox(dir: &Path, harness: Harness, session_id: &str) -> PathBuf {
 /// when a reply is matched. Returns whether it was appended.
 pub fn append_new(path: &Path, mail: &Mail) -> Result<bool> {
     use std::os::fd::AsRawFd;
-    let Mail::Message { id, .. } = mail else {
-        bail!("only messages are appended by ID");
-    };
+    let (Mail::Message { id, .. } | Mail::Reply { id, .. }) = mail;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| mailbox_error(path, e))?;
     }
@@ -769,7 +767,11 @@ pub fn append_new(path: &Path, mail: &Mail) -> Result<bool> {
     let taken = existing
         .lines()
         .filter_map(|l| serde_json::from_str::<Mail>(l).ok())
-        .any(|m| matches!(m, Mail::Message { id: i, .. } if i == *id));
+        .any(|m| match (&m, mail) {
+            (Mail::Message { id: i, .. }, Mail::Message { .. })
+            | (Mail::Reply { id: i, .. }, Mail::Reply { .. }) => i == id,
+            _ => false,
+        });
     if taken {
         return Ok(false);
     }
@@ -893,6 +895,92 @@ pub fn record_reply(
         },
     )?;
     Ok((sender, from_machine))
+}
+
+/// Every mailbox here, with the session it belongs to.
+fn mailboxes(dir: &Path) -> Vec<(Sender, PathBuf)> {
+    let harnesses = [
+        Harness::ClaudeCode,
+        Harness::Codex,
+        Harness::OpenCode,
+        Harness::Pi,
+    ];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".jsonl")?
+                .to_string();
+            harnesses.iter().find_map(|&harness| {
+                let h = serde_json::to_value(harness).ok()?;
+                let session_id = name.strip_prefix(&format!("{}-", h.as_str()?))?;
+                (mailbox(dir, harness, session_id) == path).then(|| {
+                    let sender = Sender {
+                        harness,
+                        session_id: session_id.to_string(),
+                    };
+                    (sender, path.clone())
+                })
+            })
+        })
+        .collect()
+}
+
+/// Messages relayed from here since `since` that have no reply yet, as
+/// (machine, message ID).
+pub fn awaiting(dir: &Path, since: DateTime<Utc>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (_, path) in mailboxes(dir) {
+        let mail = read(&path);
+        for m in &mail {
+            if let Mail::Message {
+                id,
+                to_machine: Some(machine),
+                at,
+                ..
+            } = m
+                && *at >= since
+                && !mail
+                    .iter()
+                    .any(|r| matches!(r, Mail::Reply { id: i, .. } if i == id))
+            {
+                out.push((machine.clone(), id.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Replies saved here to messages `machine` relayed here, among `ids`, as
+/// (the session that answered, message ID, its first reply).
+pub fn collectable(dir: &Path, machine: &str, ids: &[String]) -> Vec<(Sender, String, String)> {
+    let mut out = Vec::new();
+    for (session, path) in mailboxes(dir) {
+        let mail = read(&path);
+        for m in &mail {
+            if let Mail::Message {
+                id,
+                from_machine: Some(from),
+                ..
+            } = m
+                && from == machine
+                && ids.contains(id)
+                && let Some(text) = mail.iter().find_map(|r| match r {
+                    Mail::Reply { id: i, text, .. } if i == id => Some(text.clone()),
+                    _ => None,
+                })
+            {
+                out.push((session.clone(), id.clone(), text));
+            }
+        }
+    }
+    out
 }
 
 /// The first reply to a message in a mailbox.
