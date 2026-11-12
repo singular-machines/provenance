@@ -175,7 +175,9 @@ A message for another machine is never delivered from here. It goes as JSON on t
 - `--resume` is passed on and decided by that machine. `--force` is never relayed.
 - A machine that is unpaired, offline or refuses SSH is reported; nothing is queued.
 
-The sender keeps its own copy of the message, marked with the machine it went to. **Replies can't come back from another machine yet:** an answer stays saved on the receiving machine, and `--wait` says so instead of waiting.
+The sender keeps its own copy of the message, marked with the machine it went to.
+
+A reply goes back the same way, if the receiving machine has the sending machine paired too: `reply` saves it on the receiving machine, then runs `provenance relay reply` on the sending machine over SSH. That machine accepts it only for a message it relayed to that machine, saves it next to its copy, and passes it to the session that sent it, or leaves it for the terminal that sent it, where `send --wait` picks it up. Without the reverse pairing, or when that machine is offline, the reply stays saved where it was written, and `reply` says so.
 
 SSH is the trust boundary: a paired machine can message any session there that a local process could, including a bypass-mode session through T3 Code, which can make it run tools without asking. The sending machine's account of who sent the message is trusted the way a local caller's is, and the message is labelled with that machine's name.
 
@@ -325,7 +327,6 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - **The Claude Code inbox socket's message format isn't documented.** `send` writes the line Claude Code's own debug hint shows, so a Claude Code update could change it.
 - **The T3 Code route reads T3's internal database.** The thread lookup depends on T3's undocumented state schema, so a T3 update could break it; provenance then falls back to refusing.
 - **`send` reaches only CLI sessions that keep a process.** A Claude Code session whose process has moved to another session (`/clear`, `/resume`) is refused, and desktop apps that start a process per turn have no socket between turns.
-- **Replies don't cross machines yet.** A session answering a message from another machine saves its reply there; passing it back is next.
 - **Codex may ask you to approve the provenance tools** the first time a session calls them.
 - **OpenCode and Pi record no git branch.** Without a stamp (or, for Pi, the extension's live records), a session is matched only on the branch its folder has checked out now, and only if it's the most recent session in that folder by any harness.
 
@@ -337,7 +338,7 @@ Caches live in `~/.cache/provenance/`, and deleting that folder is always safe.
 - [x] `provenance send` and an MCP server with `send` and `reply` tools (Claude Code and Codex)
 - [ ] `send` to OpenCode and Pi sessions
 - [x] `send` to sessions on paired machines, over SSH
-- [ ] Replies back across machines
+- [x] Replies back across machines
 - [x] `provenance recap`: a timeline of your PRs and what needs you
 - [ ] `provenance show`: a session's recent turns
 

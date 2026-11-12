@@ -16,7 +16,8 @@ use crate::send::Sender;
 use crate::sessions::Harness;
 
 /// Bumped whenever the envelope or outcome changes incompatibly.
-pub const PROTOCOL: u32 = 1;
+/// 2: `relay reply` passes replies back to the sending machine.
+pub const PROTOCOL: u32 = 2;
 
 /// Largest envelope `relay` reads from stdin.
 pub const MAX_ENVELOPE: u64 = 4 * 1024 * 1024;
@@ -71,6 +72,20 @@ pub struct Envelope {
     pub resume: bool,
     /// Only say whether it could be delivered; record and send nothing.
     pub dry_run: bool,
+}
+
+/// A reply passed back to the machine a relayed message came from, as JSON
+/// on `relay reply`'s stdin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplyEnvelope {
+    pub protocol: u32,
+    /// The relayed message's ID.
+    pub id: String,
+    /// The machine the reply comes from: where the message was delivered.
+    pub from_machine: String,
+    /// The session that answered, which the message was delivered to.
+    pub replier: Sender,
+    pub text: String,
 }
 
 /// The receiving machine's answer.
@@ -235,11 +250,33 @@ pub fn hello(destination: &str, bin: Option<&str>, transport: &Transport<'_>) ->
 
 /// Sends one envelope to a peer and returns its outcome.
 pub fn call(peer: &Peer, envelope: &Envelope, transport: &Transport<'_>) -> Result<Outcome> {
-    let out = transport(
-        &peer.ssh,
-        &remote_command(&peer.bin, "deliver"),
-        &serde_json::to_vec(envelope)?,
-    )?;
+    exchange(peer, "deliver", &serde_json::to_vec(envelope)?, transport)
+}
+
+/// Passes a reply back to the peer its message came from.
+pub fn call_reply(
+    peer: &Peer,
+    reply: &ReplyEnvelope,
+    transport: &Transport<'_>,
+) -> Result<Outcome> {
+    exchange(peer, "reply", &serde_json::to_vec(reply)?, transport)
+}
+
+fn exchange(
+    peer: &Peer,
+    subcommand: &str,
+    input: &[u8],
+    transport: &Transport<'_>,
+) -> Result<Outcome> {
+    if peer.protocol != PROTOCOL {
+        bail!(
+            "machine {} was paired with relay protocol {}, this provenance {} speaks {PROTOCOL}; install the same version on both machines and pair again",
+            peer.machine,
+            peer.protocol,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    let out = transport(&peer.ssh, &remote_command(&peer.bin, subcommand), input)?;
     serde_json::from_slice(&out).with_context(|| {
         format!(
             "unexpected answer from provenance on machine {}",
@@ -250,21 +287,35 @@ pub fn call(peer: &Peer, envelope: &Envelope, transport: &Transport<'_>) -> Resu
 
 /// Reads the envelope `relay deliver` was sent.
 pub fn read_envelope(input: impl Read) -> Result<Envelope> {
+    let envelope: Envelope = read_limited(input)?;
+    check_protocol(envelope.protocol)?;
+    Ok(envelope)
+}
+
+/// Reads the reply `relay reply` was sent.
+pub fn read_reply(input: impl Read) -> Result<ReplyEnvelope> {
+    let reply: ReplyEnvelope = read_limited(input)?;
+    check_protocol(reply.protocol)?;
+    Ok(reply)
+}
+
+fn read_limited<T: serde::de::DeserializeOwned>(input: impl Read) -> Result<T> {
     let mut bytes = Vec::new();
     input.take(MAX_ENVELOPE + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_ENVELOPE {
         bail!("relayed message is larger than {MAX_ENVELOPE} bytes");
     }
-    let envelope: Envelope =
-        serde_json::from_slice(&bytes).context("reading the relayed message")?;
-    if envelope.protocol != PROTOCOL {
+    serde_json::from_slice(&bytes).context("reading the relayed message")
+}
+
+fn check_protocol(protocol: u32) -> Result<()> {
+    if protocol != PROTOCOL {
         bail!(
-            "relay protocol {} isn't supported by provenance {} here (protocol {PROTOCOL}); install the same version on both machines",
-            envelope.protocol,
+            "relay protocol {protocol} isn't supported by provenance {} here (protocol {PROTOCOL}); install the same version on both machines",
             env!("CARGO_PKG_VERSION")
         );
     }
-    Ok(envelope)
+    Ok(())
 }
 
 #[cfg(test)]

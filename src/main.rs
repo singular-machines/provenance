@@ -194,6 +194,7 @@ enum PeerCmd {
 enum RelayAction {
     Hello,
     Deliver,
+    Reply,
 }
 
 impl Cmd {
@@ -350,6 +351,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                 RelayAction::Deliver => {
                     serde_json::to_string(&match relay::read_envelope(std::io::stdin().lock()) {
                         Ok(envelope) => relay_deliver(&home, &envelope),
+                        Err(e) => relay::Outcome::refused(format!("{e:#}")),
+                    })?
+                }
+                RelayAction::Reply => {
+                    serde_json::to_string(&match relay::read_reply(std::io::stdin().lock()) {
+                        Ok(reply) => relay_reply(&home, &reply),
                         Err(e) => relay::Outcome::refused(format!("{e:#}")),
                     })?
                 }
@@ -1723,17 +1730,20 @@ fn send_cmd_output(
     let Some(secs) = wait else {
         return Ok(());
     };
-    if let Some(machine) = &sent.relayed_to {
-        writeln!(out, "{} Not waiting.", relayed_reply_note(machine))?;
-        return Ok(());
-    }
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
         if cli_waited_reply(&sent, out)? {
             return Ok(());
         }
         if std::time::Instant::now() >= end {
-            anyhow::bail!("no reply to {} after {secs}s", sent.id);
+            match &sent.relayed_to {
+                Some(machine) => anyhow::bail!(
+                    "no reply to {} after {secs}s. {}",
+                    sent.id,
+                    relayed_reply_note(machine)
+                ),
+                None => anyhow::bail!("no reply to {} after {secs}s", sent.id),
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -1743,18 +1753,86 @@ fn send_cmd_output(
 fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String> {
     let records = live::load_records(home);
     let me = checked_sender(&records)?;
-    let (sender, from_machine) = send::record_reply(&send::mail_dir(home), me.as_ref(), id, text)?;
+    reply_recorded(home, &records, me.as_ref(), id, text, &relay::ssh)
+}
+
+fn reply_recorded(
+    home: &std::path::Path,
+    records: &[live::Record],
+    me: Option<&send::Sender>,
+    id: &str,
+    text: &str,
+    transport: &relay::Transport<'_>,
+) -> Result<String> {
+    let (sender, from_machine) = send::record_reply(&send::mail_dir(home), me, id, text)?;
     if let Some(machine) = from_machine {
-        return Ok(format!(
-            "Reply to {id} saved on this machine. The message came from machine {machine}; passing replies back to another machine isn't supported yet."
-        ));
+        // record_reply only succeeds for the session the message went to.
+        let me = me.context("reply has no identified session")?;
+        return Ok(reply_back(home, &machine, me, id, text, transport));
     }
     let Some(to) = sender else {
         return Ok(format!(
             "Reply to {id} saved for the terminal that sent it."
         ));
     };
-    let alive = live::alive_pids(&records);
+    forward_reply(home, records, &to, id, &label(me), text)
+}
+
+/// Pass a reply back to the paired machine its message came from. The reply
+/// is already saved here, so every failure is reported, never raised.
+fn reply_back(
+    home: &std::path::Path,
+    machine: &str,
+    me: &send::Sender,
+    id: &str,
+    text: &str,
+    transport: &relay::Transport<'_>,
+) -> String {
+    let peer = match relay::load(home).map(|peers| relay::find(&peers, machine).cloned()) {
+        Ok(Some(peer)) => peer,
+        Ok(None) => {
+            return format!(
+                "Reply to {id} saved here, but machine {machine} isn't paired from this machine, so it can't go back; pair it with `provenance peer add <ssh-destination>`."
+            );
+        }
+        Err(e) => {
+            return format!(
+                "Reply to {id} saved here, but the paired machines couldn't be read: {e:#}."
+            );
+        }
+    };
+    let Some(here) = stamps::machine_name() else {
+        return format!("Reply to {id} saved here, but this machine has no name to send it from.");
+    };
+    let reply = relay::ReplyEnvelope {
+        protocol: relay::PROTOCOL,
+        id: id.into(),
+        from_machine: here,
+        replier: me.clone(),
+        text: text.into(),
+    };
+    match relay::call_reply(&peer, &reply, transport) {
+        Ok(o) if o.accepted => format!("Reply to {id} passed back to machine {machine}: {}", o.how),
+        Ok(o) => format!(
+            "Reply to {id} saved here, but machine {machine} refused it: {}",
+            o.why.as_deref().unwrap_or("no reason given")
+        ),
+        Err(e) => format!(
+            "Reply to {id} saved here, but it couldn't be passed back to machine {machine}: {e:#}"
+        ),
+    }
+}
+
+/// Deliver a recorded reply to the local session that sent the message.
+fn forward_reply(
+    home: &std::path::Path,
+    records: &[live::Record],
+    to: &send::Sender,
+    id: &str,
+    from: &str,
+    text: &str,
+) -> Result<String> {
+    let alive = live::alive_pids(records);
     let route = records
         .iter()
         .find(|r| r.harness == to.harness && r.session_id == to.session_id)
@@ -1769,35 +1847,94 @@ fn reply_message(home: &std::path::Path, id: &str, text: &str) -> Result<String>
     let Some(route) = route else {
         return Ok(format!(
             "Reply to {id} saved, but {} isn't running to receive it.",
-            label(Some(&to))
+            label(Some(to))
         ));
     };
-    let route = match send::bypass_route(home, &to, &route) {
+    let route = match send::bypass_route(home, to, &route) {
         Some(send::Delivery::Refuse(why)) => {
             return Ok(format!("Reply to {id} saved, but not forwarded: {why}."));
         }
         Some(rerouted) => rerouted,
         None => route,
     };
-    send::deliver_reply(&route, id, &label(me.as_ref()), text)?;
+    send::deliver_reply(&route, id, from, text)?;
     if matches!(route, send::Delivery::ClaudeSocket(_)) {
         Ok(format!(
             "Reply to {id} was written to the inbox socket for {}. Receipt is not confirmed.",
-            label(Some(&to))
+            label(Some(to))
         ))
     } else if matches!(route, send::Delivery::CodexQueue(_)) {
         Ok(format!(
             "Reply to {id} queued for {}. Receipt is not confirmed. The session must read the queue in a turn to act on it.",
-            label(Some(&to))
+            label(Some(to))
         ))
     } else {
-        Ok(format!("Reply to {id} sent to {}.", label(Some(&to))))
+        Ok(format!("Reply to {id} sent to {}.", label(Some(to))))
     }
+}
+
+/// `relay reply` on the machine a relayed message came from: accept a reply
+/// only to a message this machine relayed to that exact session on that
+/// machine, save it with the sender's copy, and pass it to the sender.
+fn relay_reply(home: &std::path::Path, reply: &relay::ReplyEnvelope) -> relay::Outcome {
+    relay_reply_checked(home, reply).unwrap_or_else(|e| relay::Outcome::refused(format!("{e:#}")))
+}
+
+fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Result<relay::Outcome> {
+    if !stamps::valid_alias(&r.from_machine) {
+        anyhow::bail!("reply names an unusable machine");
+    }
+    let mailbox = send::mailbox(
+        &send::mail_dir(home),
+        r.replier.harness,
+        &r.replier.session_id,
+    );
+    let Some(send::Mail::Message {
+        to_machine: Some(to_machine),
+        sender,
+        ..
+    }) = send::find_message(&mailbox, &r.id)
+    else {
+        anyhow::bail!(
+            "no message {} was relayed from here to {}",
+            r.id,
+            names::identity(&r.replier)
+        );
+    };
+    if to_machine != r.from_machine {
+        anyhow::bail!(
+            "message {} was relayed to machine {to_machine}, not {}",
+            r.id,
+            r.from_machine
+        );
+    }
+    send::append(
+        &mailbox,
+        &send::Mail::Reply {
+            id: r.id.clone(),
+            text: r.text.clone(),
+            at: Utc::now(),
+        },
+    )?;
+    let how = match sender {
+        None => "saved for the terminal that sent it".to_string(),
+        Some(to) => {
+            let from = format!("{} on machine {}", label(Some(&r.replier)), r.from_machine);
+            let records = live::load_records(home);
+            forward_reply(home, &records, &to, &r.id, &from, &r.text)
+                .unwrap_or_else(|e| format!("saved, but not forwarded: {e:#}"))
+        }
+    };
+    Ok(relay::Outcome {
+        accepted: true,
+        how,
+        ..relay::Outcome::default()
+    })
 }
 
 fn relayed_reply_note(machine: &str) -> String {
     format!(
-        "Replies can't come back from machine {machine} yet; an answer stays saved on that machine."
+        "A reply comes back only if machine {machine} has this machine paired (`provenance peer add` there); otherwise it stays saved on that machine."
     )
 }
 
@@ -1807,8 +1944,11 @@ fn mcp_send_text(sent: &Sent) -> String {
         out.push_str(&format!("\n{note}"));
     }
     let relayed;
-    out.push_str(if let Some(machine) = &sent.relayed_to {
-            relayed = format!("\n\n{}", relayed_reply_note(machine));
+    out.push_str(if let Some(machine) = sent.relayed_to.as_ref().filter(|_| sent.from_session) {
+            relayed = format!(
+                "\n\nIf the target answers, its reply comes back here as a \"[provenance] Reply\" message. {}",
+                relayed_reply_note(machine)
+            );
             &relayed
         } else if sent.from_session && (sent.socket_write || sent.how == "codex queue") {
             "\n\nIf the target receives and answers this message, its reply can arrive here as a \"[provenance] Reply\" message."
@@ -3375,7 +3515,12 @@ mod named_tests {
             send::record_reply(&send::mail_dir(&there), Some(&me), &sent.id, "pong").unwrap(),
             (None, Some(envelope.from_machine.clone()))
         );
-        assert!(mcp_send_text(&sent).contains("Replies can't come back from machine m-remote yet"));
+        let mut sent = sent;
+        sent.from_session = true;
+        assert!(
+            mcp_send_text(&sent)
+                .contains("A reply comes back only if machine m-remote has this machine paired")
+        );
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
     }
@@ -3700,6 +3845,246 @@ mod named_tests {
             );
         }
         assert!(!send::mail_dir(&there).exists());
+        std::fs::remove_dir_all(there).unwrap();
+    }
+    /// The way back: `there` passes a reply to `here` through a transport
+    /// that hands `relay reply` the envelope directly.
+    fn to_sender<'a>(
+        here: &'a std::path::Path,
+    ) -> impl Fn(&str, &str, &[u8]) -> Result<Vec<u8>> + 'a {
+        move |destination, command, input| {
+            assert_eq!(destination, "back");
+            assert_eq!(command, "'/here/bin/provenance' relay reply");
+            let reply = relay::read_reply(input)?;
+            Ok(serde_json::to_vec(&relay_reply(here, &reply))?)
+        }
+    }
+    fn pair_back(there: &std::path::Path) {
+        relay::save(
+            there,
+            &[relay::Peer {
+                machine: "m-here".into(),
+                ssh: "back".into(),
+                bin: "/here/bin/provenance".into(),
+                version: "0.4.0".into(),
+                protocol: relay::PROTOCOL,
+                added_at: Utc::now(),
+            }],
+        )
+        .unwrap();
+    }
+    #[test]
+    fn a_reply_goes_back_to_the_sending_machine_where_wait_finds_it() {
+        let (here, there, _) = relay_pair();
+        pair_back(&there);
+        let (r, listener) = listening_target(&there);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let sent = send_message_via(
+            &here,
+            "@Socket Target@m-remote",
+            "ping",
+            false,
+            send::Caller::Mcp,
+            &to_machine(&there, &seen),
+        )
+        .unwrap();
+        received(&listener);
+        assert_eq!(send::reply_to(&sent.mailbox, &sent.id), None);
+        // Now act as the machine that received it.
+        stamps::set_test_machine("m-remote");
+        let me = send::Sender {
+            harness: r.harness,
+            session_id: r.session_id.clone(),
+        };
+        let status = reply_recorded(
+            &there,
+            &live::load_records(&there),
+            Some(&me),
+            &sent.id,
+            "pong",
+            &to_sender(&here),
+        )
+        .unwrap();
+        assert!(
+            status.starts_with(&format!(
+                "Reply to {} passed back to machine m-here",
+                sent.id
+            )),
+            "{status}"
+        );
+        assert!(
+            status.contains("saved for the terminal that sent it"),
+            "{status}"
+        );
+        assert_eq!(
+            send::reply_to(&sent.mailbox, &sent.id).as_deref(),
+            Some("pong")
+        );
+        let mut out = Vec::new();
+        assert!(cli_waited_reply(&sent, &mut out).unwrap());
+        assert!(String::from_utf8(out).unwrap().contains("pong"));
+        let mut sent = sent;
+        sent.from_session = true;
+        assert!(mcp_send_text(&sent).contains("comes back here"));
+        std::fs::remove_dir_all(here).unwrap();
+        std::fs::remove_dir_all(there).unwrap();
+    }
+    #[test]
+    fn a_passed_back_reply_reaches_the_live_session_that_sent_it() {
+        stamps::set_test_machine("m-here");
+        let here = scratch();
+        let (sender, listener) = listening_target(&here);
+        let replier = send::Sender {
+            harness: Harness::Codex,
+            session_id: "remote-codex".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&here), replier.harness, &replier.session_id);
+        let sender = send::Sender {
+            harness: sender.harness,
+            session_id: sender.session_id.clone(),
+        };
+        send::append(
+            &mailbox,
+            &send::Mail::Message {
+                id: "m-0000000000cc".into(),
+                pr: None,
+                named_address: None,
+                from: "me".into(),
+                sender: Some(sender),
+                from_machine: None,
+                to_machine: Some("m-remote".into()),
+                text: "question".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let reply = |id: &str, machine: &str| relay::ReplyEnvelope {
+            protocol: relay::PROTOCOL,
+            id: id.into(),
+            from_machine: machine.into(),
+            replier: replier.clone(),
+            text: "the answer".into(),
+        };
+        let outcome = relay_reply(&here, &reply("m-0000000000cc", "m-remote"));
+        assert!(outcome.accepted, "{outcome:?}");
+        assert!(
+            outcome.how.contains("written to the inbox socket"),
+            "{outcome:?}"
+        );
+        let line = received(&listener);
+        assert!(line.contains("the answer"));
+        assert!(
+            line.contains("Codex session remote-codex on machine m-remote"),
+            "{line}"
+        );
+        // Only a message relayed from here to that session on that machine.
+        for (id, machine, why) in [
+            (
+                "m-0000000000dd",
+                "m-remote",
+                "no message m-0000000000dd was relayed from here",
+            ),
+            (
+                "m-0000000000cc",
+                "m-other",
+                "was relayed to machine m-remote, not m-other",
+            ),
+        ] {
+            let outcome = relay_reply(&here, &reply(id, machine));
+            assert!(!outcome.accepted);
+            assert!(outcome.why.as_deref().unwrap().contains(why), "{outcome:?}");
+        }
+        assert_eq!(send::read(&mailbox).len(), 2, "one message, one reply");
+        std::fs::remove_dir_all(here).unwrap();
+    }
+    #[test]
+    fn a_reply_to_a_local_message_cannot_be_injected_from_another_machine() {
+        stamps::set_test_machine("m-here");
+        let here = scratch();
+        let session = send::Sender {
+            harness: Harness::Codex,
+            session_id: "local-codex".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&here), session.harness, &session.session_id);
+        send::append(
+            &mailbox,
+            &send::Mail::Message {
+                id: "m-0000000000ee".into(),
+                pr: None,
+                named_address: None,
+                from: "local".into(),
+                sender: None,
+                from_machine: None,
+                to_machine: None,
+                text: "local question".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let outcome = relay_reply(
+            &here,
+            &relay::ReplyEnvelope {
+                protocol: relay::PROTOCOL,
+                id: "m-0000000000ee".into(),
+                from_machine: "m-remote".into(),
+                replier: session,
+                text: "forged".into(),
+            },
+        );
+        assert!(!outcome.accepted);
+        assert_eq!(send::reply_to(&mailbox, "m-0000000000ee"), None);
+        std::fs::remove_dir_all(here).unwrap();
+    }
+    #[test]
+    fn a_reply_to_an_unpaired_or_older_machine_stays_saved_and_says_why() {
+        let (here, there, _) = relay_pair();
+        let (r, _listener) = listening_target(&there);
+        let me = send::Sender {
+            harness: r.harness,
+            session_id: r.session_id.clone(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&there), me.harness, &me.session_id);
+        for id in ["m-0000000000f1", "m-0000000000f2"] {
+            send::append(
+                &mailbox,
+                &send::Mail::Message {
+                    id: id.into(),
+                    pr: None,
+                    named_address: None,
+                    from: "elsewhere".into(),
+                    sender: None,
+                    from_machine: Some("m-here".into()),
+                    to_machine: None,
+                    text: "q".into(),
+                    at: Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+        let never = |_: &str, _: &str, _: &[u8]| -> Result<Vec<u8>> { panic!("no transport") };
+        let records = live::load_records(&there);
+        let status =
+            reply_recorded(&there, &records, Some(&me), "m-0000000000f1", "a", &never).unwrap();
+        assert!(
+            status.contains("machine m-here isn't paired from this machine"),
+            "{status}"
+        );
+        pair_back(&there);
+        let mut peers = relay::load(&there).unwrap();
+        peers[0].protocol = relay::PROTOCOL - 1;
+        relay::save(&there, &peers).unwrap();
+        let status =
+            reply_recorded(&there, &records, Some(&me), "m-0000000000f2", "b", &never).unwrap();
+        assert!(status.contains("pair again"), "{status}");
+        assert_eq!(
+            send::reply_to(&mailbox, "m-0000000000f1").as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            send::reply_to(&mailbox, "m-0000000000f2").as_deref(),
+            Some("b")
+        );
+        std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
     }
     #[test]
