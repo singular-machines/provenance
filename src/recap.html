@@ -122,6 +122,7 @@ const fresh=e=>e.group==="needs-you"&&!e.old_ask;
 const sessionKey=e=>e.agent?`${e.agent.harness}/${e.agent.session_id}`:"";
 let win=D.days>1?"window":"today",grp="pr",showQuiet=false;
 // A page opened an hour or more after it was made says so: its status is old.
+// Its title says "Today" only on the day it was made.
 const STALE=OPENED-NOW>=H,DAYNAME=`${DN[NOW.getDay()]} ${NOW.getDate()} ${MN[NOW.getMonth()]}`;
 // Sections whose full list is shown: "old" (asks), "done", "open", "quiet".
 const expanded=new Set();
@@ -150,13 +151,13 @@ function statusText(e){
 }
 function render(){
   const list=rows(),[A,B]=range(list),X=t=>Math.max(0,Math.min(1,(t-A)/(B-A)))*100;
-  document.getElementById("title").textContent=win==="window"?D.label:STALE&&!sameDay(OPENED,NOW)?DAYNAME:`Today (${DAYNAME})`;
+  document.getElementById("title").textContent=win==="window"?D.label:sameDay(OPENED,NOW)?`Today (${DAYNAME})`:DAYNAME;
   const all=E.filter(inWindow),n=f=>all.filter(f).length,quiet=n(e=>e.group==="quiet"),asks=n(fresh);
   document.getElementById("sum").innerHTML=
     (STALE?`<span class="chip snap">Snapshot from ${esc(hm(NOW))}, ${esc(dur(NOW,OPENED))} old · run <code>provenance recap --html</code> again</span>`:"")+
     `<span class="chip"><b>${all.length}</b> PRs</span>`+
     [["merged",e=>e.state==="merged"],["closed",e=>e.state==="closed"],["open",e=>e.state==="open"]].filter(([,f])=>n(f)).map(([w,f])=>`<span class="chip"><b>${n(f)}</b> ${w}</span>`).join("")+
-    (asks?`<span class="chip needs">⚑ <b>${asks}</b> need${asks===1?"s":""} you</span>`:n(e=>e.old_ask)?`<span class="chip ok">✓ Nothing new needs you</span>`:"")+
+    (asks?`<span class="chip needs">⚑ <b>${asks}</b> need${asks===1?"s":""} you</span>`:`<span class="chip ok">✓ Nothing new needs you</span>`)+
     (quiet?`<button class="chip quiet" id="quiet">${showQuiet?"Hide":"Show"} ${quiet} gone quiet (no activity for ${esc(D.stale_days)}+ days)</button>`:"");
   const chart=document.getElementById("chart");
   if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;return}
