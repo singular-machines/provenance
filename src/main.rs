@@ -4037,7 +4037,12 @@ exit {status}
         home: &std::path::Path,
     ) -> (live::Record, std::os::unix::net::UnixListener) {
         let (r, _) = socket_target_with_id(home, None, "e4217d94-c60f-4ad7-9b6b-1b7b52976ea4");
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             home.join(format!(".claude/sessions/{}.json", r.pid.unwrap())),
