@@ -347,8 +347,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 HarnessArg::Codex => Harness::Codex,
                 HarnessArg::Pi => Harness::Pi,
             };
-            let home = home()?;
-            live::run_hook(h, &home);
+            match home() {
+                Ok(home) => live::run_hook(h, &home),
+                Err(error) => eprintln!("provenance hook skipped: {error:#}"),
+            }
             Ok(())
         }
         Cmd::UpdateCheck => {
@@ -384,6 +386,66 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             println!("{out}");
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod hook_config_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn invalid_hook_configuration_skips_without_failing_harness() {
+        const CHILD: &str = "PROVENANCE_HOOK_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cli = Cli::try_parse_from(["provenance", "hook", "codex"]).unwrap();
+            assert!(dispatch(cli).is_ok());
+            return;
+        }
+
+        for missing_home in [false, true] {
+            let suffix = send::new_id();
+            let home = std::env::temp_dir().join(format!("prov-hook-home-{suffix}"));
+            std::fs::create_dir_all(&home).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "hook_config_tests::invalid_hook_configuration_skips_without_failing_harness",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            if missing_home {
+                command
+                    .env_remove("HOME")
+                    .env_remove("PROVENANCE_STATE_DIR")
+                    .env_remove("PROVENANCE_STATE_TEST_USE_ENV");
+            } else {
+                command
+                    .env("HOME", &home)
+                    .env("PROVENANCE_STATE_DIR", "relative")
+                    .env("PROVENANCE_STATE_TEST_USE_ENV", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("provenance hook skipped"), "{stderr}");
+            if missing_home {
+                assert!(stderr.contains("HOME is not set"), "{stderr}");
+            } else {
+                assert!(
+                    stderr.contains("PROVENANCE_STATE_DIR must be an absolute path"),
+                    "{stderr}"
+                );
+                assert!(!home.join(".local/state/provenance").exists());
+            }
+            std::fs::remove_dir_all(home).unwrap();
         }
     }
 }
