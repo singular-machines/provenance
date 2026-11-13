@@ -21,6 +21,7 @@ h1{font-size:18px;margin:0 6px 0 0}
 .mix{display:flex;gap:3px;height:10px;margin-bottom:7px}
 .mix i{min-width:4px;border-radius:3px;background:var(--c)}
 .mix i.idle{height:0;margin-top:4px;border-radius:0;background:none;border-top:3px dotted var(--open)}
+.mix i.old,.keys .k.old::before{background:color-mix(in srgb,var(--needs) 40%,transparent)}
 .mix i.quiet{background:repeating-linear-gradient(45deg,color-mix(in srgb,var(--open) 45%,transparent) 0 3px,transparent 3px 6px);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--open) 60%,transparent)}
 .keys{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:12px}
 .keys b{color:var(--fg);font-variant-numeric:tabular-nums}
@@ -189,12 +190,13 @@ function render(){
   document.getElementById("status").innerHTML=
     (STALE?`<span class="chip snap">Snapshot from ${esc(hm(NOW))}, ${esc(dur(NOW,OPENED))} old · run <code>provenance recap --html</code> again</span>`:"")+
     (asks?`<span class="chip needs">⚑ <b>${asks}</b> need${asks===1?"s":""} you</span>`:`<span class="chip ok">✓ Nothing new needs you</span>`);
-  // Old asks don't need you, so they count by how long they've been idle.
-  const cat=e=>e.c?e.state:e.group==="quiet"?"quiet":fresh(e)?"needs":moving(e)?"moving":idle(e)<DAY?"stalled":"idle";
-  const parts=[["merged","merged","merged"],["closed","closed","closed"],["needs","need you","needs"],["moving","moving","running"],
+  // One part per section, so each count matches what the chart lists: old
+  // asks have their own part, as they fold away under Needs you.
+  const cat=e=>e.c?e.state:e.group==="quiet"?"quiet":e.old_ask?"old":fresh(e)?"needs":moving(e)?"moving":idle(e)<DAY?"stalled":"idle";
+  const parts=[["merged","merged","merged"],["closed","closed","closed"],["needs","need you","needs"],["old","older asks","old"],["moving","moving","running"],
     ["stalled","stalled","open"],["idle","idle","idle"],["quiet","gone quiet","quiet"]].map(([id,w,cls])=>[id,w,cls,n(e=>cat(e)===id)]).filter(p=>p[3]);
   document.getElementById("sum").innerHTML=all.length?`<div class="mix" aria-hidden="true">${parts.map(([id,w,cls,c])=>`<i class="${cls}" style="flex:${c} 0 0" title="${c} ${w}"></i>`).join("")}</div>`+
-    `<div class="keys"><span><b>${all.length}</b> PRs</span>${parts.map(([id,w,cls,c])=>`<span class="k ${cls}"><b>${c}</b> ${w}${id==="quiet"?`${showQuiet?"":", hidden"}<button id="quiet">${showQuiet?"Hide":"Show"}</button>`:""}</span>`).join("")}</div>`:"";
+    `<div class="keys"><span><b>${all.length}</b> PRs</span>${parts.map(([id,w,cls,c])=>`<span class="k ${cls}"><b>${c}</b> ${c===1&&id==="old"?"older ask":c===1&&id==="needs"?"needs you":w}${id==="quiet"?`${showQuiet?"":", hidden"}<button id="quiet">${showQuiet?"Hide":"Show"}</button>`:""}</span>`).join("")}</div>`:"";
   const chart=document.getElementById("chart");
   if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;return}
   const css=getComputedStyle(chart),lane=Math.max(200,chart.clientWidth-parseInt(css.getPropertyValue("--lab"))-parseInt(css.getPropertyValue("--gut")));
