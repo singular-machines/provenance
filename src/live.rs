@@ -32,6 +32,8 @@ pub struct Record {
     pub transcript_path: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub permission_mode_observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -405,6 +407,27 @@ pub fn update(
             Harness::Pi => app_from_path(&cwd).unwrap_or("CLI").into(),
         },
     };
+    let same_verified_process = pid.is_some()
+        && pid_started.is_some()
+        && previous.as_ref().is_some_and(|p| {
+            p.session_id == event.session_id && p.pid == pid && p.pid_started == pid_started
+        });
+    let permission_mode = event.permission_mode.clone().or_else(|| {
+        previous.as_ref().and_then(|p| {
+            same_verified_process
+                .then(|| p.permission_mode.clone())
+                .flatten()
+        })
+    });
+    let permission_mode_observed_at = if event.permission_mode.is_some() {
+        Some(now)
+    } else if same_verified_process {
+        previous
+            .as_ref()
+            .and_then(|p| p.permission_mode_observed_at)
+    } else {
+        None
+    };
     Record {
         harness,
         session_id: event.session_id,
@@ -415,7 +438,8 @@ pub fn update(
         last_event: event.hook_event_name,
         updated: now,
         branches,
-        permission_mode: event.permission_mode,
+        permission_mode,
+        permission_mode_observed_at,
         transcript_path: event
             .transcript_path
             .or_else(|| previous.and_then(|p| p.transcript_path)),
@@ -594,6 +618,7 @@ mod tests {
 
     struct Fake {
         pid: u32,
+        started: String,
         branch: &'static str,
         probes: Cell<u32>,
     }
@@ -601,7 +626,7 @@ mod tests {
     impl Probe for Fake {
         fn harness_process(&self) -> Option<(u32, String)> {
             self.probes.set(self.probes.get() + 1);
-            Some((self.pid, "Fri Oct 30 18:46:07 2026".into()))
+            Some((self.pid, self.started.clone()))
         }
         fn branch(&self, _: &str) -> Option<String> {
             Some(self.branch.into())
@@ -628,6 +653,7 @@ mod tests {
     #[test]
     fn tracks_branches_and_rechecks_process_per_turn() {
         let f = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 10,
             branch: "main",
             probes: Cell::new(0),
@@ -635,6 +661,7 @@ mod tests {
         let r = update(None, Harness::ClaudeCode, ev("SessionStart"), at(1), &f);
         assert_eq!(r.app, "CLI");
         let f2 = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 20,
             branch: "feat",
             probes: Cell::new(0),
@@ -661,6 +688,7 @@ mod tests {
     #[test]
     fn permission_mode_observation_updates_and_missing_evidence_is_unknown() {
         let probe = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 42,
             branch: "b",
             probes: Cell::new(0),
@@ -669,10 +697,12 @@ mod tests {
         event.permission_mode = Some("bypassPermissions".into());
         let record = update(None, Harness::ClaudeCode, event, at(1), &probe);
         assert_eq!(record.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(record.permission_mode_observed_at, Some(at(1)));
         let mut event = ev("Stop");
         event.permission_mode = Some("default".into());
         let record = update(Some(record), Harness::ClaudeCode, event, at(2), &probe);
         assert_eq!(record.permission_mode.as_deref(), Some("default"));
+        assert_eq!(record.permission_mode_observed_at, Some(at(2)));
         let record = update(
             Some(record),
             Harness::ClaudeCode,
@@ -680,7 +710,8 @@ mod tests {
             at(3),
             &probe,
         );
-        assert!(record.permission_mode.is_none());
+        assert_eq!(record.permission_mode.as_deref(), Some("default"));
+        assert_eq!(record.permission_mode_observed_at, Some(at(2)));
         let mut old = serde_json::to_value(record).unwrap();
         old.as_object_mut().unwrap().remove("permission_mode");
         assert!(
@@ -692,8 +723,96 @@ mod tests {
     }
 
     #[test]
+    fn permission_mode_does_not_cross_session_or_process_identity() {
+        let probe = Fake {
+            pid: 42,
+            started: "Fri Oct 30 18:46:07 2026".into(),
+            branch: "b",
+            probes: Cell::new(0),
+        };
+        let mut event = ev("UserPromptSubmit");
+        event.permission_mode = Some("bypassPermissions".into());
+        let previous = update(None, Harness::ClaudeCode, event, at(1), &probe);
+
+        let mut other_session = ev("SessionStart");
+        other_session.session_id = "s2".into();
+        let changed_session = update(
+            Some(previous.clone()),
+            Harness::ClaudeCode,
+            other_session,
+            at(2),
+            &probe,
+        );
+        assert!(changed_session.permission_mode.is_none());
+
+        let different_pid = Fake {
+            pid: 43,
+            ..Fake {
+                pid: 42,
+                started: "Fri Oct 30 18:46:07 2026".into(),
+                branch: "b",
+                probes: Cell::new(0),
+            }
+        };
+        let changed_pid = update(
+            Some(previous.clone()),
+            Harness::ClaudeCode,
+            ev("SessionStart"),
+            at(2),
+            &different_pid,
+        );
+        assert!(changed_pid.permission_mode.is_none());
+
+        let different_start_time = Fake {
+            started: "Sat Oct 31 18:46:07 2026".into(),
+            ..probe
+        };
+        let reused_pid = update(
+            Some(previous),
+            Harness::ClaudeCode,
+            ev("SessionStart"),
+            at(2),
+            &different_start_time,
+        );
+        assert!(reused_pid.permission_mode.is_none());
+    }
+
+    #[test]
+    fn missing_process_identity_does_not_preserve_permission_mode() {
+        struct NoProcess;
+        impl Probe for NoProcess {
+            fn harness_process(&self) -> Option<(u32, String)> {
+                None
+            }
+            fn branch(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn env(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let mut event = ev("UserPromptSubmit");
+        event.permission_mode = Some("bypassPermissions".into());
+        let previous = update(None, Harness::ClaudeCode, event, at(1), &NoProcess);
+        assert_eq!(previous.pid, None);
+        assert_eq!(previous.pid_started, None);
+
+        let next = update(
+            Some(previous),
+            Harness::ClaudeCode,
+            ev("SessionStart"),
+            at(2),
+            &NoProcess,
+        );
+        assert!(next.permission_mode.is_none());
+        assert!(next.permission_mode_observed_at.is_none());
+    }
+
+    #[test]
     fn state_from_last_event_and_process() {
         let f = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 1,
             branch: "b",
             probes: Cell::new(0),
@@ -908,6 +1027,7 @@ mod tests {
                     branches: vec![],
                     transcript_path: None,
                     permission_mode: None,
+                    permission_mode_observed_at: None,
                 };
                 let mut alive = HashMap::new();
                 fill_alive_pids(std::slice::from_ref(&r), &mut alive, &process_start);
@@ -1023,6 +1143,7 @@ mod tests {
     #[test]
     fn legacy_start_time_shapes_are_not_evidence_of_exit() {
         let f = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 42,
             branch: "b",
             probes: Cell::new(0),
@@ -1056,6 +1177,7 @@ mod tests {
             branches: vec![],
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         };
         let mut alive = HashMap::new();
         fill_alive_pids(std::slice::from_ref(&r), &mut alive, &|pid| {
@@ -1072,6 +1194,7 @@ mod tests {
     #[test]
     fn branches_keep_the_folder_they_were_seen_in() {
         let f = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 1,
             branch: "old-feature",
             probes: Cell::new(0),
@@ -1080,6 +1203,7 @@ mod tests {
         e.cwd = Some("/a".into());
         let r = update(None, Harness::Codex, e, at(1), &f);
         let f = Fake {
+            started: "Fri Oct 30 18:46:07 2026".into(),
             pid: 1,
             branch: "other-feature",
             probes: Cell::new(0),
@@ -1114,6 +1238,7 @@ mod tests {
             branches: Vec::new(),
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         };
         let (old, new) = (
             rec("Mon Oct 26 10:00:00 2026"),
