@@ -1127,8 +1127,12 @@ pub fn new_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let n = (nanos as u64) ^ (u64::from(std::process::id()) << 40);
-    format!("m-{:012x}", n & 0xffff_ffff_ffff)
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const MASK: u64 = 0xffff_ffff_ffff;
+    let base = *BASE.get_or_init(|| (nanos as u64) ^ (u64::from(std::process::id()) << 40));
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("m-{:012x}", base.wrapping_add(sequence) & MASK)
 }
 
 #[cfg(test)]
@@ -2047,6 +2051,19 @@ mod tests {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             );
+        }
+    }
+
+    #[test]
+    fn ids_are_unique_across_concurrent_calls() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..1_000).map(|_| new_id()).collect::<Vec<_>>()))
+            .collect();
+        let mut ids = std::collections::HashSet::new();
+        for worker in workers {
+            for id in worker.join().unwrap() {
+                assert!(ids.insert(id), "generated a duplicate ID");
+            }
         }
     }
 
