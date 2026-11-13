@@ -5319,6 +5319,7 @@ fn production_mcp_send_honors_no_resume() {
         "{error}"
     );
     assert!(error.contains("add --resume"), "{error}");
+    assert!(!error.contains("--force"));
     assert!(!error.contains("headless turn"));
     assert!(!send::mail_dir(&home).exists());
     std::fs::remove_dir_all(home).unwrap();
