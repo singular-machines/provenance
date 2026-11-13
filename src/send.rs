@@ -234,9 +234,12 @@ pub fn socket_refusal(home: &Path, target: &Sender, delivery: &Delivery) -> Opti
     {
         return None;
     }
+    let age = record
+        .permission_mode_observed_at
+        .map(|observed_at| format!(" {}", observation_age(observed_at, Utc::now())))
+        .unwrap_or_default();
     Some(format!(
-        "{BYPASS_REASON} {}; nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code",
-        observation_age(record.updated, Utc::now())
+        "{BYPASS_REASON}{age}; nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
     ))
 }
 
@@ -1176,22 +1179,85 @@ mod tests {
             BYPASS_REASON,
             "Claude Code holds socket messages from provenance when the target was last observed in bypass mode"
         );
-        let now = Utc::now();
-        assert_eq!(
-            observation_age(now - chrono::Duration::minutes(3), now),
-            "(3 minutes ago)"
+        struct SameProcess {
+            pid: u32,
+            started: String,
+        }
+        impl crate::live::Probe for SameProcess {
+            fn harness_process(&self) -> Option<(u32, String)> {
+                Some((self.pid, self.started.clone()))
+            }
+            fn branch(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn env(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let pid = std::process::id();
+        let started = crate::live::ps_info(pid).unwrap().1;
+        let probe = SameProcess { pid, started };
+        let observed_at = Utc::now() - chrono::Duration::hours(2);
+        let mut event = crate::live::HookEvent {
+            session_id: "abc".into(),
+            cwd: Some("/work".into()),
+            hook_event_name: "UserPromptSubmit".into(),
+            transcript_path: None,
+            permission_mode: Some("bypassPermissions".into()),
+        };
+        let record = crate::live::update(
+            None,
+            Harness::ClaudeCode,
+            event.clone(),
+            observed_at,
+            &probe,
         );
-        assert_eq!(
-            observation_age(now - chrono::Duration::seconds(1), now),
-            "(1 second ago)"
+        event.hook_event_name = "SessionStart".into();
+        event.permission_mode = None;
+        let record = crate::live::update(
+            Some(record),
+            Harness::ClaudeCode,
+            event,
+            Utc::now() - chrono::Duration::minutes(1),
+            &probe,
         );
-        let refusal = format!(
-            "{BYPASS_REASON} (3 minutes ago); nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
-        );
+
+        let home = std::env::temp_dir().join(format!("prov-refusal-{}-{}", pid, new_id()));
+        let live_dir = crate::live::live_dir(&home);
+        let socket_dir = home.join(".claude/sessions");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::write(
+            live_dir.join("claude-code-abc.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let socket = PathBuf::from("/tmp/cc-socks/test.sock");
+        std::fs::write(
+            socket_dir.join(format!("{pid}.json")),
+            serde_json::json!({
+                "sessionId": "abc",
+                "messagingSocketPath": socket,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let target = Sender {
+            harness: Harness::ClaudeCode,
+            session_id: "abc".into(),
+        };
+        let refusal = socket_refusal(
+            &home,
+            &target,
+            &Delivery::ClaudeSocket(PathBuf::from("/tmp/cc-socks/test.sock")),
+        )
+        .unwrap();
         assert_eq!(
             refusal,
-            "Claude Code holds socket messages from provenance when the target was last observed in bypass mode (3 minutes ago); nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
+            "Claude Code holds socket messages from provenance when the target was last observed in bypass mode (2 hours ago); nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
         );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
