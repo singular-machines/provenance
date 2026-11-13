@@ -2719,6 +2719,7 @@ mod send_cli_tests {
                 last_seen: Utc::now(),
             }],
             permission_mode: None,
+            permission_mode_observed_at: None,
             transcript_path: Some(
                 home.join("real-wiring.jsonl")
                     .to_string_lossy()
@@ -2895,6 +2896,7 @@ mod identity_tests {
             branches: Vec::new(),
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         }
     }
     #[test]
@@ -3060,6 +3062,7 @@ mod named_tests {
             branches: Vec::new(),
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         }
     }
     fn scratch() -> PathBuf {
