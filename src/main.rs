@@ -1964,7 +1964,9 @@ fn relayed_message(
     between();
     Ok(match held {
         Some(held) => Some(held),
-        None => send::find_message(mailbox, &r.id)?,
+        // Relay refusals go back to the peer, so keep local mailbox paths
+        // and parse details out of the remote-facing response.
+        None => send::find_message(mailbox, &r.id).ok().flatten(),
     })
 }
 
@@ -4861,6 +4863,35 @@ mod named_tests {
         std::fs::remove_dir_all(here).unwrap();
     }
     #[test]
+    fn missing_relay_mailbox_keeps_generic_refusal_without_local_path() {
+        stamps::set_test_machine("m-here");
+        let here = scratch();
+        let replier = send::Sender {
+            harness: Harness::Codex,
+            session_id: "remote-codex".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&here), replier.harness, &replier.session_id);
+        let outcome = relay_reply(
+            &here,
+            &relay::ReplyEnvelope {
+                protocol: relay::PROTOCOL,
+                id: "m-0000000000ef".into(),
+                from_machine: "m-remote".into(),
+                replier,
+                text: "answer".into(),
+            },
+        );
+        assert!(!outcome.accepted);
+        let why = outcome.why.unwrap();
+        assert!(
+            why.contains("no message m-0000000000ef was relayed from here to"),
+            "{why}"
+        );
+        assert!(!why.contains(&mailbox.display().to_string()), "{why}");
+        std::fs::remove_dir_all(here).unwrap();
+    }
+
+    #[test]
     fn a_reply_to_an_unpaired_or_older_machine_stays_saved_and_says_why() {
         let (here, there, _) = relay_pair();
         let (r, _listener) = listening_target(&there);
@@ -4996,16 +5027,18 @@ mod reply_cli_tests {
                 std::fs::write(&p, script).unwrap();
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            for case in ["cli", "mcp"] {
+            for case in ["cli", "mcp", "mcp-ambiguous"] {
                 let home = root.join(case);
                 std::fs::create_dir_all(&home).unwrap();
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command.args(["--exact","reply_cli_tests::cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership","--nocapture"])
                     .env("HOME",home).env("PATH",format!("{}:{}",bin.display(),std::env::var("PATH").unwrap()))
                     .env("PROVENANCE_REPLY_FIXTURE",case).env_remove("CODEX_THREAD_ID").env_remove("CODEX_SESSION_ID");
-                command
-                    .env("CODEX_THREAD_ID", "recipient-a")
-                    .env("CODEX_SESSION_ID", "recipient-a");
+                if case != "mcp-ambiguous" {
+                    command
+                        .env("CODEX_THREAD_ID", "recipient-a")
+                        .env("CODEX_SESSION_ID", "recipient-a");
+                }
                 let output = command.output().unwrap();
                 assert!(
                     output.status.success(),
@@ -5053,6 +5086,28 @@ mod reply_cli_tests {
             )
             .unwrap();
         }
+        if case == "mcp-ambiguous" {
+            use mcp::Tools;
+            let error = McpTools { home: home.clone() }
+                .reply("m-owned", "answer")
+                .unwrap_err();
+            assert!(error.is::<AmbiguousCaller>());
+            let text = format!("{error:#}");
+            assert!(text.contains("provenance reply MESSAGE_ID"));
+            assert!(
+                send::reply_to(
+                    &send::mailbox(
+                        &send::mail_dir(&home),
+                        recipient.harness,
+                        &recipient.session_id
+                    ),
+                    "m-owned"
+                )
+                .is_none()
+            );
+            assert!(!home.join("transport.txt").exists());
+            return;
+        }
         if case == "mcp" {
             use mcp::Tools;
             let receipt = McpTools { home: home.clone() }
@@ -5097,6 +5152,11 @@ mod reply_cli_tests {
         let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
         assert!(transport.contains("queue --thread original-sender"));
         assert!(transport.contains("Reply to message m-owned"));
+        let recipient_a_path = send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-a");
+        let recipient_a_before = std::fs::read(&recipient_a_path).unwrap();
+        let recipient_b_path = send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-b");
+        let recipient_b_before = std::fs::read(&recipient_b_path).unwrap();
+        std::fs::remove_file(home.join("transport.txt")).unwrap();
         let wrong =
             dispatch(Cli::try_parse_from(["provenance", "reply", "m-wrong", "bad"]).unwrap())
                 .unwrap_err();
@@ -5118,12 +5178,17 @@ mod reply_cli_tests {
             "{wrong_text}"
         );
         assert_eq!(
-            send::reply_to(
-                &send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-b"),
-                "m-wrong"
-            ),
-            None,
-            "wrong-recipient refusal must not write a reply"
+            std::fs::read(&recipient_a_path).unwrap(),
+            recipient_a_before,
+            "wrong-recipient refusal must not modify the caller mailbox"
+        );
+        assert_eq!(
+            std::fs::read(&recipient_b_path).unwrap(),
+            recipient_b_before
+        );
+        assert!(
+            !home.join("transport.txt").exists(),
+            "wrong-recipient refusal must not send"
         );
         let rpath = dir.join("original-sender.json");
         let mut r: serde_json::Value =

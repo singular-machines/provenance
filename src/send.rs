@@ -864,18 +864,40 @@ impl Drop for Relaying {
 pub fn find_message(path: &Path, id: &str) -> Result<Option<Mail>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading mailbox {}", path.display()))?;
-    contents
-        .lines()
-        .enumerate()
-        .try_fold(None, |found, (index, line)| {
-            let mail: Mail = serde_json::from_str(line).with_context(|| {
-                format!("parsing mailbox {} line {}", path.display(), index + 1)
-            })?;
-            Ok::<_, anyhow::Error>(found.or_else(|| {
-                matches!(&mail, Mail::Message { id: message_id, .. } if message_id == id)
-                    .then_some(mail)
-            }))
-        })
+    let mut found = None;
+    let mut malformed = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        match serde_json::from_str::<Mail>(line) {
+            Ok(mail) => {
+                if found.is_none()
+                    && matches!(&mail, Mail::Message { id: message_id, .. } if message_id == id)
+                {
+                    found = Some(mail);
+                }
+            }
+            Err(error) => malformed.push((index + 1, error)),
+        }
+    }
+    if found.is_some() {
+        return Ok(found);
+    }
+    if !malformed.is_empty() {
+        let locations = malformed
+            .iter()
+            .map(|(line, _)| line.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let details = malformed
+            .iter()
+            .map(|(line, error)| format!("line {line}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "could not parse {} mailbox line(s) at line(s) {locations}: {details}",
+            malformed.len()
+        );
+    }
+    Ok(None)
 }
 
 /// Record `me`'s answer to a message sent to `me`, and return who sent it.
@@ -1738,7 +1760,7 @@ mod tests {
         let malformed = record_reply(&dir, Some(&me), "m-1", "answer").unwrap_err();
         let malformed_text = format!("{malformed:#}");
         assert!(
-            malformed_text.contains("parsing mailbox"),
+            malformed_text.contains("could not parse"),
             "{malformed_text}"
         );
         assert!(malformed_text.contains("line 1"), "{malformed_text}");
@@ -1746,6 +1768,33 @@ mod tests {
             malformed_text.contains(&path.display().to_string()),
             "{malformed_text}"
         );
+        append(
+            &path,
+            &Mail::Message {
+                id: "m-1".into(),
+                pr: None,
+                named_address: None,
+                from: "fixture".into(),
+                sender: None,
+                from_machine: None,
+                to_machine: None,
+                text: "request".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        record_reply(&dir, Some(&me), "m-1", "answer").unwrap();
+        assert_eq!(reply_to(&path, "m-1").as_deref(), Some("answer"));
+
+        std::fs::write(&path, "{not json}\n").unwrap();
+        let no_match = record_reply(&dir, Some(&me), "m-2", "answer").unwrap_err();
+        let no_match_text = format!("{no_match:#}");
+        assert!(
+            no_match_text.contains("1 mailbox line(s)"),
+            "{no_match_text}"
+        );
+        assert!(no_match_text.contains("line(s) 1"), "{no_match_text}");
+        assert!(no_match_text.contains("line 1:"), "{no_match_text}");
         std::fs::remove_file(&path).unwrap();
 
         let other_home = root.join("other-home");
