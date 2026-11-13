@@ -1010,6 +1010,23 @@ fn plan_recipient(
     if sender.is_some_and(|me| me.harness == s.harness && me.session_id == s.session_id) {
         return send::Delivery::Refuse("it's this session".into());
     }
+    // A dead hook PID does not close T3's exact native conversation. Keep
+    // remote/web targets and every other refusal under the normal planner.
+    if process == go::Process::Gone
+        && s.url.is_none()
+        && s.machine
+            .as_deref()
+            .is_none_or(|m| Some(m) == stamps::machine_name().as_deref())
+        && let Some(route) = send::exact_t3_route(
+            home,
+            &send::Sender {
+                harness: s.harness,
+                session_id: s.session_id.clone(),
+            },
+        )
+    {
+        return route;
+    }
     let delivery = send::plan(
         s,
         state,
@@ -3113,7 +3130,7 @@ mod named_tests {
             .unwrap();
         let mut r = record("exact", Harness::Codex, u32::MAX, "gone");
         r.cwd = "/actual-folder".into();
-        let (s, state, process) = named_recipient(&binding, &[r.clone()]).unwrap();
+        let (s, state, process) = named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
         assert_eq!(s.cwd, "/actual-folder");
         assert!(matches!(
             plan_recipient(&home, &s, state, process, None, false, send::Caller::Mcp),
@@ -3123,7 +3140,7 @@ mod named_tests {
         r.pid = Some(std::process::id());
         r.pid_started = Some(started);
         r.last_event = "UserPromptSubmit".into();
-        let (s, state, process) = named_recipient(&binding, &[r.clone()]).unwrap();
+        let (s, state, process) = named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
         assert_eq!(
             plan_recipient(&home, &s, state, process, None, false, send::Caller::Mcp),
             send::Delivery::CodexQueue("exact".into())
@@ -3543,7 +3560,7 @@ mod named_tests {
     fn bypass_socket_reroutes_through_t3_when_t3_hosts_the_session() {
         let Ok(case) = std::env::var("PROVENANCE_T3_FIXTURE") else {
             let root = scratch();
-            for case in ["default", "custom"] {
+            for case in ["default", "custom", "dead"] {
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command
                     .args([
@@ -3579,8 +3596,7 @@ mod named_tests {
             "custom" => PathBuf::from(std::env::var("T3CODE_HOME").unwrap().trim()),
             _ => home.join(".t3"),
         };
-        let (r, s) = socket_target_with_id(&home, Some("bypassPermissions"), session);
-        t3_add(&base, "thread-9", "p9", session, "strong", true);
+        let (mut r, s) = socket_target_with_id(&home, Some("bypassPermissions"), session);
         let bin = home.join(".t3/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let t3 = bin.join("t3");
@@ -3593,6 +3609,93 @@ mod named_tests {
         )
         .unwrap();
         std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if case == "dead" {
+            r.pid = Some(u32::MAX);
+            std::fs::write(
+                live::live_dir(&home).join("target.json"),
+                serde_json::to_vec(&r).unwrap(),
+            )
+            .unwrap();
+            let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+            assert_eq!(
+                named_recipient(&binding, std::slice::from_ref(&r))
+                    .unwrap()
+                    .2,
+                go::Process::Gone
+            );
+            // Every rejected mapping goes through the names and send planners.
+            for invalid in [
+                "historical",
+                "weak",
+                "ambiguous",
+                "switched",
+                "archived",
+                "deleted",
+                "other-session",
+                "other-harness",
+            ] {
+                t3_sql(
+                    &base,
+                    "DROP TABLE IF EXISTS orchestration_v2_projection_threads; DROP TABLE IF EXISTS orchestration_v2_projection_provider_threads;",
+                );
+                let other = "d4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+                t3_add(
+                    &base,
+                    "thread-9",
+                    "p9",
+                    if invalid == "other-session" {
+                        other
+                    } else {
+                        session
+                    },
+                    if invalid == "weak" { "weak" } else { "strong" },
+                    invalid != "historical",
+                );
+                match invalid {
+                    "ambiguous" => t3_add(&base, "thread-10", "p10", session, "strong", true),
+                    "switched" => t3_add(&base, "thread-9", "p10", other, "strong", true),
+                    "archived" => t3_sql(
+                        &base,
+                        "UPDATE orchestration_v2_projection_threads SET archived_at = 'now';",
+                    ),
+                    "deleted" => t3_sql(
+                        &base,
+                        "UPDATE orchestration_v2_projection_threads SET deleted_at = 'now';",
+                    ),
+                    "other-harness" => t3_sql(
+                        &base,
+                        "UPDATE orchestration_v2_projection_provider_threads SET payload_json = json_set(payload_json, '$.nativeThreadRef.driver', 'codex');",
+                    ),
+                    _ => {}
+                }
+                assert!(
+                    binding_status(&home, "socket-target", &binding, std::slice::from_ref(&r))
+                        .unwrap()["availability"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("unavailable:"),
+                    "{invalid}"
+                );
+                assert!(
+                    send_message(
+                        &home,
+                        "@Socket Target",
+                        "never deliver",
+                        false,
+                        send::Caller::Mcp
+                    )
+                    .is_err(),
+                    "{invalid}"
+                );
+                assert!(!send::mail_dir(&home).exists(), "{invalid}");
+                assert!(!home.join("t3-args.txt").exists());
+            }
+            t3_sql(
+                &base,
+                "DROP TABLE orchestration_v2_projection_threads; DROP TABLE orchestration_v2_projection_provider_threads;",
+            );
+        }
+        t3_add(&base, "thread-9", "p9", session, "strong", true);
         let planned = send::Delivery::T3Thread {
             bin: t3.clone(),
             base: base.clone(),
@@ -3602,12 +3705,21 @@ mod named_tests {
             &home,
             &s,
             Some(live::State::Running),
-            go::Process::Live(std::process::id()),
+            if case == "dead" {
+                go::Process::Gone
+            } else {
+                go::Process::Live(std::process::id())
+            },
             None,
             false,
             send::Caller::Mcp,
         );
         assert_eq!(delivery, planned);
+        let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+        assert_eq!(
+            binding_status(&home, "socket-target", &binding, std::slice::from_ref(&r)).unwrap()["availability"],
+            "available"
+        );
         let sent = send_message(
             &home,
             "@Socket Target",
@@ -3663,6 +3775,78 @@ mod named_tests {
         assert_eq!(send::read(&mailbox).len(), 1);
         std::fs::remove_dir_all(home).unwrap();
     }
+    #[test]
+    fn dead_pid_t3_mapping_revalidated_before_dispatch() {
+        let home = scratch();
+        let session = "c4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let (mut r, s) = socket_target_with_id(&home, None, session);
+        r.pid = Some(u32::MAX);
+        std::fs::write(
+            live::live_dir(&home).join("target.json"),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+        let base = send::t3_base(&home, std::env::var_os("T3CODE_HOME"));
+        // Do not touch an ambient T3 database: execute the case in an isolated child.
+        if std::env::var_os("PROVENANCE_REVALIDATION_FIXTURE").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "named_tests::dead_pid_t3_mapping_revalidated_before_dispatch",
+                ])
+                .env_remove("T3CODE_HOME")
+                .env("PROVENANCE_REVALIDATION_FIXTURE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        t3_add(&base, "thread", "provider", session, "strong", true);
+        let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+        let (sighting, state, process) = named_recipient(&binding, &[r]).unwrap();
+        let delivery = plan_recipient(
+            &home,
+            &sighting,
+            state,
+            process,
+            None,
+            false,
+            send::Caller::Mcp,
+        );
+        assert!(matches!(delivery, send::Delivery::T3Thread { .. }));
+        t3_add(
+            &base,
+            "thread",
+            "switched",
+            "d4217d94-c60f-4ad7-9b6b-1b7b52976ea4",
+            "strong",
+            true,
+        );
+        let error = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery,
+                sender: None,
+                pr: None,
+                named: None,
+                note: None,
+            },
+            "never deliver",
+            &|_, _, _, _, _, _, _| panic!("refusal must precede transport"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("nothing was delivered"));
+        assert!(!send::mail_dir(&home).exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
     /// Two "machines" in one test: `here` sends, `there` runs `relay deliver`
     /// through a transport that hands it the envelope directly.
     /// Pins this thread's machine name too, so `PROVENANCE_MACHINE` can't
@@ -3699,7 +3883,13 @@ mod named_tests {
         home: &std::path::Path,
     ) -> (live::Record, std::os::unix::net::UnixListener) {
         let (r, _) = socket_target_with_id(home, None, "e4217d94-c60f-4ad7-9b6b-1b7b52976ea4");
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            send::new_id()
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             home.join(format!(".claude/sessions/{}.json", r.pid.unwrap())),
@@ -4672,7 +4862,13 @@ mod named_tests {
         // Passed back again before the session is back: still not forwarded.
         assert!(relay_reply(&here, &reply).how.contains("not forwarded yet"));
         // The session is back; the next pull forwards it, without asking any machine.
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            send::new_id()
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             here.join(format!(".claude/sessions/{}.json", sender.pid.unwrap())),

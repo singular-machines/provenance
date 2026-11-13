@@ -3,8 +3,9 @@
 //! A running session is messaged through its harness's own way in: a Claude
 //! Code session's inbox socket, or `codex queue` for Codex. A Claude Code
 //! session in bypass mode holds socket messages, so when T3 Code hosts it,
-//! `t3 thread send` delivers instead. A session that isn't running is only
-//! reached by resuming it headless, when asked to.
+//! `t3 thread send` delivers instead. An exact active T3 conversation can
+//! also receive messages when its recorded hook PID is dead. Other stopped
+//! sessions are reached by resuming them headless, when asked to.
 //!
 //! Every message and reply is kept in a mailbox, one JSONL file per receiving
 //! session under `~/.local/state/provenance/mail/`, so a reply can be matched
@@ -278,15 +279,14 @@ pub fn bypass_note(reasons: &[String]) -> Option<String> {
 
 /// Where a held socket write goes instead. `None` when the socket isn't held;
 /// T3 Code's own thread queue when T3 hosts the session; otherwise a refusal.
-/// A planned T3 route is checked again, so a mapping or process that changed
+/// A planned T3 route is checked again, so a mapping that changed
 /// since planning is refused instead of delivered to whatever the thread now
 /// runs. T3 offers no way to bind a send to the native session, so a switch
 /// between this check and `t3 thread send` remains possible.
 pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option<Delivery> {
     let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
     if let Delivery::T3Thread { .. } = delivery {
-        let current =
-            live_record(home, target).and_then(|_| t3_route(home, &base, &target.session_id));
+        let current = exact_t3_route(home, target);
         return Some(match current {
             Some(d) if &d == delivery => d,
             Some(_) => Delivery::Refuse(
@@ -303,14 +303,14 @@ pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option
     Some(t3_route(home, &base, &target.session_id).unwrap_or(Delivery::Refuse(why)))
 }
 
-/// The target's hook record, if its process is still alive.
-fn live_record(home: &Path, target: &Sender) -> Option<crate::live::Record> {
-    let records = crate::live::load_records(home);
-    let record = records
-        .into_iter()
-        .find(|r| r.harness == target.harness && r.session_id == target.session_id)?;
-    let alive = crate::live::alive_pids(std::slice::from_ref(&record));
-    crate::live::is_alive(&record, &alive).then_some(record)
+/// A unique strong active mapping for this exact harness and native session.
+/// The hook PID is not authoritative for a conversation managed by T3.
+pub fn exact_t3_route(home: &Path, target: &Sender) -> Option<Delivery> {
+    if target.harness != Harness::ClaudeCode {
+        return None;
+    }
+    let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
+    t3_route(home, &base, &target.session_id)
 }
 
 /// T3 Code's data directory from `T3CODE_HOME`, resolved as T3 resolves it:
