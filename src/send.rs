@@ -196,6 +196,97 @@ pub fn headless_argv(harness: Harness, id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Codex resumes use only their schema-constrained final message as a reply.
+pub fn is_codex_resume(d: &Delivery) -> bool {
+    matches!(d, Delivery::Resume { argv, .. } if argv.get(1).is_some_and(|a| a == "exec") && argv.get(2).is_some_and(|a| a == "resume"))
+}
+
+pub fn check_codex_contract(d: &Delivery) -> Result<()> {
+    if let Delivery::Resume { argv, .. } = d
+        && is_codex_resume(d)
+    {
+        let help = Command::new(&argv[0]).args(["exec", "resume", "--help"]).output()
+            .context("checking Codex resume capabilities; install a CLI supporting --output-schema, --output-last-message and --json")?;
+        let text = String::from_utf8_lossy(&help.stdout);
+        if !help.status.success()
+            || ["--output-schema", "--output-last-message", "--json"]
+                .iter()
+                .any(|flag| !text.split_whitespace().any(|word| word == *flag))
+        {
+            bail!(
+                "Codex exec resume requires --output-schema, --output-last-message and --json; upgrade Codex before delivery"
+            );
+        }
+    }
+    Ok(())
+}
+
+struct ResponseFiles(PathBuf);
+impl Drop for ResponseFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn codex_response(d: &Delivery, prompt: &str, relay: Relay<'_>) -> Result<String> {
+    check_codex_contract(d)?;
+    let Delivery::Resume { cwd, argv } = d else {
+        unreachable!()
+    };
+    let files = ResponseFiles(
+        std::env::temp_dir().join(format!("provenance-response-{}", random_boundary("")?)),
+    );
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(&files.0)?;
+    let schema = files.0.join("schema.json");
+    let response = files.0.join("response.json");
+    std::fs::write(
+        &schema,
+        r#"{"type":"object","properties":{"reply":{"type":"string","minLength":1}},"required":["reply"],"additionalProperties":false}"#,
+    )?;
+    let events = run(
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .arg("--output-schema")
+            .arg(&schema)
+            .arg("--output-last-message")
+            .arg(&response)
+            .arg("--json")
+            .arg(prompt)
+            .current_dir(cwd),
+        Some(relay),
+    )?;
+    let mut completed = false;
+    for line in events.lines() {
+        let event: serde_json::Value = serde_json::from_str(line)
+            .context("invalid Codex JSON event output; no structured reply saved")?;
+        match event["type"].as_str() {
+            Some("turn.failed" | "error") => {
+                bail!("Codex turn failed; no structured reply saved; inspect the session log")
+            }
+            Some("turn.completed") => completed = true,
+            _ => {}
+        }
+    }
+    if !completed {
+        bail!(
+            "Codex did not report turn.completed; no structured reply saved; inspect the session log"
+        );
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Response {
+        reply: String,
+    }
+    let bytes = std::fs::read(&response)
+        .context("Codex returned no final response; no structured reply saved")?;
+    let result: Response = serde_json::from_slice(&bytes).context("invalid Codex final response; expected only a nonempty reply string; no structured reply saved")?;
+    if result.reply.trim().is_empty() {
+        bail!("Codex returned an empty reply; no structured reply saved");
+    }
+    Ok(result.reply)
+}
+
 /// The inbox socket of a Claude Code process, from `~/.claude/sessions/<pid>.json`,
 /// if that process is still on the given session.
 pub fn claude_socket(home: &Path, pid: u32, session_id: &str) -> Option<PathBuf> {
@@ -508,16 +599,32 @@ pub fn deliver_forward(
     text: &str,
     log_path: Option<&Path>,
 ) -> Result<String> {
+    let prompt = framed(id, pr, from, text)?;
+    let prompt = if is_codex_resume(d) {
+        let suffix = format!("Answer with the provenance `reply` tool, message_id \"{id}\".");
+        format!(
+            "{}Return your answer in the final structured response's reply field. Provenance saves and forwards it; no mailbox write is needed.",
+            prompt
+                .strip_suffix(&suffix)
+                .context("missing reply instruction")?
+        )
+    } else {
+        prompt
+    };
     let output = deliver(
         d,
-        &framed(id, pr, from, text)?,
+        &prompt,
         Relay {
             id,
             from: to,
             log_path,
         },
     )?;
-    returned_output(d, id, to, &output)
+    if is_codex_resume(d) {
+        Ok(output)
+    } else {
+        returned_output(d, id, to, &output)
+    }
 }
 
 fn needs_output_frame(d: &Delivery, output: &str) -> bool {
@@ -576,6 +683,9 @@ fn deliver(d: &Delivery, text: &str, relay: Relay<'_>) -> Result<String> {
         Delivery::Resume { cwd, argv } => {
             if !Path::new(cwd).is_dir() {
                 bail!("the session's folder is gone: {cwd}");
+            }
+            if is_codex_resume(d) {
+                return codex_response(d, text, relay);
             }
             run(
                 Command::new(&argv[0])
@@ -942,6 +1052,16 @@ pub fn find_message(path: &Path, id: &str) -> Result<Option<Mail>> {
 /// Only the receiving session can answer, so a reply can't be forged by
 /// another session that knows the message ID.
 pub fn record_reply(
+    dir: &Path,
+    me: Option<&Sender>,
+    id: &str,
+    text: &str,
+) -> Result<(Option<Sender>, Option<String>)> {
+    let (sender, machine) = persist_reply(dir, me, id, text)?;
+    Ok((sender, machine))
+}
+
+pub fn persist_reply(
     dir: &Path,
     me: Option<&Sender>,
     id: &str,
@@ -1813,6 +1933,37 @@ mod tests {
         assert_eq!(claude_socket(&home, 42, "other"), None);
         assert_eq!(claude_socket(&home, 43, "abc"), None);
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn codex_without_structured_flags_is_refused_before_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("prov-old-codex-{}", random_boundary("").unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        let bin = dir.join("codex");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$3\" = --help ] || exit 99\necho old-cli\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let d = Delivery::Resume {
+            cwd: dir.to_string_lossy().into_owned(),
+            argv: vec![
+                bin.to_string_lossy().into_owned(),
+                "exec".into(),
+                "resume".into(),
+                "fixture".into(),
+            ],
+        };
+        assert!(
+            check_codex_contract(&d)
+                .unwrap_err()
+                .to_string()
+                .contains("upgrade Codex before delivery")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
