@@ -1228,6 +1228,7 @@ mod tests {
             branches: vec![],
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         }
     }
 
