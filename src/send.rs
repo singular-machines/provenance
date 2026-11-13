@@ -243,11 +243,18 @@ fn codex_response(d: &Delivery, prompt: &str, relay: Relay<'_>) -> Result<String
         &schema,
         r#"{"type":"object","properties":{"reply":{"type":"string","minLength":1}},"required":["reply"],"additionalProperties":false}"#,
     )?;
-    let events = run(Command::new(&argv[0]).args(&argv[1..])
-        .arg("--output-schema").arg(&schema)
-        .arg("--output-last-message").arg(&response).arg("--json")
-        .arg(format!("{prompt}\n\nReturn your answer in the final structured response's reply field. Provenance will save and forward it; no mailbox write is needed."))
-        .current_dir(cwd), Some(relay))?;
+    let events = run(
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .arg("--output-schema")
+            .arg(&schema)
+            .arg("--output-last-message")
+            .arg(&response)
+            .arg("--json")
+            .arg(prompt)
+            .current_dir(cwd),
+        Some(relay),
+    )?;
     let mut completed = false;
     for line in events.lines() {
         let event: serde_json::Value = serde_json::from_str(line)
@@ -998,14 +1005,13 @@ pub fn find_message(path: &Path, id: &str) -> Option<Mail> {
 /// Record `me`'s answer to a message sent to `me`, and return who sent it.
 /// Only the receiving session can answer, so a reply can't be forged by
 /// another session that knows the message ID.
-#[cfg(test)]
 pub fn record_reply(
     dir: &Path,
     me: Option<&Sender>,
     id: &str,
     text: &str,
 ) -> Result<(Option<Sender>, Option<String>)> {
-    let (sender, machine, _) = persist_reply(dir, me, id, text)?;
+    let (sender, machine) = persist_reply(dir, me, id, text)?;
     Ok((sender, machine))
 }
 
@@ -1014,7 +1020,7 @@ pub fn persist_reply(
     me: Option<&Sender>,
     id: &str,
     text: &str,
-) -> Result<(Option<Sender>, Option<String>, bool)> {
+) -> Result<(Option<Sender>, Option<String>)> {
     let Some(me) = me else {
         bail!(
             "reply works only inside the session the message was sent to, with provenance's session hooks installed"
@@ -1029,7 +1035,7 @@ pub fn persist_reply(
     else {
         bail!("no message {id} was sent to this session");
     };
-    let saved = append_new(
+    append(
         &path,
         &Mail::Reply {
             id: id.to_string(),
@@ -1037,7 +1043,7 @@ pub fn persist_reply(
             at: Utc::now(),
         },
     )?;
-    Ok((sender, from_machine, saved))
+    Ok((sender, from_machine))
 }
 
 /// Every mailbox here, with the session it belongs to.
