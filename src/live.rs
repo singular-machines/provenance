@@ -66,7 +66,7 @@ pub fn state(r: &Record, alive: bool) -> State {
 }
 
 pub fn live_dir(home: &Path) -> PathBuf {
-    home.join(".local/state/provenance/live")
+    crate::state::root(home).join("live")
 }
 
 fn record_path(dir: &Path, harness: Harness, id: &str) -> PathBuf {

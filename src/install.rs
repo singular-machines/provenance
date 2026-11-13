@@ -606,13 +606,18 @@ pub fn pull_agent_path(home: &Path) -> PathBuf {
         .join(format!("{PULL_AGENT}.plist"))
 }
 
+pub fn pull_agent_log(home: &Path) -> PathBuf {
+    crate::state::root(home).join("pull.log")
+}
+
 fn pull_agent_plist(home: &Path, bin: &Path, path: &str, every_secs: u64) -> String {
     let xml = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     };
-    let log = home.join(".local/state/provenance/pull.log");
+    let state_root = crate::state::root(home);
+    let log = pull_agent_log(home);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -622,7 +627,7 @@ fn pull_agent_plist(home: &Path, bin: &Path, path: &str, every_secs: u64) -> Str
   <key>ProgramArguments</key>
   <array><string>{}</string><string>peer</string><string>pull</string><string>--quiet</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{}</string></dict>
+  <dict><key>PATH</key><string>{}</string><key>PROVENANCE_STATE_DIR</key><string>{}</string></dict>
   <key>StartInterval</key><integer>{every_secs}</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{}</string>
@@ -632,6 +637,7 @@ fn pull_agent_plist(home: &Path, bin: &Path, path: &str, every_secs: u64) -> Str
 "#,
         xml(&bin.display().to_string()),
         xml(path),
+        xml(&state_root.display().to_string()),
         xml(&log.display().to_string()),
         xml(&log.display().to_string()),
     )
@@ -663,6 +669,27 @@ pub fn pull_agent_path_var(home: &Path, path: &str) -> String {
 
 /// Writes and loads the pull agent, replacing any earlier one.
 pub fn install_pull_agent(home: &Path, bin: &Path, path: &str, every_secs: u64) -> Result<String> {
+    install_pull_agent_with(
+        home,
+        bin,
+        path,
+        every_secs,
+        crate::state::is_overridden(),
+        launchctl,
+    )
+}
+
+fn install_pull_agent_with(
+    home: &Path,
+    bin: &Path,
+    path: &str,
+    every_secs: u64,
+    state_override: bool,
+    mut launch: impl FnMut(&[&str]) -> bool,
+) -> Result<String> {
+    if state_override {
+        return Ok("The macOS reply-collection agent was not installed because PROVENANCE_STATE_DIR is set; run `provenance peer pull` manually to collect replies.".into());
+    }
     if !cfg!(target_os = "macos") {
         return Ok(format!(
             "Replies that machine can't pass back are collected by `provenance peer pull`; run it every {every_secs} seconds (cron or a systemd timer) on this machine."
@@ -670,11 +697,11 @@ pub fn install_pull_agent(home: &Path, bin: &Path, path: &str, every_secs: u64) 
     }
     let agent = pull_agent_path(home);
     std::fs::create_dir_all(agent.parent().unwrap())?;
-    std::fs::create_dir_all(home.join(".local/state/provenance"))?;
+    std::fs::create_dir_all(crate::state::root(home))?;
     let plist = pull_agent_plist(home, bin, &pull_agent_path_var(home, path), every_secs);
     std::fs::write(&agent, plist).with_context(|| format!("writing {}", agent.display()))?;
-    launchctl(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
-    if !launchctl(&["bootstrap", &gui_domain(), &agent.display().to_string()]) {
+    launch(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
+    if !launch(&["bootstrap", &gui_domain(), &agent.display().to_string()]) {
         bail!("launchctl couldn't load {}", agent.display());
     }
     Ok(format!(
@@ -684,12 +711,24 @@ pub fn install_pull_agent(home: &Path, bin: &Path, path: &str, every_secs: u64) 
 
 /// Unloads and deletes the pull agent, if there is one.
 pub fn remove_pull_agent(home: &Path, dry_run: bool) -> Result<Option<String>> {
+    remove_pull_agent_with(home, dry_run, crate::state::is_overridden(), launchctl)
+}
+
+fn remove_pull_agent_with(
+    home: &Path,
+    dry_run: bool,
+    state_override: bool,
+    mut launch: impl FnMut(&[&str]) -> bool,
+) -> Result<Option<String>> {
+    if state_override {
+        return Ok(Some("The macOS reply-collection agent was not removed because PROVENANCE_STATE_DIR is set; the HOME-based agent and plist were left untouched.".into()));
+    }
     let path = pull_agent_path(home);
     if !path.exists() {
         return Ok(None);
     }
     if !dry_run {
-        launchctl(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
+        launch(&["bootout", &format!("{}/{PULL_AGENT}", gui_domain())]);
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(Some(format!(
@@ -721,6 +760,37 @@ fn quote(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_override_never_touches_the_home_pull_agent() {
+        let home = std::env::temp_dir().join(format!("prov-agent-{}", crate::send::new_id()));
+        let agent = pull_agent_path(&home);
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "default agent plist").unwrap();
+
+        let installed = install_pull_agent_with(
+            &home,
+            Path::new("/bin/provenance"),
+            "/usr/bin",
+            30,
+            true,
+            |_| panic!("override must not call launchctl"),
+        )
+        .unwrap();
+        assert!(installed.contains("was not installed because PROVENANCE_STATE_DIR is set"));
+
+        let removed = remove_pull_agent_with(&home, false, true, |_| {
+            panic!("override must not call launchctl")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(removed.contains("was not removed because PROVENANCE_STATE_DIR is set"));
+        assert_eq!(
+            std::fs::read_to_string(&agent).unwrap(),
+            "default agent plist"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn appends_after_existing_hooks_and_is_idempotent() {
