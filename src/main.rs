@@ -12,6 +12,7 @@ mod render;
 mod send;
 mod sessions;
 mod stamps;
+mod state;
 mod update;
 
 use std::collections::HashMap;
@@ -248,9 +249,9 @@ fn main() -> Result<()> {
 
 fn dispatch(cli: Cli) -> Result<()> {
     let home = || -> Result<PathBuf> {
-        Ok(PathBuf::from(
-            std::env::var_os("HOME").context("HOME is not set")?,
-        ))
+        let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+        state::validate()?;
+        Ok(home)
     };
     match cli.command {
         Cmd::Prs {
@@ -346,9 +347,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 HarnessArg::Codex => Harness::Codex,
                 HarnessArg::Pi => Harness::Pi,
             };
-            if let Ok(home) = home() {
-                live::run_hook(h, &home);
-            }
+            let home = home()?;
+            live::run_hook(h, &home);
             Ok(())
         }
         Cmd::UpdateCheck => {
@@ -4958,6 +4958,13 @@ mod named_tests {
             assert_eq!(path.matches(":/usr/bin").count(), 1, "{path}");
             assert!(
                 plist.contains(&format!("<key>PATH</key><string>{path}</string>")),
+                "{plist}"
+            );
+            assert!(
+                plist.contains(&format!(
+                    "<key>PROVENANCE_STATE_DIR</key><string>{}/.local/state/provenance</string>",
+                    home.display()
+                )),
                 "{plist}"
             );
             assert!(install::remove_pull_agent(&home, false).unwrap().is_some());

@@ -752,7 +752,7 @@ pub enum Mail {
 }
 
 pub fn mail_dir(home: &Path) -> PathBuf {
-    home.join(".local/state/provenance/mail")
+    crate::state::root(home).join("mail")
 }
 
 /// The mailbox of the session receiving messages.
@@ -829,7 +829,7 @@ fn mailbox_error(path: &Path, error: std::io::Error) -> anyhow::Error {
     let denied = matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES));
     let context = if denied {
         format!(
-            "writing mailbox {}: the session sandbox (for example, Codex workspace-write) may block writes under ~/.local/state/provenance/mail. The mailbox write failed; nothing was forwarded and the entry was not saved completely (a partial write may remain). Report this to the user; run the session with access to that folder. Do not change permissions",
+            "writing mailbox {}: the session sandbox (for example, Codex workspace-write) may block writes to provenance's state directory. The mailbox write failed; nothing was forwarded and the entry was not saved completely (a partial write may remain). Report this to the user; run the session with access to that folder. Do not change permissions",
             path.display()
         )
     } else {
