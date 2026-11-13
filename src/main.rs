@@ -1927,19 +1927,39 @@ fn forward_reply(
         None => route,
     };
     send::deliver_reply(&route, id, from, text)?;
+    Ok(reply_receipt(&route, id, to))
+}
+
+fn reply_receipt(route: &send::Delivery, id: &str, to: &send::Sender) -> String {
     if matches!(route, send::Delivery::ClaudeSocket(_)) {
-        Ok(format!(
+        format!(
             "Reply to {id} was written to the inbox socket for {}. Receipt is not confirmed.",
             label(Some(to))
-        ))
+        )
     } else if matches!(route, send::Delivery::CodexQueue(_)) {
-        Ok(format!(
+        format!(
             "Reply to {id} queued for {}. Receipt is not confirmed. The session must read the queue in a turn to act on it.",
             label(Some(to))
-        ))
+        )
     } else {
-        Ok(format!("Reply to {id} sent to {}.", label(Some(to))))
+        format!("Reply to {id} sent to {}.", label(Some(to)))
     }
+}
+
+#[test]
+fn codex_queue_reply_receipt_explains_unconfirmed_delivery() {
+    let to = send::Sender {
+        harness: Harness::Codex,
+        session_id: "target-session".into(),
+    };
+    assert_eq!(
+        reply_receipt(
+            &send::Delivery::CodexQueue(to.session_id.clone()),
+            "m-queue",
+            &to,
+        ),
+        "Reply to m-queue queued for Codex session target-session. Receipt is not confirmed. The session must read the queue in a turn to act on it."
+    );
 }
 
 /// `relay reply` on the machine a relayed message came from: accept a reply
@@ -2815,23 +2835,6 @@ mod send_cli_tests {
         );
         assert!(!error.contains("--force"));
         assert!(!error.contains("headless turn"));
-        let no_resume = <McpTools as mcp::Tools>::send(
-            &McpTools {
-                home: fixture_home.clone(),
-            },
-            pr,
-            "request without resume",
-            false,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            no_resume.contains("no matched session can take a message now"),
-            "{no_resume}"
-        );
-        assert!(no_resume.contains("stopped mid-turn"), "{no_resume}");
-        assert!(!no_resume.contains("headless turn"));
-        assert!(!send::mail_dir(&fixture_home).exists());
         for force in [false, true] {
             let error = send_cmd(&fixture_home, pr, "request", true, force, None)
                 .unwrap_err()
@@ -5267,6 +5270,58 @@ fn queue_acceptance_does_not_claim_receipt() {
         assert!(!text.contains("resume"));
         assert!(!text.starts_with("Sent "));
     }
+}
+
+#[test]
+fn production_mcp_send_honors_no_resume() {
+    let home = std::env::temp_dir().join(format!("prov-mcp-no-resume-{}", send::new_id()));
+    let cwd = home.join("target-session");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let target = send::Sender {
+        harness: Harness::Codex,
+        session_id: "target-session".into(),
+    };
+    let records = live::live_dir(&home);
+    std::fs::create_dir_all(&records).unwrap();
+    let record = live::Record {
+        harness: Harness::Codex,
+        session_id: target.session_id.clone(),
+        app: "Terminal".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        pid: None,
+        pid_started: None,
+        last_event: "SessionEnd".into(),
+        updated: Utc::now(),
+        branches: Vec::new(),
+        permission_mode: None,
+        transcript_path: None,
+    };
+    std::fs::write(
+        records.join("target-session.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let cwd_text = cwd.to_string_lossy();
+    names::Store::new(&home)
+        .register("Fixture", &target, &cwd_text, None)
+        .unwrap();
+
+    let error = <McpTools as mcp::Tools>::send(
+        &McpTools { home: home.clone() },
+        "@Fixture",
+        "request",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("we can't tell whether it's running"),
+        "{error}"
+    );
+    assert!(error.contains("add --resume"), "{error}");
+    assert!(!error.contains("headless turn"));
+    assert!(!send::mail_dir(&home).exists());
+    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
