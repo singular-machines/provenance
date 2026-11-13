@@ -2908,7 +2908,7 @@ mod send_cli_tests {
         assert!(entry.get("pr").is_none());
         // Exercise the production MCP adapter through resolution, planning,
         // mailbox persistence, and delivery.
-        record.last_event = "Stop".into();
+        record.last_event = "SessionEnd".into();
         record.pid = Some(987654);
         record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
         std::fs::write(
@@ -2940,6 +2940,7 @@ mod send_cli_tests {
         );
         // The fake ps identifies this parent as the sender. Self exclusion must
         // win even with force; dropping sender at the real entry point breaks it.
+        record.last_event = "Stop".into();
         record.pid = Some(std::os::unix::process::parent_id());
         record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
         std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
