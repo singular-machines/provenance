@@ -12,6 +12,7 @@ mod render;
 mod send;
 mod sessions;
 mod stamps;
+mod state;
 mod update;
 
 use std::collections::HashMap;
@@ -248,9 +249,9 @@ fn main() -> Result<()> {
 
 fn dispatch(cli: Cli) -> Result<()> {
     let home = || -> Result<PathBuf> {
-        Ok(PathBuf::from(
-            std::env::var_os("HOME").context("HOME is not set")?,
-        ))
+        let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+        state::validate()?;
+        Ok(home)
     };
     match cli.command {
         Cmd::Prs {
@@ -346,8 +347,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 HarnessArg::Codex => Harness::Codex,
                 HarnessArg::Pi => Harness::Pi,
             };
-            if let Ok(home) = home() {
-                live::run_hook(h, &home);
+            match home() {
+                Ok(home) => live::run_hook(h, &home),
+                Err(error) => eprintln!("provenance hook skipped: {error:#}"),
             }
             Ok(())
         }
@@ -384,6 +386,66 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             println!("{out}");
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod hook_config_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn invalid_hook_configuration_skips_without_failing_harness() {
+        const CHILD: &str = "PROVENANCE_HOOK_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cli = Cli::try_parse_from(["provenance", "hook", "codex"]).unwrap();
+            assert!(dispatch(cli).is_ok());
+            return;
+        }
+
+        for missing_home in [false, true] {
+            let suffix = send::new_id();
+            let home = std::env::temp_dir().join(format!("prov-hook-home-{suffix}"));
+            std::fs::create_dir_all(&home).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "hook_config_tests::invalid_hook_configuration_skips_without_failing_harness",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            if missing_home {
+                command
+                    .env_remove("HOME")
+                    .env_remove("PROVENANCE_STATE_DIR")
+                    .env_remove("PROVENANCE_STATE_TEST_USE_ENV");
+            } else {
+                command
+                    .env("HOME", &home)
+                    .env("PROVENANCE_STATE_DIR", "relative")
+                    .env("PROVENANCE_STATE_TEST_USE_ENV", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("provenance hook skipped"), "{stderr}");
+            if missing_home {
+                assert!(stderr.contains("HOME is not set"), "{stderr}");
+            } else {
+                assert!(
+                    stderr.contains("PROVENANCE_STATE_DIR must be an absolute path"),
+                    "{stderr}"
+                );
+                assert!(!home.join(".local/state/provenance").exists());
+            }
+            std::fs::remove_dir_all(home).unwrap();
         }
     }
 }
@@ -1010,6 +1072,23 @@ fn plan_recipient(
     if sender.is_some_and(|me| me.harness == s.harness && me.session_id == s.session_id) {
         return send::Delivery::Refuse("it's this session".into());
     }
+    // A dead hook PID does not close T3's exact native conversation. Keep
+    // remote/web targets and every other refusal under the normal planner.
+    if process == go::Process::Gone
+        && s.url.is_none()
+        && s.machine
+            .as_deref()
+            .is_none_or(|m| Some(m) == stamps::machine_name().as_deref())
+        && let Some(route) = send::exact_t3_route(
+            home,
+            &send::Sender {
+                harness: s.harness,
+                session_id: s.session_id.clone(),
+            },
+        )
+    {
+        return route;
+    }
     let delivery = send::plan(
         s,
         state,
@@ -1631,12 +1710,15 @@ fn deliver_message(
 
 /// Why a planned delivery can't run, found without side effects, so a relay
 /// dry run refuses exactly what delivery would.
-fn resume_precondition(s: &sessions::Sighting, delivery: &send::Delivery) -> Option<&'static str> {
-    (s.harness == sessions::Harness::Codex
-        && matches!(delivery, send::Delivery::Resume { .. })
-        && !send::codex_resume_repo(&s.cwd))
-    .then_some(
-        "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written",
+fn resume_precondition(s: &sessions::Sighting, delivery: &send::Delivery) -> Option<String> {
+    if s.harness != sessions::Harness::Codex || !matches!(delivery, send::Delivery::Resume { .. }) {
+        return None;
+    }
+    if !std::path::Path::new(&s.cwd).is_dir() {
+        return Some(format!("the session's folder is gone: {}", s.cwd));
+    }
+    (!send::codex_resume_repo(&s.cwd)).then_some(
+        "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written".into(),
     )
 }
 
@@ -1945,19 +2027,39 @@ fn forward_reply(
         None => route,
     };
     send::deliver_reply(&route, id, from, text)?;
+    Ok(reply_receipt(&route, id, to))
+}
+
+fn reply_receipt(route: &send::Delivery, id: &str, to: &send::Sender) -> String {
     if matches!(route, send::Delivery::ClaudeSocket(_)) {
-        Ok(format!(
+        format!(
             "Reply to {id} was written to the inbox socket for {}. Receipt is not confirmed.",
             label(Some(to))
-        ))
+        )
     } else if matches!(route, send::Delivery::CodexQueue(_)) {
-        Ok(format!(
+        format!(
             "Reply to {id} queued for {}. Receipt is not confirmed. The session must read the queue in a turn to act on it.",
             label(Some(to))
-        ))
+        )
     } else {
-        Ok(format!("Reply to {id} sent to {}.", label(Some(to))))
+        format!("Reply to {id} sent to {}.", label(Some(to)))
     }
+}
+
+#[test]
+fn codex_queue_reply_receipt_explains_unconfirmed_delivery() {
+    let to = send::Sender {
+        harness: Harness::Codex,
+        session_id: "target-session".into(),
+    };
+    assert_eq!(
+        reply_receipt(
+            &send::Delivery::CodexQueue(to.session_id.clone()),
+            "m-queue",
+            &to,
+        ),
+        "Reply to m-queue queued for Codex session target-session. Receipt is not confirmed. The session must read the queue in a turn to act on it."
+    );
 }
 
 /// `relay reply` on the machine a relayed message came from: accept a reply
@@ -1978,12 +2080,17 @@ fn relayed_message(
     mailbox: &std::path::Path,
     r: &relay::ReplyEnvelope,
     between: impl FnOnce(),
-) -> Option<send::Mail> {
+) -> Result<Option<send::Mail>> {
     let held = send::Relaying::find(dir, &r.id).filter(|held| {
         matches!(held, send::Mail::Message { to_machine: Some(m), .. } if *m == r.from_machine)
     });
     between();
-    held.or_else(|| send::find_message(mailbox, &r.id))
+    Ok(match held {
+        Some(held) => Some(held),
+        // Relay refusals go back to the peer, so keep local mailbox paths
+        // and parse details out of the remote-facing response.
+        None => send::find_message(mailbox, &r.id).ok().flatten(),
+    })
 }
 
 fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Result<relay::Outcome> {
@@ -1995,7 +2102,7 @@ fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Resu
     }
     let dir = send::mail_dir(home);
     let mailbox = send::mailbox(&dir, r.replier.harness, &r.replier.session_id);
-    let message = relayed_message(&dir, &mailbox, r, || {});
+    let message = relayed_message(&dir, &mailbox, r, || {})?;
     let refused = || {
         anyhow::anyhow!(
             "no message {} was relayed from here to {}",
@@ -2294,6 +2401,17 @@ impl<B: SendBackend> mcp::Tools for McpTools<B> {
 #[cfg(test)]
 mod send_cli_tests {
     use super::*;
+    use std::io::Write;
+
+    fn is_isolated_fixture_child(
+        marker: Option<&std::ffi::OsStr>,
+        fixture_home: Option<&std::path::Path>,
+        home: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        marker == Some(std::ffi::OsStr::new("1"))
+            && fixture_home.map(std::path::Path::as_os_str) == home
+            && fixture_home.is_some_and(|path| path.is_dir())
+    }
 
     fn assert_reply_frame(text: &str, body: &str) {
         assert!(text.starts_with("[provenance] Reply to message m-1 from Codex session test."));
@@ -2493,6 +2611,72 @@ mod send_cli_tests {
     }
 
     #[test]
+    fn mcp_stdin_wrapper_dispatches_production_server() {
+        let isolated = std::env::var_os("PROVENANCE_MCP_WRAPPER_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("PROVENANCE_FIXTURE_HOME").as_deref()
+                == std::env::var_os("HOME").as_deref();
+        if !isolated {
+            let root = std::env::temp_dir().join(format!("prov-mcp-{}", send::new_id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "send_cli_tests::mcp_stdin_wrapper_dispatches_production_server",
+                    "--nocapture",
+                ])
+                .env("PROVENANCE_MCP_WRAPPER_CHILD", "1")
+                .env("PROVENANCE_FIXTURE_HOME", &root)
+                .env("HOME", &root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n",
+                )
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let response = stdout
+                .lines()
+                .find(|line| line.starts_with("{\"jsonrpc\""))
+                .unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(response).unwrap();
+            assert!(
+                value["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "send")
+            );
+            return;
+        }
+        dispatch(Cli::try_parse_from(["provenance", "mcp"]).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn exported_fixture_marker_alone_does_not_skip_isolated_setup() {
+        assert!(!is_isolated_fixture_child(
+            Some(std::ffi::OsStr::new("1")),
+            None,
+            Some(std::ffi::OsStr::new("/ambient/home")),
+        ));
+    }
+
+    #[test]
     fn cli_failed_turn_fences_stderr_and_escapes_controls() {
         let d = send::Delivery::Resume {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
@@ -2549,7 +2733,13 @@ mod send_cli_tests {
     fn resolved_send_preserves_caller_log_and_sender() {
         // Run in a child with isolated HOME and executables; never mutate the test
         // runner's environment or discover/resume an actual harness session.
-        if std::env::var_os("PROVENANCE_FIXTURE_CHILD").is_none() {
+        let fixture_home = std::env::var_os("PROVENANCE_FIXTURE_HOME").map(PathBuf::from);
+        let isolated_child = is_isolated_fixture_child(
+            std::env::var_os("PROVENANCE_FIXTURE_CHILD").as_deref(),
+            fixture_home.as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
+        if !isolated_child {
             use std::os::unix::fs::PermissionsExt;
             let root = std::env::temp_dir().join(format!("prov-fixtures-{}", send::new_id()));
             std::fs::create_dir_all(&root).unwrap();
@@ -2572,7 +2762,8 @@ mod send_cli_tests {
                 std::fs::write(&path, script).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "send_cli_tests::resolved_send_preserves_caller_log_and_sender",
@@ -2581,14 +2772,20 @@ mod send_cli_tests {
                 .env_remove("CODEX_THREAD_ID")
                 .env_remove("CODEX_SESSION_ID")
                 .env("PROVENANCE_FIXTURE_CHILD", "1")
+                .env("PROVENANCE_FIXTURE_HOME", &root)
                 .env("HOME", &root)
                 .env("PROVENANCE_MACHINE", "fixture")
                 .env(
                     "PATH",
                     format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
-                )
-                .output()
-                .unwrap();
+                );
+            for (key, _) in std::env::vars_os().filter(|(key, _)| {
+                key.to_string_lossy().starts_with("XDG_")
+                    || key.to_string_lossy().starts_with("PI_")
+            }) {
+                command.env_remove(key);
+            }
+            let output = command.output().unwrap();
             std::fs::remove_dir_all(root).unwrap();
             assert!(
                 output.status.success(),
@@ -2599,6 +2796,7 @@ mod send_cli_tests {
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
             return;
         }
+        assert_eq!(fixture_home, std::env::var_os("HOME").map(PathBuf::from));
         let home = std::env::temp_dir().join(format!("prov-resolved-{}", send::new_id()));
         std::fs::create_dir_all(&home).unwrap();
         let target = matching::SessionMatch {
@@ -2717,6 +2915,7 @@ mod send_cli_tests {
                 last_seen: Utc::now(),
             }],
             permission_mode: None,
+            permission_mode_observed_at: None,
             transcript_path: Some(
                 home.join("real-wiring.jsonl")
                     .to_string_lossy()
@@ -2816,8 +3015,41 @@ mod send_cli_tests {
             record.session_id
         );
         assert!(entry.get("pr").is_none());
+        // Exercise the production MCP adapter through resolution, planning,
+        // mailbox persistence, and delivery.
+        record.last_event = "SessionEnd".into();
+        record.pid = Some(987654);
+        record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
+        std::fs::write(
+            record.transcript_path.as_ref().unwrap(),
+            "fixture transcript",
+        )
+        .unwrap();
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let mcp_error = <McpTools as mcp::Tools>::send(
+            &McpTools {
+                home: fixture_home.clone(),
+            },
+            pr,
+            "mcp request",
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mcp_error.contains("Diagnostics (stderr)"), "{mcp_error}");
+        let target_mailbox = send::mailbox(
+            &send::mail_dir(&fixture_home),
+            record.harness,
+            &record.session_id,
+        );
+        assert!(
+            std::fs::read_to_string(target_mailbox)
+                .unwrap()
+                .contains("mcp request")
+        );
         // The fake ps identifies this parent as the sender. Self exclusion must
         // win even with force; dropping sender at the real entry point breaks it.
+        record.last_event = "Stop".into();
         record.pid = Some(std::os::unix::process::parent_id());
         record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
         std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
@@ -3031,6 +3263,7 @@ mod identity_tests {
             branches: Vec::new(),
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         }
     }
     #[test]
@@ -3196,6 +3429,7 @@ mod named_tests {
             branches: Vec::new(),
             transcript_path: None,
             permission_mode: None,
+            permission_mode_observed_at: None,
         }
     }
     fn scratch() -> PathBuf {
@@ -3264,7 +3498,7 @@ mod named_tests {
             .unwrap();
         let mut r = record("exact", Harness::Codex, u32::MAX, "gone");
         r.cwd = "/actual-folder".into();
-        let (s, state, process) = named_recipient(&binding, &[r.clone()]).unwrap();
+        let (s, state, process) = named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
         assert_eq!(s.cwd, "/actual-folder");
         assert!(matches!(
             plan_recipient(&home, &s, state, process, None, false, send::Caller::Mcp),
@@ -3274,7 +3508,7 @@ mod named_tests {
         r.pid = Some(std::process::id());
         r.pid_started = Some(started);
         r.last_event = "UserPromptSubmit".into();
-        let (s, state, process) = named_recipient(&binding, &[r.clone()]).unwrap();
+        let (s, state, process) = named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
         assert_eq!(
             plan_recipient(&home, &s, state, process, None, false, send::Caller::Mcp),
             send::Delivery::CodexQueue("exact".into())
@@ -3694,7 +3928,7 @@ mod named_tests {
     fn bypass_socket_reroutes_through_t3_when_t3_hosts_the_session() {
         let Ok(case) = std::env::var("PROVENANCE_T3_FIXTURE") else {
             let root = scratch();
-            for case in ["default", "custom"] {
+            for case in ["default", "custom", "dead"] {
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command
                     .args([
@@ -3730,8 +3964,7 @@ mod named_tests {
             "custom" => PathBuf::from(std::env::var("T3CODE_HOME").unwrap().trim()),
             _ => home.join(".t3"),
         };
-        let (r, s) = socket_target_with_id(&home, Some("bypassPermissions"), session);
-        t3_add(&base, "thread-9", "p9", session, "strong", true);
+        let (mut r, s) = socket_target_with_id(&home, Some("bypassPermissions"), session);
         let bin = home.join(".t3/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let t3 = bin.join("t3");
@@ -3744,6 +3977,93 @@ mod named_tests {
         )
         .unwrap();
         std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if case == "dead" {
+            r.pid = Some(u32::MAX);
+            std::fs::write(
+                live::live_dir(&home).join("target.json"),
+                serde_json::to_vec(&r).unwrap(),
+            )
+            .unwrap();
+            let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+            assert_eq!(
+                named_recipient(&binding, std::slice::from_ref(&r))
+                    .unwrap()
+                    .2,
+                go::Process::Gone
+            );
+            // Every rejected mapping goes through the names and send planners.
+            for invalid in [
+                "historical",
+                "weak",
+                "ambiguous",
+                "switched",
+                "archived",
+                "deleted",
+                "other-session",
+                "other-harness",
+            ] {
+                t3_sql(
+                    &base,
+                    "DROP TABLE IF EXISTS orchestration_v2_projection_threads; DROP TABLE IF EXISTS orchestration_v2_projection_provider_threads;",
+                );
+                let other = "d4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+                t3_add(
+                    &base,
+                    "thread-9",
+                    "p9",
+                    if invalid == "other-session" {
+                        other
+                    } else {
+                        session
+                    },
+                    if invalid == "weak" { "weak" } else { "strong" },
+                    invalid != "historical",
+                );
+                match invalid {
+                    "ambiguous" => t3_add(&base, "thread-10", "p10", session, "strong", true),
+                    "switched" => t3_add(&base, "thread-9", "p10", other, "strong", true),
+                    "archived" => t3_sql(
+                        &base,
+                        "UPDATE orchestration_v2_projection_threads SET archived_at = 'now';",
+                    ),
+                    "deleted" => t3_sql(
+                        &base,
+                        "UPDATE orchestration_v2_projection_threads SET deleted_at = 'now';",
+                    ),
+                    "other-harness" => t3_sql(
+                        &base,
+                        "UPDATE orchestration_v2_projection_provider_threads SET payload_json = json_set(payload_json, '$.nativeThreadRef.driver', 'codex');",
+                    ),
+                    _ => {}
+                }
+                assert!(
+                    binding_status(&home, "socket-target", &binding, std::slice::from_ref(&r))
+                        .unwrap()["availability"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("unavailable:"),
+                    "{invalid}"
+                );
+                assert!(
+                    send_message(
+                        &home,
+                        "@Socket Target",
+                        "never deliver",
+                        false,
+                        send::Caller::Mcp
+                    )
+                    .is_err(),
+                    "{invalid}"
+                );
+                assert!(!send::mail_dir(&home).exists(), "{invalid}");
+                assert!(!home.join("t3-args.txt").exists());
+            }
+            t3_sql(
+                &base,
+                "DROP TABLE orchestration_v2_projection_threads; DROP TABLE orchestration_v2_projection_provider_threads;",
+            );
+        }
+        t3_add(&base, "thread-9", "p9", session, "strong", true);
         let planned = send::Delivery::T3Thread {
             bin: t3.clone(),
             base: base.clone(),
@@ -3753,12 +4073,21 @@ mod named_tests {
             &home,
             &s,
             Some(live::State::Running),
-            go::Process::Live(std::process::id()),
+            if case == "dead" {
+                go::Process::Gone
+            } else {
+                go::Process::Live(std::process::id())
+            },
             None,
             false,
             send::Caller::Mcp,
         );
         assert_eq!(delivery, planned);
+        let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+        assert_eq!(
+            binding_status(&home, "socket-target", &binding, std::slice::from_ref(&r)).unwrap()["availability"],
+            "available"
+        );
         let sent = send_message(
             &home,
             "@Socket Target",
@@ -3814,6 +4143,78 @@ mod named_tests {
         assert_eq!(send::read(&mailbox).len(), 1);
         std::fs::remove_dir_all(home).unwrap();
     }
+    #[test]
+    fn dead_pid_t3_mapping_revalidated_before_dispatch() {
+        let home = scratch();
+        let session = "c4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let (mut r, s) = socket_target_with_id(&home, None, session);
+        r.pid = Some(u32::MAX);
+        std::fs::write(
+            live::live_dir(&home).join("target.json"),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+        let base = send::t3_base(&home, std::env::var_os("T3CODE_HOME"));
+        // Do not touch an ambient T3 database: execute the case in an isolated child.
+        if std::env::var_os("PROVENANCE_REVALIDATION_FIXTURE").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "named_tests::dead_pid_t3_mapping_revalidated_before_dispatch",
+                ])
+                .env_remove("T3CODE_HOME")
+                .env("PROVENANCE_REVALIDATION_FIXTURE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        t3_add(&base, "thread", "provider", session, "strong", true);
+        let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+        let (sighting, state, process) = named_recipient(&binding, &[r]).unwrap();
+        let delivery = plan_recipient(
+            &home,
+            &sighting,
+            state,
+            process,
+            None,
+            false,
+            send::Caller::Mcp,
+        );
+        assert!(matches!(delivery, send::Delivery::T3Thread { .. }));
+        t3_add(
+            &base,
+            "thread",
+            "switched",
+            "d4217d94-c60f-4ad7-9b6b-1b7b52976ea4",
+            "strong",
+            true,
+        );
+        let error = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery,
+                sender: None,
+                pr: None,
+                named: None,
+                note: None,
+            },
+            "never deliver",
+            &|_, _, _, _, _, _, _| panic!("refusal must precede transport"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("nothing was delivered"));
+        assert!(!send::mail_dir(&home).exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
     /// Two "machines" in one test: `here` sends, `there` runs `relay deliver`
     /// through a transport that hands it the envelope directly.
     /// Pins this thread's machine name too, so `PROVENANCE_MACHINE` can't
@@ -3850,7 +4251,13 @@ mod named_tests {
         home: &std::path::Path,
     ) -> (live::Record, std::os::unix::net::UnixListener) {
         let (r, _) = socket_target_with_id(home, None, "e4217d94-c60f-4ad7-9b6b-1b7b52976ea4");
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            send::new_id()
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             home.join(format!(".claude/sessions/{}.json", r.pid.unwrap())),
@@ -4488,19 +4895,28 @@ mod named_tests {
         let found = relayed_message(&dir, &mailbox, &reply("m-0000000000a1"), || {
             send::append_new(&mailbox, &message("m-0000000000a1")).unwrap();
             drop(held);
-        });
+        })
+        .unwrap();
         assert!(found.is_some(), "held at the first read");
         let held = send::Relaying::hold(&dir, &message("m-0000000000a2")).unwrap();
         send::append_new(&mailbox, &message("m-0000000000a2")).unwrap();
         drop(held);
-        assert!(relayed_message(&dir, &mailbox, &reply("m-0000000000a2"), || {}).is_some());
+        assert!(
+            relayed_message(&dir, &mailbox, &reply("m-0000000000a2"), || {})
+                .unwrap()
+                .is_some()
+        );
         // A hold for another machine never matches.
         let _held = send::Relaying::hold(&dir, &message("m-0000000000a3")).unwrap();
         let other = relay::ReplyEnvelope {
             from_machine: "m-other".into(),
             ..reply("m-0000000000a3")
         };
-        assert!(relayed_message(&dir, &mailbox, &other, || {}).is_none());
+        assert!(
+            relayed_message(&dir, &mailbox, &other, || {})
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(here).unwrap();
     }
     /// The way back for a machine `there` can't reach: `here` asks, and
@@ -4765,6 +5181,13 @@ mod named_tests {
                 plist.contains(&format!("<key>PATH</key><string>{path}</string>")),
                 "{plist}"
             );
+            assert!(
+                plist.contains(&format!(
+                    "<key>PROVENANCE_STATE_DIR</key><string>{}/.local/state/provenance</string>",
+                    home.display()
+                )),
+                "{plist}"
+            );
             assert!(install::remove_pull_agent(&home, false).unwrap().is_some());
             assert!(!install::pull_agent_path(&home).exists());
         }
@@ -4814,7 +5237,13 @@ mod named_tests {
         // Passed back again before the session is back: still not forwarded.
         assert!(relay_reply(&here, &reply).how.contains("not forwarded yet"));
         // The session is back; the next pull forwards it, without asking any machine.
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            send::new_id()
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             here.join(format!(".claude/sessions/{}.json", sender.pid.unwrap())),
@@ -5008,6 +5437,35 @@ mod named_tests {
         std::fs::remove_dir_all(here).unwrap();
     }
     #[test]
+    fn missing_relay_mailbox_keeps_generic_refusal_without_local_path() {
+        stamps::set_test_machine("m-here");
+        let here = scratch();
+        let replier = send::Sender {
+            harness: Harness::Codex,
+            session_id: "remote-codex".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&here), replier.harness, &replier.session_id);
+        let outcome = relay_reply(
+            &here,
+            &relay::ReplyEnvelope {
+                protocol: relay::PROTOCOL,
+                id: "m-0000000000ef".into(),
+                from_machine: "m-remote".into(),
+                replier,
+                text: "answer".into(),
+            },
+        );
+        assert!(!outcome.accepted);
+        let why = outcome.why.unwrap();
+        assert!(
+            why.contains("no message m-0000000000ef was relayed from here to"),
+            "{why}"
+        );
+        assert!(!why.contains(&mailbox.display().to_string()), "{why}");
+        std::fs::remove_dir_all(here).unwrap();
+    }
+
+    #[test]
     fn a_reply_to_an_unpaired_or_older_machine_stays_saved_and_says_why() {
         let (here, there, _) = relay_pair();
         let (r, _listener) = listening_target(&there);
@@ -5143,14 +5601,14 @@ mod reply_cli_tests {
                 std::fs::write(&p, script).unwrap();
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            for case in ["cli", "mcp"] {
+            for case in ["cli", "mcp", "mcp-ambiguous"] {
                 let home = root.join(case);
                 std::fs::create_dir_all(&home).unwrap();
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command.args(["--exact","reply_cli_tests::cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership","--nocapture"])
                     .env("HOME",home).env("PATH",format!("{}:{}",bin.display(),std::env::var("PATH").unwrap()))
                     .env("PROVENANCE_REPLY_FIXTURE",case).env_remove("CODEX_THREAD_ID").env_remove("CODEX_SESSION_ID");
-                if case == "cli" {
+                if case != "mcp-ambiguous" {
                     command
                         .env("CODEX_THREAD_ID", "recipient-a")
                         .env("CODEX_SESSION_ID", "recipient-a");
@@ -5202,7 +5660,7 @@ mod reply_cli_tests {
             )
             .unwrap();
         }
-        if case == "mcp" {
+        if case == "mcp-ambiguous" {
             use mcp::Tools;
             let error = McpTools { home: home.clone() }
                 .reply("m-owned", "answer")
@@ -5222,6 +5680,28 @@ mod reply_cli_tests {
                 .is_none()
             );
             assert!(!home.join("transport.txt").exists());
+            return;
+        }
+        if case == "mcp" {
+            use mcp::Tools;
+            let receipt = McpTools { home: home.clone() }
+                .reply("m-owned", "answer")
+                .unwrap();
+            assert!(receipt.contains("Receipt is not confirmed"));
+            assert!(
+                send::reply_to(
+                    &send::mailbox(
+                        &send::mail_dir(&home),
+                        recipient.harness,
+                        &recipient.session_id
+                    ),
+                    "m-owned"
+                )
+                .as_deref()
+                    == Some("answer")
+            );
+            let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
+            assert!(transport.contains("queue --thread original-sender"));
             return;
         }
         dispatch(Cli::try_parse_from(["provenance", "reply", "m-owned", "answer"]).unwrap())
@@ -5246,11 +5726,43 @@ mod reply_cli_tests {
         let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
         assert!(transport.contains("queue --thread original-sender"));
         assert!(transport.contains("Reply to message m-owned"));
-        assert!(
+        let recipient_a_path = send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-a");
+        let recipient_a_before = std::fs::read(&recipient_a_path).unwrap();
+        let recipient_b_path = send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-b");
+        let recipient_b_before = std::fs::read(&recipient_b_path).unwrap();
+        std::fs::remove_file(home.join("transport.txt")).unwrap();
+        let wrong =
             dispatch(Cli::try_parse_from(["provenance", "reply", "m-wrong", "bad"]).unwrap())
-                .unwrap_err()
-                .to_string()
-                .contains("no message m-wrong was sent to this session")
+                .unwrap_err();
+        let wrong_text = format!("{wrong:#}");
+        assert!(
+            wrong_text.contains("no message m-wrong was sent"),
+            "{wrong_text}"
+        );
+        assert!(
+            wrong_text.contains("Codex session recipient-a"),
+            "{wrong_text}"
+        );
+        assert!(
+            wrong_text.contains(
+                &send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-a")
+                    .display()
+                    .to_string()
+            ),
+            "{wrong_text}"
+        );
+        assert_eq!(
+            std::fs::read(&recipient_a_path).unwrap(),
+            recipient_a_before,
+            "wrong-recipient refusal must not modify the caller mailbox"
+        );
+        assert_eq!(
+            std::fs::read(&recipient_b_path).unwrap(),
+            recipient_b_before
+        );
+        assert!(
+            !home.join("transport.txt").exists(),
+            "wrong-recipient refusal must not send"
         );
         let rpath = dir.join("original-sender.json");
         let mut r: serde_json::Value =
@@ -5285,8 +5797,90 @@ fn queue_acceptance_does_not_claim_receipt() {
 }
 
 #[test]
+fn production_mcp_send_honors_no_resume() {
+    let home = std::env::temp_dir().join(format!("prov-mcp-no-resume-{}", send::new_id()));
+    let cwd = home.join("target-session");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let target = send::Sender {
+        harness: Harness::Codex,
+        session_id: "target-session".into(),
+    };
+    let records = live::live_dir(&home);
+    std::fs::create_dir_all(&records).unwrap();
+    let record = live::Record {
+        harness: Harness::Codex,
+        session_id: target.session_id.clone(),
+        app: "Terminal".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        pid: None,
+        pid_started: None,
+        last_event: "SessionEnd".into(),
+        updated: Utc::now(),
+        branches: Vec::new(),
+        permission_mode: None,
+        permission_mode_observed_at: None,
+        transcript_path: None,
+    };
+    std::fs::write(
+        records.join("target-session.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let cwd_text = cwd.to_string_lossy();
+    names::Store::new(&home)
+        .register("Fixture", &target, &cwd_text, None)
+        .unwrap();
+
+    let error = <McpTools as mcp::Tools>::send(
+        &McpTools { home: home.clone() },
+        "@Fixture",
+        "request",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("we can't tell whether it's running"),
+        "{error}"
+    );
+    assert!(error.contains("add --resume"), "{error}");
+    assert!(!error.contains("--force"));
+    assert!(!error.contains("headless turn"));
+    assert!(!send::mail_dir(&home).exists());
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn non_git_resume_refuses_before_mailbox_or_transport() {
-    let home = std::env::temp_dir().join(format!("zz-resume-{}", send::new_id()));
+    let root = std::env::var_os("PROVENANCE_NON_GIT_FIXTURE_HOME").map(PathBuf::from);
+    let isolated = std::env::var_os("PROVENANCE_NON_GIT_FIXTURE_CHILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && root == std::env::var_os("HOME").map(PathBuf::from)
+        && root.as_ref().is_some_and(|path| path.is_dir());
+    if !isolated {
+        let root = std::env::temp_dir().join(format!("prov-non-git-{}", send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "non_git_resume_refuses_before_mailbox_or_transport",
+            ])
+            .env("PROVENANCE_NON_GIT_FIXTURE_CHILD", "1")
+            .env("PROVENANCE_NON_GIT_FIXTURE_HOME", &root)
+            .env("HOME", &root)
+            .env("GIT_CEILING_DIRECTORIES", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let home = root.unwrap().join(format!("session-{}", send::new_id()));
     std::fs::create_dir_all(&home).unwrap();
     let sighting = sessions::Sighting {
         harness: Harness::Codex,
@@ -5321,6 +5915,81 @@ fn non_git_resume_refuses_before_mailbox_or_transport() {
     assert!(error.contains("no mailbox entry"));
     assert!(!send::mail_dir(&home).exists());
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn deleted_codex_resume_reports_gone_folder_before_mail_or_transport() {
+    let root = std::env::temp_dir().join(format!("prov-deleted-{}", send::new_id()));
+    let home = root.join("gone-session");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    let sighting = sessions::Sighting {
+        harness: Harness::Codex,
+        session_id: "deleted-fixture".into(),
+        app: "Terminal".into(),
+        cwd: home.to_string_lossy().into_owned(),
+        branch: String::new(),
+        repo_url: None,
+        last_seen: Utc::now(),
+        log_path: None,
+        machine: None,
+        url: None,
+    };
+    let outgoing = Outgoing {
+        sighting,
+        delivery: send::Delivery::Resume {
+            cwd: home.to_string_lossy().into_owned(),
+            argv: send::headless_argv(Harness::Codex, "deleted-fixture"),
+        },
+        sender: None,
+        pr: None,
+        named: None,
+        note: None,
+    };
+    let error = deliver_message(&root, outgoing, "hello", &|_, _, _, _, _, _, _| {
+        panic!("transport must not run")
+    })
+    .err()
+    .expect("deleted-folder send must be refused")
+    .to_string();
+    assert!(error.contains(&format!("the session's folder is gone: {}", home.display())));
+    assert!(!send::mail_dir(&root).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_resume_is_allowed_in_a_non_git_folder() {
+    let cwd = std::env::temp_dir()
+        .join(format!("prov-claude-non-git-{}", send::new_id()))
+        .to_string_lossy()
+        .into_owned();
+    let sighting = sessions::Sighting {
+        harness: Harness::ClaudeCode,
+        session_id: "claude-fixture".into(),
+        app: "Terminal".into(),
+        cwd: cwd.clone(),
+        branch: String::new(),
+        repo_url: None,
+        last_seen: Utc::now(),
+        log_path: None,
+        machine: None,
+        url: None,
+    };
+    let planned = send::plan(
+        &sighting,
+        Some(live::State::Ended),
+        go::Process::Gone,
+        true,
+        send::Caller::Mcp,
+        None,
+        &|_, _| None,
+    );
+    assert!(matches!(planned, send::Delivery::Resume { .. }));
+    let delivery = send::Delivery::Resume {
+        cwd,
+        argv: send::headless_argv(Harness::ClaudeCode, "claude-fixture"),
+    };
+    assert!(resume_precondition(&sighting, &delivery).is_none());
 }
 
 #[cfg(test)]

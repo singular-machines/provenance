@@ -75,7 +75,7 @@ pub struct Store {
 impl Store {
     pub fn new(home: &Path) -> Self {
         Self {
-            dir: home.join(".local/state/provenance"),
+            dir: crate::state::root(home),
         }
     }
     fn prepare(&self) -> Result<()> {
