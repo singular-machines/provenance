@@ -5493,6 +5493,7 @@ fn production_mcp_send_honors_no_resume() {
         updated: Utc::now(),
         branches: Vec::new(),
         permission_mode: None,
+        permission_mode_observed_at: None,
         transcript_path: None,
     };
     std::fs::write(
