@@ -235,12 +235,34 @@ pub fn socket_refusal(home: &Path, target: &Sender, delivery: &Delivery) -> Opti
         return None;
     }
     Some(format!(
-        "{BYPASS_REASON}; nothing was delivered. Use a session not running in bypass mode, or one hosted by T3 Code"
+        "{BYPASS_REASON} {}; nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code",
+        observation_age(record.updated, Utc::now())
     ))
 }
 
-pub const BYPASS_REASON: &str =
-    "Claude Code holds socket messages from provenance when the target is in bypass mode";
+pub const BYPASS_REASON: &str = "Claude Code holds socket messages from provenance when the target was last observed in bypass mode";
+
+fn observation_age(updated: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(updated).num_seconds().max(0);
+    if seconds < 60 {
+        format!(
+            "({seconds} second{} ago)",
+            if seconds == 1 { "" } else { "s" }
+        )
+    } else if seconds < 3_600 {
+        let minutes = seconds / 60;
+        format!(
+            "({minutes} minute{} ago)",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else if seconds < 86_400 {
+        let hours = seconds / 3_600;
+        format!("({hours} hour{} ago)", if hours == 1 { "" } else { "s" })
+    } else {
+        let days = seconds / 86_400;
+        format!("({days} day{} ago)", if days == 1 { "" } else { "s" })
+    }
+}
 
 /// Retain refusal evidence from selection without probing the session again.
 pub fn bypass_note(reasons: &[String]) -> Option<String> {
@@ -1146,6 +1168,30 @@ mod tests {
         assert!(note.contains("Skipped 1 newer"));
         assert!(note.contains(BYPASS_REASON));
         assert!(bypass_note(&["not running".into()]).is_none());
+    }
+
+    #[test]
+    fn bypass_refusal_describes_observation_age_and_refresh_action() {
+        assert_eq!(
+            BYPASS_REASON,
+            "Claude Code holds socket messages from provenance when the target was last observed in bypass mode"
+        );
+        let now = Utc::now();
+        assert_eq!(
+            observation_age(now - chrono::Duration::minutes(3), now),
+            "(3 minutes ago)"
+        );
+        assert_eq!(
+            observation_age(now - chrono::Duration::seconds(1), now),
+            "(1 second ago)"
+        );
+        let refusal = format!(
+            "{BYPASS_REASON} (3 minutes ago); nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
+        );
+        assert_eq!(
+            refusal,
+            "Claude Code holds socket messages from provenance when the target was last observed in bypass mode (3 minutes ago); nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
+        );
     }
 
     #[test]
