@@ -1957,12 +1957,15 @@ fn relayed_message(
     mailbox: &std::path::Path,
     r: &relay::ReplyEnvelope,
     between: impl FnOnce(),
-) -> Option<send::Mail> {
+) -> Result<Option<send::Mail>> {
     let held = send::Relaying::find(dir, &r.id).filter(|held| {
         matches!(held, send::Mail::Message { to_machine: Some(m), .. } if *m == r.from_machine)
     });
     between();
-    held.or_else(|| send::find_message(mailbox, &r.id))
+    Ok(match held {
+        Some(held) => Some(held),
+        None => send::find_message(mailbox, &r.id)?,
+    })
 }
 
 fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Result<relay::Outcome> {
@@ -1974,7 +1977,7 @@ fn relay_reply_checked(home: &std::path::Path, r: &relay::ReplyEnvelope) -> Resu
     }
     let dir = send::mail_dir(home);
     let mailbox = send::mailbox(&dir, r.replier.harness, &r.replier.session_id);
-    let message = relayed_message(&dir, &mailbox, r, || {});
+    let message = relayed_message(&dir, &mailbox, r, || {})?;
     let refused = || {
         anyhow::anyhow!(
             "no message {} was relayed from here to {}",
@@ -4329,19 +4332,28 @@ mod named_tests {
         let found = relayed_message(&dir, &mailbox, &reply("m-0000000000a1"), || {
             send::append_new(&mailbox, &message("m-0000000000a1")).unwrap();
             drop(held);
-        });
+        })
+        .unwrap();
         assert!(found.is_some(), "held at the first read");
         let held = send::Relaying::hold(&dir, &message("m-0000000000a2")).unwrap();
         send::append_new(&mailbox, &message("m-0000000000a2")).unwrap();
         drop(held);
-        assert!(relayed_message(&dir, &mailbox, &reply("m-0000000000a2"), || {}).is_some());
+        assert!(
+            relayed_message(&dir, &mailbox, &reply("m-0000000000a2"), || {})
+                .unwrap()
+                .is_some()
+        );
         // A hold for another machine never matches.
         let _held = send::Relaying::hold(&dir, &message("m-0000000000a3")).unwrap();
         let other = relay::ReplyEnvelope {
             from_machine: "m-other".into(),
             ..reply("m-0000000000a3")
         };
-        assert!(relayed_message(&dir, &mailbox, &other, || {}).is_none());
+        assert!(
+            relayed_message(&dir, &mailbox, &other, || {})
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(here).unwrap();
     }
     /// The way back for a machine `there` can't reach: `here` asks, and
@@ -4991,11 +5003,9 @@ mod reply_cli_tests {
                 command.args(["--exact","reply_cli_tests::cli_reply_uses_shared_identity_original_sender_and_mailbox_ownership","--nocapture"])
                     .env("HOME",home).env("PATH",format!("{}:{}",bin.display(),std::env::var("PATH").unwrap()))
                     .env("PROVENANCE_REPLY_FIXTURE",case).env_remove("CODEX_THREAD_ID").env_remove("CODEX_SESSION_ID");
-                if case == "cli" {
-                    command
-                        .env("CODEX_THREAD_ID", "recipient-a")
-                        .env("CODEX_SESSION_ID", "recipient-a");
-                }
+                command
+                    .env("CODEX_THREAD_ID", "recipient-a")
+                    .env("CODEX_SESSION_ID", "recipient-a");
                 let output = command.output().unwrap();
                 assert!(
                     output.status.success(),
@@ -5045,12 +5055,10 @@ mod reply_cli_tests {
         }
         if case == "mcp" {
             use mcp::Tools;
-            let error = McpTools { home: home.clone() }
+            let receipt = McpTools { home: home.clone() }
                 .reply("m-owned", "answer")
-                .unwrap_err();
-            assert!(error.is::<AmbiguousCaller>());
-            let text = format!("{error:#}");
-            assert!(text.contains("provenance reply MESSAGE_ID"));
+                .unwrap();
+            assert!(receipt.contains("Receipt is not confirmed"));
             assert!(
                 send::reply_to(
                     &send::mailbox(
@@ -5060,9 +5068,11 @@ mod reply_cli_tests {
                     ),
                     "m-owned"
                 )
-                .is_none()
+                .as_deref()
+                    == Some("answer")
             );
-            assert!(!home.join("transport.txt").exists());
+            let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
+            assert!(transport.contains("queue --thread original-sender"));
             return;
         }
         dispatch(Cli::try_parse_from(["provenance", "reply", "m-owned", "answer"]).unwrap())
@@ -5087,11 +5097,33 @@ mod reply_cli_tests {
         let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
         assert!(transport.contains("queue --thread original-sender"));
         assert!(transport.contains("Reply to message m-owned"));
-        assert!(
+        let wrong =
             dispatch(Cli::try_parse_from(["provenance", "reply", "m-wrong", "bad"]).unwrap())
-                .unwrap_err()
-                .to_string()
-                .contains("no message m-wrong was sent to this session")
+                .unwrap_err();
+        let wrong_text = format!("{wrong:#}");
+        assert!(
+            wrong_text.contains("no message m-wrong was sent"),
+            "{wrong_text}"
+        );
+        assert!(
+            wrong_text.contains("Codex session recipient-a"),
+            "{wrong_text}"
+        );
+        assert!(
+            wrong_text.contains(
+                &send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-a")
+                    .display()
+                    .to_string()
+            ),
+            "{wrong_text}"
+        );
+        assert_eq!(
+            send::reply_to(
+                &send::mailbox(&send::mail_dir(&home), Harness::Codex, "recipient-b"),
+                "m-wrong"
+            ),
+            None,
+            "wrong-recipient refusal must not write a reply"
         );
         let rpath = dir.join("original-sender.json");
         let mut r: serde_json::Value =
