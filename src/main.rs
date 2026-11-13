@@ -1546,8 +1546,35 @@ fn send_resolved_via(
         let pr = Some(format!("{repo}#{number}"));
         return send_remote(home, peer, target, pr, text, *resumes, caller, transport);
     }
+    let chosen_index = sessions
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, m))
+        .unwrap();
+    let bypass_indexes = skipped
+        .borrow()
+        .iter()
+        .filter(|(_, reason)| reason.starts_with(send::BYPASS_REASON))
+        .filter_map(|(index, _)| (*index < chosen_index).then_some(*index))
+        .collect::<std::collections::HashSet<_>>();
     let note = if matches!(delivery, send::Delivery::Resume { .. }) {
-        send::resume_note(sessions, m, sender)
+        if bypass_indexes.is_empty() {
+            send::resume_note(sessions, m, sender)
+        } else {
+            let resume_skipped = sessions[..chosen_index]
+                .iter()
+                .enumerate()
+                .filter(|(index, candidate)| {
+                    !bypass_indexes.contains(index)
+                        && !sender.is_some_and(|s| {
+                            s.harness == candidate.sighting.harness
+                                && s.session_id == candidate.sighting.session_id
+                        })
+                })
+                .count();
+            (resume_skipped > 0).then(|| format!(
+                "Skipped {resume_skipped} newer matched session(s) not selected for headless resume (they may still be open or otherwise unavailable)."
+            ))
+        }
     } else {
         None
     };
@@ -1557,13 +1584,7 @@ fn send_resolved_via(
             &skipped
                 .borrow()
                 .iter()
-                .filter(|(index, _)| {
-                    *index
-                        < sessions
-                            .iter()
-                            .position(|candidate| std::ptr::eq(candidate, m))
-                            .unwrap()
-                })
+                .filter(|(index, _)| *index < chosen_index)
                 .map(|(_, reason)| reason.clone())
                 .collect::<Vec<_>>(),
         ),
@@ -2677,6 +2698,98 @@ mod send_cli_tests {
         // Exercise resolution, backend, CLI command and parsed dispatch with real
         // records and fake gh, without consulting an external service.
         let fixture_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        // Exercise the resolver boundary with a newer bypass refusal, the
+        // selected headless session, and an older match. The bypass session
+        // must appear only in the bypass note, and the older match is ignored.
+        let bypass_id = "fixture-newer-bypass";
+        let bypass_record = live::Record {
+            harness: Harness::ClaudeCode,
+            session_id: bypass_id.into(),
+            app: "Terminal".into(),
+            cwd: home.to_string_lossy().into_owned(),
+            pid: Some(std::process::id()),
+            pid_started: std::process::Command::new("/bin/ps")
+                .args(["-p", &std::process::id().to_string(), "-o", "lstart="])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()),
+            last_event: "UserPromptSubmit".into(),
+            updated: Utc::now(),
+            branches: vec![],
+            permission_mode: Some("bypassPermissions".into()),
+            transcript_path: None,
+        };
+        let fixture_records = live::live_dir(&fixture_home);
+        std::fs::create_dir_all(&fixture_records).unwrap();
+        std::fs::write(
+            fixture_records.join("bypass.json"),
+            serde_json::to_vec(&bypass_record).unwrap(),
+        )
+        .unwrap();
+        let claude_sessions = fixture_home.join(".claude/sessions");
+        std::fs::create_dir_all(&claude_sessions).unwrap();
+        std::fs::write(
+            claude_sessions.join(format!("{}.json", std::process::id())),
+            serde_json::json!({"sessionId": bypass_id, "messagingSocketPath":"/fixture.sock"})
+                .to_string(),
+        )
+        .unwrap();
+        let make_match = |id: &str, harness, state| matching::SessionMatch {
+            kind: matching::MatchKind::Stamp,
+            state,
+            sighting: sessions::Sighting {
+                harness,
+                session_id: id.into(),
+                app: "Terminal".into(),
+                cwd: home.to_string_lossy().into_owned(),
+                branch: String::new(),
+                repo_url: None,
+                last_seen: Utc::now(),
+                log_path: None,
+                machine: None,
+                url: None,
+            },
+        };
+        let newer_bypass = make_match(bypass_id, Harness::ClaudeCode, Some(live::State::Waiting));
+        let chosen = make_match(
+            "fixture-chosen",
+            Harness::ClaudeCode,
+            Some(live::State::Ended),
+        );
+        let older = make_match(
+            "fixture-older",
+            Harness::ClaudeCode,
+            Some(live::State::Ended),
+        );
+        let resolved = send_resolved(
+            &fixture_home,
+            "fixture/repo",
+            1,
+            "request",
+            &[newer_bypass, chosen, older],
+            None,
+            true,
+            send::Caller::Mcp,
+            &|m| {
+                if m.sighting.session_id == bypass_id {
+                    go::Process::Live(std::process::id())
+                } else {
+                    go::Process::Gone
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.to,
+            "fixture/repo#1's Claude session fixture-chosen"
+        );
+        assert_eq!(
+            resolved.note.as_deref(),
+            Some(
+                "Skipped 1 newer matched session(s): Claude Code holds socket messages from provenance when the target is in bypass mode, and T3 Code doesn't host them. Use a session not running in bypass mode, or one hosted by T3 Code."
+            )
+        );
         std::fs::write(fixture_home.join("pr.json"), r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","number":1,"createdAt":"2026-10-28T12:00:00Z","headRefName":"fixture","headRefOid":"aaa","baseRefOid":"bbb","repository":{"nameWithOwner":"fixture/repo"}}}}}"#).unwrap();
         std::fs::write(fixture_home.join("commits.json"), r#"{"data":{"nodes":[{"id":"PR_1","headRefOid":"aaa","baseRefOid":"bbb","commits":{"nodes":[{"commit":{"message":"Agent-Session: codex/fixture-target","committedDate":"2026-10-30T01:00:00Z"}}]}}]}}"#).unwrap();
         let records = live::live_dir(&fixture_home);
