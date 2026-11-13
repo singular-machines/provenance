@@ -3,8 +3,9 @@
 //! A running session is messaged through its harness's own way in: a Claude
 //! Code session's inbox socket, or `codex queue` for Codex. A Claude Code
 //! session in bypass mode holds socket messages, so when T3 Code hosts it,
-//! `t3 thread send` delivers instead. A session that isn't running is only
-//! reached by resuming it headless, when asked to.
+//! `t3 thread send` delivers instead. An exact active T3 conversation can
+//! also receive messages when its recorded hook PID is dead. Other stopped
+//! sessions are reached by resuming them headless, when asked to.
 //!
 //! Every message and reply is kept in a mailbox, one JSONL file per receiving
 //! session under `~/.local/state/provenance/mail/`, so a reply can be matched
@@ -369,15 +370,14 @@ pub fn bypass_note(reasons: &[String]) -> Option<String> {
 
 /// Where a held socket write goes instead. `None` when the socket isn't held;
 /// T3 Code's own thread queue when T3 hosts the session; otherwise a refusal.
-/// A planned T3 route is checked again, so a mapping or process that changed
+/// A planned T3 route is checked again, so a mapping that changed
 /// since planning is refused instead of delivered to whatever the thread now
 /// runs. T3 offers no way to bind a send to the native session, so a switch
 /// between this check and `t3 thread send` remains possible.
 pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option<Delivery> {
     let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
     if let Delivery::T3Thread { .. } = delivery {
-        let current =
-            live_record(home, target).and_then(|_| t3_route(home, &base, &target.session_id));
+        let current = exact_t3_route(home, target);
         return Some(match current {
             Some(d) if &d == delivery => d,
             Some(_) => Delivery::Refuse(
@@ -394,14 +394,14 @@ pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option
     Some(t3_route(home, &base, &target.session_id).unwrap_or(Delivery::Refuse(why)))
 }
 
-/// The target's hook record, if its process is still alive.
-fn live_record(home: &Path, target: &Sender) -> Option<crate::live::Record> {
-    let records = crate::live::load_records(home);
-    let record = records
-        .into_iter()
-        .find(|r| r.harness == target.harness && r.session_id == target.session_id)?;
-    let alive = crate::live::alive_pids(std::slice::from_ref(&record));
-    crate::live::is_alive(&record, &alive).then_some(record)
+/// A unique strong active mapping for this exact harness and native session.
+/// The hook PID is not authoritative for a conversation managed by T3.
+pub fn exact_t3_route(home: &Path, target: &Sender) -> Option<Delivery> {
+    if target.harness != Harness::ClaudeCode {
+        return None;
+    }
+    let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
+    t3_route(home, &base, &target.session_id)
 }
 
 /// T3 Code's data directory from `T3CODE_HOME`, resolved as T3 resolves it:
@@ -996,10 +996,43 @@ impl Drop for Relaying {
     }
 }
 
-pub fn find_message(path: &Path, id: &str) -> Option<Mail> {
-    read(path)
-        .into_iter()
-        .find(|m| matches!(m, Mail::Message { id: i, .. } if i == id))
+pub fn find_message(path: &Path, id: &str) -> Result<Option<Mail>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading mailbox {}", path.display()))?;
+    let mut found = None;
+    let mut malformed = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        match serde_json::from_str::<Mail>(line) {
+            Ok(mail) => {
+                if found.is_none()
+                    && matches!(&mail, Mail::Message { id: message_id, .. } if message_id == id)
+                {
+                    found = Some(mail);
+                }
+            }
+            Err(error) => malformed.push((index + 1, error)),
+        }
+    }
+    if found.is_some() {
+        return Ok(found);
+    }
+    if !malformed.is_empty() {
+        let locations = malformed
+            .iter()
+            .map(|(line, _)| line.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let details = malformed
+            .iter()
+            .map(|(line, error)| format!("line {line}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "could not parse {} mailbox line(s) at line(s) {locations}: {details}",
+            malformed.len()
+        );
+    }
+    Ok(None)
 }
 
 /// Record `me`'s answer to a message sent to `me`, and return who sent it.
@@ -1031,9 +1064,21 @@ pub fn persist_reply(
         sender,
         from_machine,
         ..
-    }) = find_message(&path, id)
+    }) = find_message(&path, id).with_context(|| {
+        format!(
+            "looking for message {id} addressed to {} session {} in mailbox {}",
+            harness_name(me.harness),
+            me.session_id,
+            path.display()
+        )
+    })?
     else {
-        bail!("no message {id} was sent to this session");
+        bail!(
+            "no message {id} was sent to {} session {}; searched mailbox {}",
+            harness_name(me.harness),
+            me.session_id,
+            path.display()
+        );
     };
     append(
         &path,
@@ -1943,6 +1988,115 @@ mod tests {
         );
         assert_eq!(reply_to(&path, "m-1").as_deref(), Some("done"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reply_lookup_reports_mailbox_failures_and_never_searches_other_sessions() {
+        let root = std::env::temp_dir().join(format!("prov-reply-errors-{}", new_id()));
+        let dir = root.join("mail");
+        let me = Sender {
+            harness: Harness::Codex,
+            session_id: "recipient".into(),
+        };
+        let path = mailbox(&dir, me.harness, &me.session_id);
+
+        let missing = record_reply(&dir, Some(&me), "m-1", "answer").unwrap_err();
+        let missing_text = format!("{missing:#}");
+        assert!(missing_text.contains("reading mailbox"), "{missing_text}");
+        assert!(missing_text.contains("recipient"), "{missing_text}");
+        assert!(
+            missing_text.contains(&path.display().to_string()),
+            "{missing_text}"
+        );
+
+        std::fs::create_dir_all(&path).unwrap();
+        let unreadable = record_reply(&dir, Some(&me), "m-1", "answer").unwrap_err();
+        let unreadable_text = format!("{unreadable:#}");
+        assert!(
+            unreadable_text.contains("reading mailbox"),
+            "{unreadable_text}"
+        );
+        assert!(unreadable_text.contains("directory"), "{unreadable_text}");
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&path, "{not json}\n").unwrap();
+        let malformed = record_reply(&dir, Some(&me), "m-1", "answer").unwrap_err();
+        let malformed_text = format!("{malformed:#}");
+        assert!(
+            malformed_text.contains("could not parse"),
+            "{malformed_text}"
+        );
+        assert!(malformed_text.contains("line 1"), "{malformed_text}");
+        assert!(
+            malformed_text.contains(&path.display().to_string()),
+            "{malformed_text}"
+        );
+        append(
+            &path,
+            &Mail::Message {
+                id: "m-1".into(),
+                pr: None,
+                named_address: None,
+                from: "fixture".into(),
+                sender: None,
+                from_machine: None,
+                to_machine: None,
+                text: "request".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        record_reply(&dir, Some(&me), "m-1", "answer").unwrap();
+        assert_eq!(reply_to(&path, "m-1").as_deref(), Some("answer"));
+
+        std::fs::write(&path, "{not json}\n").unwrap();
+        let no_match = record_reply(&dir, Some(&me), "m-2", "answer").unwrap_err();
+        let no_match_text = format!("{no_match:#}");
+        assert!(
+            no_match_text.contains("1 mailbox line(s)"),
+            "{no_match_text}"
+        );
+        assert!(no_match_text.contains("line(s) 1"), "{no_match_text}");
+        assert!(no_match_text.contains("line 1:"), "{no_match_text}");
+        std::fs::remove_file(&path).unwrap();
+
+        let other_home = root.join("other-home");
+        let other_path = mailbox(&mail_dir(&other_home), me.harness, &me.session_id);
+        append(
+            &other_path,
+            &Mail::Message {
+                id: "m-1".into(),
+                pr: None,
+                named_address: None,
+                from: "fixture".into(),
+                sender: None,
+                from_machine: None,
+                to_machine: None,
+                text: "request".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        // A message under a different HOME must not authorize this reply.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let wrong_home = record_reply(&dir, Some(&me), "m-1", "answer").unwrap_err();
+        let wrong_home_text = format!("{wrong_home:#}");
+        assert!(
+            wrong_home_text.contains("no message m-1 was sent"),
+            "{wrong_home_text}"
+        );
+        assert!(
+            wrong_home_text.contains("Codex session recipient"),
+            "{wrong_home_text}"
+        );
+        assert!(
+            wrong_home_text.contains(&path.display().to_string()),
+            "{wrong_home_text}"
+        );
+        assert!(reply_to(&other_path, "m-1").is_none());
+        assert!(read(&path).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
