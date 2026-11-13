@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>provenance recap</title>
 <style>
-:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--border:#d0d7de;--card:#f6f8fa;--night:rgba(31,35,40,.05);--sel:#ddf4ff;--merged:#1a7f37;--closed:#cf222e;--running:#0969da;--needs:#9a6700;--open:#8c959f;--accent:#0969da;--lab:380px;--gut:76px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--border:#30363d;--card:#161b22;--night:rgba(255,255,255,.04);--sel:#1c2b3f;--merged:#3fb950;--closed:#f85149;--running:#58a6ff;--needs:#d29922;--open:#6e7681;--accent:#58a6ff}}
+:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--border:#d0d7de;--card:#f6f8fa;--night:rgba(31,35,40,.05);--sel:#ddf4ff;--merged:#1a7f37;--closed:#cf222e;--running:#0969da;--needs:#9a6700;--open:#8c959f;--accent:#0969da;--r0:#8250df;--r1:#bf3989;--r2:#1b7c83;--r3:#4f5bd5;--r4:#a2532b;--r5:#6f7a00;--lab:380px;--gut:76px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--border:#30363d;--card:#161b22;--night:rgba(255,255,255,.04);--sel:#1c2b3f;--merged:#3fb950;--closed:#f85149;--running:#58a6ff;--needs:#d29922;--open:#6e7681;--accent:#58a6ff;--r0:#a371f7;--r1:#db61a2;--r2:#39c5cf;--r3:#8b95f5;--r4:#e08a5d;--r5:#b5c23a}}
 @media (max-width:720px){:root{--lab:190px;--gut:56px}}
 *{box-sizing:border-box}
 body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -15,11 +15,22 @@ h1{font-size:18px;margin:0 6px 0 0}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
 .seg button{background:none;border:0;color:var(--muted);font:inherit;font-size:12px;padding:4px 10px;cursor:pointer}
 .seg button.on{background:var(--card);color:var(--fg);font-weight:600}
-.sum{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.status{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
 .chip{font-size:12px;padding:2px 9px;border-radius:999px;border:1px solid var(--border);color:var(--muted);background:none;font-family:inherit}
-.chip b{color:var(--fg)}
-button.chip{cursor:pointer;border-color:var(--needs);color:var(--needs)}
-button.chip.quiet{border-color:var(--border);border-style:dashed;color:var(--muted)}
+/* Every PR in view as one strip, sized by count, with its key underneath. */
+.mix{display:flex;gap:3px;height:10px;margin-bottom:7px}
+.mix i{min-width:4px;border-radius:3px;background:var(--c)}
+.mix i.idle{height:0;margin-top:4px;border-radius:0;background:none;border-top:3px dotted var(--open)}
+.mix i.old,.keys .k.old::before{background:color-mix(in srgb,var(--needs) 40%,transparent)}
+.mix i.quiet{background:repeating-linear-gradient(45deg,color-mix(in srgb,var(--open) 45%,transparent) 0 3px,transparent 3px 6px);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--open) 60%,transparent)}
+.keys{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:12px}
+.keys b{color:var(--fg);font-variant-numeric:tabular-nums}
+.keys .k::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--c);margin-right:6px;vertical-align:-1px}
+.keys .idle::before{width:12px;height:0;border-radius:0;background:none;border-top:2px dotted var(--open);vertical-align:3px}
+.keys .quiet::before{background:none;border:1px dashed var(--open);box-sizing:border-box}
+.keys button{all:unset;color:var(--accent);cursor:pointer;margin-left:4px}
+.keys button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rc{display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--rc);margin-right:5px}
 .chart{border:1px solid var(--border);border-radius:6px;position:relative;overflow:hidden}
 .axis,.row{display:grid;grid-template-columns:var(--lab) 1fr var(--gut)}
 .axis{height:28px;border-bottom:1px solid var(--border);position:relative;z-index:1}
@@ -91,8 +102,8 @@ code{font-family:var(--mono);font-size:11.5px}
 </style>
 </head>
 <body>
-<div class="top"><h1 id="title"></h1><div class="seg" id="win"></div><div class="seg" id="grp"><button data-v="pr" class="on">By PR</button><button data-v="session">By session</button></div></div>
-<div class="sum" id="sum"></div>
+<div class="top"><h1 id="title"></h1><div class="seg" id="win"></div><div class="seg" id="grp"><button data-v="pr" class="on">By PR</button><button data-v="session">By session</button></div><div class="status" id="status"></div></div>
+<div id="sum"></div>
 <div class="chart" id="chart"></div>
 <div class="legend" id="legend"></div>
 <div class="foot" id="foot"></div>
@@ -118,6 +129,9 @@ const dur=(a,b)=>{let m=Math.max(0,Math.round((b-a)/6e4)),d=Math.floor(m/1440),h
 const E=D.entries.map(e=>{const end=e.state==="merged"?(e.merged_at||e.closed_at):e.state==="closed"?e.closed_at:null;
   return {...e,key:`${e.repo}#${e.number}`,o:new Date(e.created_at),c:end?new Date(end):null}});
 const names={};for(const e of E){const n=e.repo.split("/").pop();(names[n]=names[n]||new Set).add(e.repo)}
+// A colour per repo, from its name, so it stays the same between runs.
+const REPOS=new Set(E.map(e=>e.repo)).size>1;
+const rc=e=>{if(!REPOS)return "";let h=0;for(const ch of e.repo)h=(h*31+ch.charCodeAt(0))|0;return `<i class="rc" style="--rc:var(--r${Math.abs(h)%6})"></i>`};
 const short=e=>{const n=e.repo.split("/").pop();return `${names[n].size===1?n:e.repo}#${e.number}`};
 const idle=e=>NOW-new Date(e.last_activity);
 // Moving: its agent is running, or something happened on it in the last hour.
@@ -172,13 +186,17 @@ const title=t=>{const m=/^(\w+(?:\([^)]*\))?!?):\s*(?=\S)/.exec(t);return m?`<sp
 function render(){
   const list=rows(),[A,B]=range(list),X=t=>Math.max(0,Math.min(1,(t-A)/(B-A)))*100;
   document.getElementById("title").textContent=win==="window"?D.label:sameDay(OPENED,NOW)?`Today (${DAYNAME})`:DAYNAME;
-  const all=E.filter(inWindow),n=f=>all.filter(f).length,quiet=n(e=>e.group==="quiet"),asks=n(fresh);
-  document.getElementById("sum").innerHTML=
+  const all=E.filter(inWindow),n=f=>all.filter(f).length,asks=n(fresh);
+  document.getElementById("status").innerHTML=
     (STALE?`<span class="chip snap">Snapshot from ${esc(hm(NOW))}, ${esc(dur(NOW,OPENED))} old · run <code>provenance recap --html</code> again</span>`:"")+
-    `<span class="chip"><b>${all.length}</b> PRs</span>`+
-    [["merged",e=>e.state==="merged"],["closed",e=>e.state==="closed"],["open",e=>e.state==="open"]].filter(([,f])=>n(f)).map(([w,f])=>`<span class="chip"><b>${n(f)}</b> ${w}</span>`).join("")+
-    (asks?`<span class="chip needs">⚑ <b>${asks}</b> need${asks===1?"s":""} you</span>`:`<span class="chip ok">✓ Nothing new needs you</span>`)+
-    (quiet?`<button class="chip quiet" id="quiet">${showQuiet?"Hide":"Show"} ${quiet} gone quiet (no activity for ${esc(D.stale_days)}+ days)</button>`:"");
+    (asks?`<span class="chip needs">⚑ <b>${asks}</b> need${asks===1?"s":""} you</span>`:`<span class="chip ok">✓ Nothing new needs you</span>`);
+  // One part per section, so each count matches what the chart lists: old
+  // asks have their own part, as they fold away under Needs you.
+  const cat=e=>e.c?e.state:e.group==="quiet"?"quiet":e.old_ask?"old":fresh(e)?"needs":moving(e)?"moving":idle(e)<DAY?"stalled":"idle";
+  const parts=[["merged","merged","merged"],["closed","closed","closed"],["needs","need you","needs"],["old","older asks","old"],["moving","moving","running"],
+    ["stalled","stalled","open"],["idle","idle","idle"],["quiet","gone quiet","quiet"]].map(([id,w,cls])=>[id,w,cls,n(e=>cat(e)===id)]).filter(p=>p[3]);
+  document.getElementById("sum").innerHTML=all.length?`<div class="mix" aria-hidden="true">${parts.map(([id,w,cls,c])=>`<i class="${cls}" style="flex:${c} 0 0" title="${c} ${w}"></i>`).join("")}</div>`+
+    `<div class="keys"><span><b>${all.length}</b> PRs</span>${parts.map(([id,w,cls,c])=>`<span class="k ${cls}"><b>${c}</b> ${c===1&&id==="old"?"older ask":c===1&&id==="needs"?"needs you":w}${id==="quiet"?`${showQuiet?"":", hidden"}<button id="quiet">${showQuiet?"Hide":"Show"}</button>`:""}</span>`).join("")}</div>`:"";
   const chart=document.getElementById("chart");
   if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;return}
   const css=getComputedStyle(chart),lane=Math.max(200,chart.clientWidth-parseInt(css.getPropertyValue("--lab"))-parseInt(css.getPropertyValue("--gut")));
@@ -208,7 +226,7 @@ function render(){
     if(carry&&still&&la<A)marks+=`<span class="note">last activity ${esc(when(la))}</span>`;
     const st=statusText(e),who=grp==="pr"?" · "+esc(e.agent?e.agent.name:"no session"):"";
     const tip=`Opened ${full(e.o)}${e.c?` · ${e.state} ${full(e.c)}`:""} · last activity ${full(la)}`;
-    return `<div class="row ${k}${e.key===sel?" sel":""}" data-key="${esc(e.key)}" aria-expanded="${e.key===sel}"><div class="lab"><div class="l1">${title(e.title)}</div><div class="l2">${st?`<span class="st ${k}">${esc(st)}</span> · `:""}<span class="ref">${esc(short(e))}</span>${who} · opened ${esc(when(e.o))}</div></div><div class="lane" title="${esc(tip)}">${marks}</div>${gutter(e)}</div>${e.key===sel?panel(e):""}`};
+    return `<div class="row ${k}${e.key===sel?" sel":""}" data-key="${esc(e.key)}" aria-expanded="${e.key===sel}"><div class="lab"><div class="l1">${title(e.title)}</div><div class="l2">${st?`<span class="st ${k}">${esc(st)}</span> · `:""}<span class="ref">${rc(e)}${esc(short(e))}</span>${who} · opened ${esc(when(e.o))}</div></div><div class="lane" title="${esc(tip)}">${marks}</div>${gutter(e)}</div>${e.key===sel?panel(e):""}`};
   let body="";
   // Needs you, Done and Gone quiet match the terminal. Open PRs split by how
   // recently anything happened on them; long sections show their newest few.

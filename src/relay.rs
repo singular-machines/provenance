@@ -144,7 +144,7 @@ impl Outcome {
 pub type Transport<'a> = dyn Fn(&str, &str, &[u8]) -> Result<Vec<u8>> + 'a;
 
 pub fn peers_path(home: &Path) -> PathBuf {
-    home.join(".local/state/provenance/peers.json")
+    crate::state::root(home).join("peers.json")
 }
 
 pub fn load(home: &Path) -> Result<Vec<Peer>> {
