@@ -196,13 +196,13 @@ function render(){
       bg+=`<div class="gl" style="left:${X(d0)}%"></div>`}}
   bg+=`<div class="now" style="left:100%"></div>`;
   const row=e=>{const k=kind(e),la=new Date(e.last_activity),carry=e.o<A,l=X(e.o);
-    // Ended or moving: one bar to the end or to now. Otherwise the bar stops at
-    // the last activity and dots run on to now.
-    const still=!e.c&&k!=="running"&&k!=="needs",r=e.c?X(e.c):still?Math.max(l,X(la)):100;
+    // Ended, or its agent is running: one bar to the end or to now. Otherwise
+    // the bar stops at the last activity and dots run on to now.
+    const live=!e.c&&e.status==="running",still=!e.c&&!live,r=e.c?X(e.c):live?100:Math.max(l,X(la));
     let marks=r>l?`<i class="span" style="left:${l}%;width:${r-l}%"></i>`:"";
     if(still)marks+=`<i class="tail" style="left:${r}%;width:${100-r}%"></i>`;
     if(carry)marks+=`<i class="carry${still&&la<A?" dim":""}"></i>`;
-    else if(r-l>2||!still&&!e.c)marks+=`<i class="pt" style="left:${l}%"></i>`;
+    else if(r-l>3||live)marks+=`<i class="pt" style="left:${l}%"></i>`;
     if(e.c)marks+=`<i class="pt end" style="left:${r}%">${k==="merged"?"✓":"✗"}</i>`;
     else if(still&&la>=A)marks+=`<i class="pt fill" style="left:${r}%"></i>`;
     if(carry&&still&&la<A)marks+=`<span class="note">last activity ${esc(when(la))}</span>`;
