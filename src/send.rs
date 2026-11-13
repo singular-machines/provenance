@@ -794,6 +794,7 @@ pub fn choose<'a>(
 }
 
 /// Explain when a headless fallback selected an older matched session.
+#[cfg(test)]
 pub fn resume_note(
     sessions: &[SessionMatch],
     chosen: &SessionMatch,

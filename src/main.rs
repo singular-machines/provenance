@@ -1637,11 +1637,7 @@ fn send_resolved_via(
         .map(|(index, _)| *index)
         .collect::<Vec<_>>();
     let note = if matches!(delivery, send::Delivery::Resume { .. }) {
-        if bypass_indexes.is_empty() {
-            send::resume_note(sessions, m, sender)
-        } else {
-            send::resume_note_excluding(sessions, m, sender, &bypass_indexes)
-        }
+        send::resume_note_excluding(sessions, m, sender, &bypass_indexes)
     } else {
         None
     };
@@ -3112,7 +3108,7 @@ mod send_cli_tests {
             let ps = if cfg!(target_os = "macos") {
                 "#!/bin/sh\nexec /bin/ps \"$@\"\n"
             } else {
-                "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n2 Fri Oct 30 18:46:07 2026 codex\\n';; esac\n"
+                "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n2 Fri Oct 30 18:46:07 2026 codex\\n';; *lstart=*) printf '1 Fri Oct 30 18:46:07 2026\\n2 Fri Oct 30 18:46:07 2026\\n';; esac\n"
             };
             for (name, script) in [
                 ("claude", "#!/bin/sh\nprintf 'fixture answer'\n"),
