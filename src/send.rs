@@ -3,8 +3,9 @@
 //! A running session is messaged through its harness's own way in: a Claude
 //! Code session's inbox socket, or `codex queue` for Codex. A Claude Code
 //! session in bypass mode holds socket messages, so when T3 Code hosts it,
-//! `t3 thread send` delivers instead. A session that isn't running is only
-//! reached by resuming it headless, when asked to.
+//! `t3 thread send` delivers instead. An exact active T3 conversation can
+//! also receive messages when its recorded hook PID is dead. Other stopped
+//! sessions are reached by resuming them headless, when asked to.
 //!
 //! Every message and reply is kept in a mailbox, one JSONL file per receiving
 //! session under `~/.local/state/provenance/mail/`, so a reply can be matched
@@ -234,13 +235,38 @@ pub fn socket_refusal(home: &Path, target: &Sender, delivery: &Delivery) -> Opti
     {
         return None;
     }
+    let age = record
+        .permission_mode_observed_at
+        .map(|observed_at| format!(" {}", observation_age(observed_at, Utc::now())))
+        .unwrap_or_default();
     Some(format!(
-        "{BYPASS_REASON}; nothing was delivered. Use a session not running in bypass mode, or one hosted by T3 Code"
+        "{BYPASS_REASON}{age}; nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
     ))
 }
 
-pub const BYPASS_REASON: &str =
-    "Claude Code holds socket messages from provenance when the target is in bypass mode";
+pub const BYPASS_REASON: &str = "Claude Code holds socket messages from provenance when the target was last observed in bypass mode";
+
+fn observation_age(updated: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(updated).num_seconds().max(0);
+    if seconds < 60 {
+        format!(
+            "({seconds} second{} ago)",
+            if seconds == 1 { "" } else { "s" }
+        )
+    } else if seconds < 3_600 {
+        let minutes = seconds / 60;
+        format!(
+            "({minutes} minute{} ago)",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else if seconds < 86_400 {
+        let hours = seconds / 3_600;
+        format!("({hours} hour{} ago)", if hours == 1 { "" } else { "s" })
+    } else {
+        let days = seconds / 86_400;
+        format!("({days} day{} ago)", if days == 1 { "" } else { "s" })
+    }
+}
 
 /// Retain refusal evidence from selection without probing the session again.
 pub fn bypass_note(reasons: &[String]) -> Option<String> {
@@ -253,15 +279,14 @@ pub fn bypass_note(reasons: &[String]) -> Option<String> {
 
 /// Where a held socket write goes instead. `None` when the socket isn't held;
 /// T3 Code's own thread queue when T3 hosts the session; otherwise a refusal.
-/// A planned T3 route is checked again, so a mapping or process that changed
+/// A planned T3 route is checked again, so a mapping that changed
 /// since planning is refused instead of delivered to whatever the thread now
 /// runs. T3 offers no way to bind a send to the native session, so a switch
 /// between this check and `t3 thread send` remains possible.
 pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option<Delivery> {
     let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
     if let Delivery::T3Thread { .. } = delivery {
-        let current =
-            live_record(home, target).and_then(|_| t3_route(home, &base, &target.session_id));
+        let current = exact_t3_route(home, target);
         return Some(match current {
             Some(d) if &d == delivery => d,
             Some(_) => Delivery::Refuse(
@@ -278,14 +303,14 @@ pub fn bypass_route(home: &Path, target: &Sender, delivery: &Delivery) -> Option
     Some(t3_route(home, &base, &target.session_id).unwrap_or(Delivery::Refuse(why)))
 }
 
-/// The target's hook record, if its process is still alive.
-fn live_record(home: &Path, target: &Sender) -> Option<crate::live::Record> {
-    let records = crate::live::load_records(home);
-    let record = records
-        .into_iter()
-        .find(|r| r.harness == target.harness && r.session_id == target.session_id)?;
-    let alive = crate::live::alive_pids(std::slice::from_ref(&record));
-    crate::live::is_alive(&record, &alive).then_some(record)
+/// A unique strong active mapping for this exact harness and native session.
+/// The hook PID is not authoritative for a conversation managed by T3.
+pub fn exact_t3_route(home: &Path, target: &Sender) -> Option<Delivery> {
+    if target.harness != Harness::ClaudeCode {
+        return None;
+    }
+    let base = t3_base(home, std::env::var_os("T3CODE_HOME"));
+    t3_route(home, &base, &target.session_id)
 }
 
 /// T3 Code's data directory from `T3CODE_HOME`, resolved as T3 resolves it:
@@ -1150,6 +1175,93 @@ mod tests {
         assert!(note.contains("Skipped 1 newer"));
         assert!(note.contains(BYPASS_REASON));
         assert!(bypass_note(&["not running".into()]).is_none());
+    }
+
+    #[test]
+    fn bypass_refusal_describes_observation_age_and_refresh_action() {
+        assert_eq!(
+            BYPASS_REASON,
+            "Claude Code holds socket messages from provenance when the target was last observed in bypass mode"
+        );
+        struct SameProcess {
+            pid: u32,
+            started: String,
+        }
+        impl crate::live::Probe for SameProcess {
+            fn harness_process(&self) -> Option<(u32, String)> {
+                Some((self.pid, self.started.clone()))
+            }
+            fn branch(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn env(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let pid = std::process::id();
+        let started = crate::live::ps_info(pid).unwrap().1;
+        let probe = SameProcess { pid, started };
+        let observed_at = Utc::now() - chrono::Duration::hours(2);
+        let mut event = crate::live::HookEvent {
+            session_id: "abc".into(),
+            cwd: Some("/work".into()),
+            hook_event_name: "UserPromptSubmit".into(),
+            transcript_path: None,
+            permission_mode: Some("bypassPermissions".into()),
+        };
+        let record = crate::live::update(
+            None,
+            Harness::ClaudeCode,
+            event.clone(),
+            observed_at,
+            &probe,
+        );
+        event.hook_event_name = "SessionStart".into();
+        event.permission_mode = None;
+        let record = crate::live::update(
+            Some(record),
+            Harness::ClaudeCode,
+            event,
+            Utc::now() - chrono::Duration::minutes(1),
+            &probe,
+        );
+
+        let home = std::env::temp_dir().join(format!("prov-refusal-{}-{}", pid, new_id()));
+        let live_dir = crate::live::live_dir(&home);
+        let socket_dir = home.join(".claude/sessions");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::write(
+            live_dir.join("claude-code-abc.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let socket = PathBuf::from("/tmp/cc-socks/test.sock");
+        std::fs::write(
+            socket_dir.join(format!("{pid}.json")),
+            serde_json::json!({
+                "sessionId": "abc",
+                "messagingSocketPath": socket,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let target = Sender {
+            harness: Harness::ClaudeCode,
+            session_id: "abc".into(),
+        };
+        let refusal = socket_refusal(
+            &home,
+            &target,
+            &Delivery::ClaudeSocket(PathBuf::from("/tmp/cc-socks/test.sock")),
+        )
+        .unwrap();
+        assert_eq!(
+            refusal,
+            "Claude Code holds socket messages from provenance when the target was last observed in bypass mode (2 hours ago); nothing was delivered. Submit a new prompt in that session to refresh the observation. Use a session not running in bypass mode, or one hosted by T3 Code"
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
