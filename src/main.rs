@@ -1656,6 +1656,7 @@ fn deliver_message_as(
     if let Some(why) = resume_precondition(&s, &delivery) {
         anyhow::bail!("{why}");
     }
+    send::check_codex_contract(&delivery)?;
     let address = match &named {
         Some(n) => format!("@{} ({})", n.name, names::identity(&target)),
         None => pr.clone().unwrap_or_default(),
@@ -1696,6 +1697,23 @@ fn deliver_message_as(
         s.log_path.as_deref(),
         text,
     )?;
+    let output = if send::is_codex_resume(&delivery) {
+        reply_recorded(
+            home,
+            &live::load_records(home),
+            Some(&target),
+            &id,
+            &output,
+            &relay::ssh,
+        )
+        .context(
+            "saving Codex structured reply after delivery; do not resend the original message",
+        )?;
+        let saved = send::reply_to(&mailbox, &id).context("saved Codex reply is missing")?;
+        send::framed_reply(&id, &label(Some(&target)), &saved)?
+    } else {
+        output
+    };
     Ok(Sent {
         id,
         to: format!("{address}'s {}", label(Some(&target))),
@@ -1830,7 +1848,12 @@ fn reply_recorded(
     text: &str,
     transport: &relay::Transport<'_>,
 ) -> Result<String> {
-    let (sender, from_machine) = send::record_reply(&send::mail_dir(home), me, id, text)?;
+    let (sender, from_machine, saved) = send::persist_reply(&send::mail_dir(home), me, id, text)?;
+    if !saved {
+        return Ok(format!(
+            "Reply to {id} already saved; nothing forwarded again."
+        ));
+    }
     if let Some(machine) = from_machine {
         // record_reply only succeeds for the session the message went to.
         let me = me.context("reply has no identified session")?;
@@ -2535,7 +2558,7 @@ mod send_cli_tests {
             for (name, script) in [
                 (
                     "codex",
-                    "#!/bin/sh\nprintf 'fixture diagnostics' >&2\nexit 97\n",
+                    "#!/bin/sh\nif [ \"$3\" = --help ]; then echo '--output-schema --output-last-message --json'; exit 0; fi\nprintf 'fixture diagnostics' >&2\nexit 97\n",
                 ),
                 ("claude", "#!/bin/sh\nprintf 'fixture answer'\n"),
                 (
@@ -3145,6 +3168,156 @@ mod named_tests {
         );
         std::fs::remove_dir_all(home).unwrap();
     }
+    fn structured_fixture(
+        response: &str,
+        event: &str,
+        status: i32,
+        tool_reply: bool,
+    ) -> (Result<Sent>, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = scratch();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&home)
+            .output()
+            .unwrap();
+        let bin = home.join("mock-codex");
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$3" = "--help" ]; then
+ echo '--output-schema --output-last-message --json'
+ exit 0
+fi
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = '--output-last-message' ]; then shift; out="$1"; fi
+ shift
+done
+cat > "$out" <<'RESPONSE'
+{response}
+RESPONSE
+printf '%s\n' '{event}'
+exit {status}
+"#
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let recipient = send::Sender {
+            harness: Harness::Codex,
+            session_id: "original".into(),
+        };
+        let binding = names::Binding {
+            harness: Harness::Codex,
+            session_id: "original".into(),
+            cwd_hint: home.to_string_lossy().into_owned(),
+            display_name: "fixture".into(),
+            registered_at: Utc::now(),
+        };
+        let (s, _, _) =
+            named_recipient(&binding, &[record("original", Harness::Codex, 1, "start")]).unwrap();
+        let mut s = s;
+        s.cwd = home.to_string_lossy().into_owned();
+        let d = send::Delivery::Resume {
+            cwd: s.cwd.clone(),
+            argv: vec![
+                bin.to_string_lossy().into_owned(),
+                "exec".into(),
+                "resume".into(),
+                "original".into(),
+            ],
+        };
+        let result = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery: d,
+                sender: None,
+                pr: None,
+                named: None,
+                note: None,
+            },
+            "hello",
+            &|d, id, pr, from, to, log, text| {
+                if tool_reply {
+                    reply_recorded(&home, &[], Some(&recipient), id, "tool answer", &relay::ssh)?;
+                }
+                send::deliver_forward(d, id, pr, from, to, text, log)
+            },
+        );
+        (result, home)
+    }
+
+    #[test]
+    fn structured_codex_reply_is_saved_once_and_waited() {
+        let (result, home) = structured_fixture(
+            r#"{"reply":"answer"}"#,
+            r#"{"type":"turn.completed"}"#,
+            0,
+            false,
+        );
+        let sent = result.unwrap();
+        assert!(sent.output.contains("answer"));
+        assert!(cli_waited_reply(&sent, &mut Vec::new()).unwrap());
+        assert_eq!(
+            send::reply_to(&sent.mailbox, &sent.id).as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            send::read(&sent.mailbox)
+                .iter()
+                .filter(|m| matches!(m, send::Mail::Reply { .. }))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn structured_codex_output_cannot_redirect_and_failures_are_immediate() {
+        for (response, event, status) in [
+            (
+                r#"{"reply":"evil","id":"other","recipient":"other","mailbox":"/tmp/other"}"#,
+                r#"{"type":"turn.completed"}"#,
+                0,
+            ),
+            ("", r#"{"type":"turn.completed"}"#, 0),
+            ("bad JSON", r#"{"type":"turn.completed"}"#, 0),
+            (r#"{"reply":" "}"#, r#"{"type":"turn.completed"}"#, 0),
+            (r#"{"reply":"answer"}"#, r#"{"type":"turn.failed"}"#, 0),
+            (r#"{"reply":"answer"}"#, r#"{"type":"turn.completed"}"#, 1),
+        ] {
+            let (result, home) = structured_fixture(response, event, status, false);
+            assert!(result.is_err());
+            let path = send::mailbox(&send::mail_dir(&home), Harness::Codex, "original");
+            assert!(
+                !send::read(&path)
+                    .iter()
+                    .any(|m| matches!(m, send::Mail::Reply { .. }))
+            );
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn tool_and_structured_codex_reply_are_deduplicated() {
+        let (result, home) = structured_fixture(
+            r#"{"reply":"second answer"}"#,
+            r#"{"type":"turn.completed"}"#,
+            0,
+            true,
+        );
+        let sent = result.unwrap();
+        assert!(sent.output.contains("tool answer"));
+        assert!(!sent.output.contains("second answer"));
+        assert_eq!(
+            send::read(&sent.mailbox)
+                .iter()
+                .filter(|m| matches!(m, send::Mail::Reply { .. }))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn fake_delivery_and_replies_keep_snapshot_after_reassignment() {
         let home = scratch();
@@ -5080,9 +5253,7 @@ mod reply_cli_tests {
             Some("answer")
         );
         let receipt = reply_message(&home, "m-owned", "answer").unwrap();
-        assert!(receipt.contains(
-            "Receipt is not confirmed. The session must read the queue in a turn to act on it."
-        ));
+        assert!(receipt.contains("already saved; nothing forwarded again"));
         assert!(!receipt.contains("codex exec"));
         let transport = std::fs::read_to_string(home.join("transport.txt")).unwrap();
         assert!(transport.contains("queue --thread original-sender"));
@@ -5099,8 +5270,7 @@ mod reply_cli_tests {
         r["last_event"] = "SessionEnd".into();
         std::fs::write(rpath, r.to_string()).unwrap();
         let result = reply_message(&home, "m-owned", "saved answer").unwrap();
-        assert!(result.contains("saved, but"));
-        assert!(result.contains("isn't running"));
+        assert!(result.contains("already saved; nothing forwarded again"));
     }
 }
 #[test]
