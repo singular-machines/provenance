@@ -794,18 +794,32 @@ pub fn choose<'a>(
 }
 
 /// Explain when a headless fallback selected an older matched session.
+#[cfg(test)]
 pub fn resume_note(
     sessions: &[SessionMatch],
     chosen: &SessionMatch,
     sender: Option<&Sender>,
 ) -> Option<String> {
+    resume_note_excluding(sessions, chosen, sender, &[])
+}
+
+/// Explain a headless fallback while omitting sessions already described by
+/// another skip reason, such as a bypass-mode refusal.
+pub fn resume_note_excluding(
+    sessions: &[SessionMatch],
+    chosen: &SessionMatch,
+    sender: Option<&Sender>,
+    excluded: &[usize],
+) -> Option<String> {
     let position = sessions.iter().position(|m| std::ptr::eq(m, chosen))?;
     let skipped = sessions[..position]
         .iter()
-        .filter(|m| {
-            !sender.is_some_and(|s| {
-                s.harness == m.sighting.harness && s.session_id == m.sighting.session_id
-            })
+        .enumerate()
+        .filter(|(index, m)| {
+            !excluded.contains(index)
+                && !sender.is_some_and(|s| {
+                    s.harness == m.sighting.harness && s.session_id == m.sighting.session_id
+                })
         })
         .count();
     (skipped > 0)
