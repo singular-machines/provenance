@@ -1610,12 +1610,15 @@ fn deliver_message(
 
 /// Why a planned delivery can't run, found without side effects, so a relay
 /// dry run refuses exactly what delivery would.
-fn resume_precondition(s: &sessions::Sighting, delivery: &send::Delivery) -> Option<&'static str> {
-    (s.harness == sessions::Harness::Codex
-        && matches!(delivery, send::Delivery::Resume { .. })
-        && !send::codex_resume_repo(&s.cwd))
-    .then_some(
-        "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written",
+fn resume_precondition(s: &sessions::Sighting, delivery: &send::Delivery) -> Option<String> {
+    if s.harness != sessions::Harness::Codex || !matches!(delivery, send::Delivery::Resume { .. }) {
+        return None;
+    }
+    if !std::path::Path::new(&s.cwd).is_dir() {
+        return Some(format!("the session's folder is gone: {}", s.cwd));
+    }
+    (!send::codex_resume_repo(&s.cwd)).then_some(
+        "Codex headless resume requires a git repository. The original session's --skip-git-repo-check choice is not recorded, so provenance will not bypass that check; no mailbox entry was written".into(),
     )
 }
 
@@ -2273,6 +2276,17 @@ impl<B: SendBackend> mcp::Tools for McpTools<B> {
 #[cfg(test)]
 mod send_cli_tests {
     use super::*;
+    use std::io::Write;
+
+    fn is_isolated_fixture_child(
+        marker: Option<&std::ffi::OsStr>,
+        fixture_home: Option<&std::path::Path>,
+        home: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        marker == Some(std::ffi::OsStr::new("1"))
+            && fixture_home.map(std::path::Path::as_os_str) == home
+            && fixture_home.is_some_and(|path| path.is_dir())
+    }
 
     fn assert_reply_frame(text: &str, body: &str) {
         assert!(text.starts_with("[provenance] Reply to message m-1 from Codex session test."));
@@ -2472,6 +2486,72 @@ mod send_cli_tests {
     }
 
     #[test]
+    fn mcp_stdin_wrapper_dispatches_production_server() {
+        let isolated = std::env::var_os("PROVENANCE_MCP_WRAPPER_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("PROVENANCE_FIXTURE_HOME").as_deref()
+                == std::env::var_os("HOME").as_deref();
+        if !isolated {
+            let root = std::env::temp_dir().join(format!("prov-mcp-{}", send::new_id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "send_cli_tests::mcp_stdin_wrapper_dispatches_production_server",
+                    "--nocapture",
+                ])
+                .env("PROVENANCE_MCP_WRAPPER_CHILD", "1")
+                .env("PROVENANCE_FIXTURE_HOME", &root)
+                .env("HOME", &root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n",
+                )
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let response = stdout
+                .lines()
+                .find(|line| line.starts_with("{\"jsonrpc\""))
+                .unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(response).unwrap();
+            assert!(
+                value["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "send")
+            );
+            return;
+        }
+        dispatch(Cli::try_parse_from(["provenance", "mcp"]).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn exported_fixture_marker_alone_does_not_skip_isolated_setup() {
+        assert!(!is_isolated_fixture_child(
+            Some(std::ffi::OsStr::new("1")),
+            None,
+            Some(std::ffi::OsStr::new("/ambient/home")),
+        ));
+    }
+
+    #[test]
     fn cli_failed_turn_fences_stderr_and_escapes_controls() {
         let d = send::Delivery::Resume {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
@@ -2528,7 +2608,13 @@ mod send_cli_tests {
     fn resolved_send_preserves_caller_log_and_sender() {
         // Run in a child with isolated HOME and executables; never mutate the test
         // runner's environment or discover/resume an actual harness session.
-        if std::env::var_os("PROVENANCE_FIXTURE_CHILD").is_none() {
+        let fixture_home = std::env::var_os("PROVENANCE_FIXTURE_HOME").map(PathBuf::from);
+        let isolated_child = is_isolated_fixture_child(
+            std::env::var_os("PROVENANCE_FIXTURE_CHILD").as_deref(),
+            fixture_home.as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
+        if !isolated_child {
             use std::os::unix::fs::PermissionsExt;
             let root = std::env::temp_dir().join(format!("prov-fixtures-{}", send::new_id()));
             std::fs::create_dir_all(&root).unwrap();
@@ -2551,7 +2637,8 @@ mod send_cli_tests {
                 std::fs::write(&path, script).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "send_cli_tests::resolved_send_preserves_caller_log_and_sender",
@@ -2560,14 +2647,20 @@ mod send_cli_tests {
                 .env_remove("CODEX_THREAD_ID")
                 .env_remove("CODEX_SESSION_ID")
                 .env("PROVENANCE_FIXTURE_CHILD", "1")
+                .env("PROVENANCE_FIXTURE_HOME", &root)
                 .env("HOME", &root)
                 .env("PROVENANCE_MACHINE", "fixture")
                 .env(
                     "PATH",
                     format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
-                )
-                .output()
-                .unwrap();
+                );
+            for (key, _) in std::env::vars_os().filter(|(key, _)| {
+                key.to_string_lossy().starts_with("XDG_")
+                    || key.to_string_lossy().starts_with("PI_")
+            }) {
+                command.env_remove(key);
+            }
+            let output = command.output().unwrap();
             std::fs::remove_dir_all(root).unwrap();
             assert!(
                 output.status.success(),
@@ -2578,6 +2671,7 @@ mod send_cli_tests {
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
             return;
         }
+        assert_eq!(fixture_home, std::env::var_os("HOME").map(PathBuf::from));
         let home = std::env::temp_dir().join(format!("prov-resolved-{}", send::new_id()));
         std::fs::create_dir_all(&home).unwrap();
         let target = matching::SessionMatch {
@@ -2721,6 +2815,23 @@ mod send_cli_tests {
         );
         assert!(!error.contains("--force"));
         assert!(!error.contains("headless turn"));
+        let no_resume = <McpTools as mcp::Tools>::send(
+            &McpTools {
+                home: fixture_home.clone(),
+            },
+            pr,
+            "request without resume",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            no_resume.contains("no matched session can take a message now"),
+            "{no_resume}"
+        );
+        assert!(no_resume.contains("stopped mid-turn"), "{no_resume}");
+        assert!(!no_resume.contains("headless turn"));
+        assert!(!send::mail_dir(&fixture_home).exists());
         for force in [false, true] {
             let error = send_cmd(&fixture_home, pr, "request", true, force, None)
                 .unwrap_err()
@@ -2795,6 +2906,38 @@ mod send_cli_tests {
             record.session_id
         );
         assert!(entry.get("pr").is_none());
+        // Exercise the production MCP adapter through resolution, planning,
+        // mailbox persistence, and delivery.
+        record.last_event = "Stop".into();
+        record.pid = Some(987654);
+        record.pid_started = Some("Fri Oct 30 18:46:07 2026".into());
+        std::fs::write(
+            record.transcript_path.as_ref().unwrap(),
+            "fixture transcript",
+        )
+        .unwrap();
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let mcp_error = <McpTools as mcp::Tools>::send(
+            &McpTools {
+                home: fixture_home.clone(),
+            },
+            pr,
+            "mcp request",
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mcp_error.contains("Diagnostics (stderr)"), "{mcp_error}");
+        let target_mailbox = send::mailbox(
+            &send::mail_dir(&fixture_home),
+            record.harness,
+            &record.session_id,
+        );
+        assert!(
+            std::fs::read_to_string(target_mailbox)
+                .unwrap()
+                .contains("mcp request")
+        );
         // The fake ps identifies this parent as the sender. Self exclusion must
         // win even with force; dropping sender at the real entry point breaks it.
         record.pid = Some(std::os::unix::process::parent_id());
@@ -5127,7 +5270,35 @@ fn queue_acceptance_does_not_claim_receipt() {
 
 #[test]
 fn non_git_resume_refuses_before_mailbox_or_transport() {
-    let home = std::env::temp_dir().join(format!("zz-resume-{}", send::new_id()));
+    let root = std::env::var_os("PROVENANCE_NON_GIT_FIXTURE_HOME").map(PathBuf::from);
+    let isolated = std::env::var_os("PROVENANCE_NON_GIT_FIXTURE_CHILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && root == std::env::var_os("HOME").map(PathBuf::from)
+        && root.as_ref().is_some_and(|path| path.is_dir());
+    if !isolated {
+        let root = std::env::temp_dir().join(format!("prov-non-git-{}", send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "non_git_resume_refuses_before_mailbox_or_transport",
+            ])
+            .env("PROVENANCE_NON_GIT_FIXTURE_CHILD", "1")
+            .env("PROVENANCE_NON_GIT_FIXTURE_HOME", &root)
+            .env("HOME", &root)
+            .env("GIT_CEILING_DIRECTORIES", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let home = root.unwrap().join(format!("session-{}", send::new_id()));
     std::fs::create_dir_all(&home).unwrap();
     let sighting = sessions::Sighting {
         harness: Harness::Codex,
@@ -5162,6 +5333,81 @@ fn non_git_resume_refuses_before_mailbox_or_transport() {
     assert!(error.contains("no mailbox entry"));
     assert!(!send::mail_dir(&home).exists());
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn deleted_codex_resume_reports_gone_folder_before_mail_or_transport() {
+    let root = std::env::temp_dir().join(format!("prov-deleted-{}", send::new_id()));
+    let home = root.join("gone-session");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    let sighting = sessions::Sighting {
+        harness: Harness::Codex,
+        session_id: "deleted-fixture".into(),
+        app: "Terminal".into(),
+        cwd: home.to_string_lossy().into_owned(),
+        branch: String::new(),
+        repo_url: None,
+        last_seen: Utc::now(),
+        log_path: None,
+        machine: None,
+        url: None,
+    };
+    let outgoing = Outgoing {
+        sighting,
+        delivery: send::Delivery::Resume {
+            cwd: home.to_string_lossy().into_owned(),
+            argv: send::headless_argv(Harness::Codex, "deleted-fixture"),
+        },
+        sender: None,
+        pr: None,
+        named: None,
+        note: None,
+    };
+    let error = deliver_message(&root, outgoing, "hello", &|_, _, _, _, _, _, _| {
+        panic!("transport must not run")
+    })
+    .err()
+    .expect("deleted-folder send must be refused")
+    .to_string();
+    assert!(error.contains(&format!("the session's folder is gone: {}", home.display())));
+    assert!(!send::mail_dir(&root).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_resume_is_allowed_in_a_non_git_folder() {
+    let cwd = std::env::temp_dir()
+        .join(format!("prov-claude-non-git-{}", send::new_id()))
+        .to_string_lossy()
+        .into_owned();
+    let sighting = sessions::Sighting {
+        harness: Harness::ClaudeCode,
+        session_id: "claude-fixture".into(),
+        app: "Terminal".into(),
+        cwd: cwd.clone(),
+        branch: String::new(),
+        repo_url: None,
+        last_seen: Utc::now(),
+        log_path: None,
+        machine: None,
+        url: None,
+    };
+    let planned = send::plan(
+        &sighting,
+        Some(live::State::Ended),
+        go::Process::Gone,
+        true,
+        send::Caller::Mcp,
+        None,
+        &|_, _| None,
+    );
+    assert!(matches!(planned, send::Delivery::Resume { .. }));
+    let delivery = send::Delivery::Resume {
+        cwd,
+        argv: send::headless_argv(Harness::ClaudeCode, "claude-fixture"),
+    };
+    assert!(resume_precondition(&sighting, &delivery).is_none());
 }
 
 #[cfg(test)]
