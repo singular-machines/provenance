@@ -1633,26 +1633,13 @@ fn send_resolved_via(
         .borrow()
         .iter()
         .filter(|(_, reason)| reason.starts_with(send::BYPASS_REASON))
-        .filter_map(|(index, _)| (*index < chosen_index).then_some(*index))
-        .collect::<std::collections::HashSet<_>>();
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
     let note = if matches!(delivery, send::Delivery::Resume { .. }) {
         if bypass_indexes.is_empty() {
             send::resume_note(sessions, m, sender)
         } else {
-            let resume_skipped = sessions[..chosen_index]
-                .iter()
-                .enumerate()
-                .filter(|(index, candidate)| {
-                    !bypass_indexes.contains(index)
-                        && !sender.is_some_and(|s| {
-                            s.harness == candidate.sighting.harness
-                                && s.session_id == candidate.sighting.session_id
-                        })
-                })
-                .count();
-            (resume_skipped > 0).then(|| format!(
-                "Skipped {resume_skipped} newer matched session(s) not selected for headless resume (they may still be open or otherwise unavailable)."
-            ))
+            send::resume_note_excluding(sessions, m, sender, &bypass_indexes)
         }
     } else {
         None
@@ -3070,16 +3057,24 @@ mod send_cli_tests {
 
     #[test]
     fn resolved_send_notes_count_bypass_once_and_ignore_older_sessions() {
-        if std::env::var_os("PROVENANCE_RESOLVER_FIXTURE_CHILD").is_none() {
+        let fixture_home = std::env::var_os("PROVENANCE_RESOLVER_FIXTURE_HOME").map(PathBuf::from);
+        let isolated_child = is_isolated_fixture_child(
+            std::env::var_os("PROVENANCE_RESOLVER_FIXTURE_CHILD").as_deref(),
+            fixture_home.as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
+        if !isolated_child {
             use std::os::unix::fs::PermissionsExt;
             let root = std::env::temp_dir().join(format!("prov-resolver-{}", send::new_id()));
             std::fs::create_dir_all(&root).unwrap();
+            let ps = if cfg!(target_os = "macos") {
+                "#!/bin/sh\nexec /bin/ps \"$@\"\n"
+            } else {
+                "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n2 Fri Oct 30 18:46:07 2026 codex\\n';; esac\n"
+            };
             for (name, script) in [
                 ("claude", "#!/bin/sh\nprintf 'fixture answer'\n"),
-                (
-                    "ps",
-                    "#!/bin/sh\ncase \"$*\" in *comm=*) printf '1 Fri Oct 30 18:46:07 2026 codex\\n';; esac\n",
-                ),
+                ("ps", ps),
             ] {
                 let path = root.join(name);
                 std::fs::write(&path, script).unwrap();
@@ -3095,6 +3090,7 @@ mod send_cli_tests {
                 .env_remove("CODEX_SESSION_ID")
                 .env_remove("T3CODE_HOME")
                 .env("PROVENANCE_RESOLVER_FIXTURE_CHILD", "1")
+                .env("PROVENANCE_RESOLVER_FIXTURE_HOME", &root)
                 .env("HOME", &root)
                 .env("PROVENANCE_MACHINE", "fixture")
                 .env(
@@ -3114,52 +3110,72 @@ mod send_cli_tests {
             return;
         }
 
+        assert_eq!(fixture_home, std::env::var_os("HOME").map(PathBuf::from));
         let home = std::env::temp_dir().join(format!("prov-resolver-home-{}", send::new_id()));
         std::fs::create_dir_all(&home).unwrap();
-        let fixture_home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let bypass_id = "fixture-newer-bypass";
-        let (bypass_pid, bypass_pid_started) = if cfg!(target_os = "macos") {
-            let pid = std::process::id();
-            let started = std::process::Command::new("/bin/ps")
-                .args(["-p", &pid.to_string(), "-o", "lstart="])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
-            (pid, started)
+        let fixture_home = fixture_home.unwrap();
+        #[cfg(target_os = "macos")]
+        let mut older_process = Some(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let mut older_process: Option<std::process::Child> = None;
+        let newer_pid = if cfg!(target_os = "macos") {
+            std::process::id()
         } else {
-            (1, Some("Fri Oct 30 18:46:07 2026".into()))
+            1
         };
-        let bypass_record = live::Record {
-            harness: Harness::ClaudeCode,
-            session_id: bypass_id.into(),
-            app: "Terminal".into(),
-            cwd: home.to_string_lossy().into_owned(),
-            pid: Some(bypass_pid),
-            pid_started: bypass_pid_started,
-            last_event: "UserPromptSubmit".into(),
-            updated: Utc::now(),
-            branches: vec![],
-            permission_mode: Some("bypassPermissions".into()),
-            transcript_path: None,
+        let older_pid = older_process.as_ref().map_or(2, std::process::Child::id);
+        let start_time = |pid: u32| {
+            if cfg!(target_os = "macos") {
+                std::process::Command::new("/bin/ps")
+                    .args(["-p", &pid.to_string(), "-o", "lstart="])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                Some("Fri Oct 30 18:46:07 2026".into())
+            }
         };
+        let newer_bypass_id = "fixture-newer-bypass";
+        let older_bypass_id = "fixture-older-bypass";
         let records = live::live_dir(&fixture_home);
         std::fs::create_dir_all(&records).unwrap();
-        std::fs::write(
-            records.join("bypass.json"),
-            serde_json::to_vec(&bypass_record).unwrap(),
-        )
-        .unwrap();
         let claude_sessions = fixture_home.join(".claude/sessions");
         std::fs::create_dir_all(&claude_sessions).unwrap();
-        std::fs::write(
-            claude_sessions.join(format!("{bypass_pid}.json")),
-            serde_json::json!({"sessionId": bypass_id, "messagingSocketPath":"/fixture.sock"})
-                .to_string(),
-        )
-        .unwrap();
+        for (id, pid) in [(newer_bypass_id, newer_pid), (older_bypass_id, older_pid)] {
+            let record = live::Record {
+                harness: Harness::ClaudeCode,
+                session_id: id.into(),
+                app: "Terminal".into(),
+                cwd: home.to_string_lossy().into_owned(),
+                pid: Some(pid),
+                pid_started: start_time(pid),
+                last_event: "UserPromptSubmit".into(),
+                updated: Utc::now(),
+                branches: vec![],
+                permission_mode: Some("bypassPermissions".into()),
+                permission_mode_observed_at: None,
+                transcript_path: None,
+            };
+            std::fs::write(
+                records.join(format!("{id}.json")),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                claude_sessions.join(format!("{pid}.json")),
+                serde_json::json!({"sessionId": id, "messagingSocketPath":"/fixture.sock"})
+                    .to_string(),
+            )
+            .unwrap();
+        }
 
-        let make_match = |id: &str, state| matching::SessionMatch {
+        let make_match = |id: &str, state, machine| matching::SessionMatch {
             kind: matching::MatchKind::Stamp,
             state,
             sighting: sessions::Sighting {
@@ -3171,36 +3187,52 @@ mod send_cli_tests {
                 repo_url: None,
                 last_seen: Utc::now(),
                 log_path: None,
-                machine: None,
+                machine,
                 url: None,
             },
         };
-        let newer_bypass = make_match(bypass_id, Some(live::State::Waiting));
-        let chosen = make_match("fixture-chosen", Some(live::State::Ended));
-        let older = make_match("fixture-older", Some(live::State::Ended));
-        let sent = send_resolved(
+        let newer_bypass = make_match(newer_bypass_id, Some(live::State::Waiting), None);
+        let newer_other = make_match(
+            "fixture-newer-other",
+            Some(live::State::Ended),
+            Some("another-machine".into()),
+        );
+        let chosen = make_match("fixture-chosen", Some(live::State::Ended), None);
+        let older_bypass = make_match(older_bypass_id, Some(live::State::Waiting), None);
+        let older_other = make_match(
+            "fixture-older-other",
+            Some(live::State::Ended),
+            Some("another-machine".into()),
+        );
+        let sent_result = send_resolved(
             &fixture_home,
             "fixture/repo",
             1,
             "request",
-            &[newer_bypass, chosen, older],
+            &[newer_bypass, newer_other, chosen, older_bypass, older_other],
             None,
             true,
             send::Caller::Mcp,
             &|m| {
-                if m.sighting.session_id == bypass_id {
-                    go::Process::Live(bypass_pid)
+                if m.sighting.session_id == newer_bypass_id {
+                    go::Process::Live(newer_pid)
+                } else if m.sighting.session_id == older_bypass_id {
+                    go::Process::Live(older_pid)
                 } else {
                     go::Process::Gone
                 }
             },
-        )
-        .unwrap();
+        );
+        if let Some(process) = older_process.as_mut() {
+            process.kill().unwrap();
+            process.wait().unwrap();
+        }
+        let sent = sent_result.unwrap();
         assert_eq!(sent.to, "fixture/repo#1's Claude session fixture-chosen");
         assert_eq!(
             sent.note.as_deref(),
             Some(
-                "Skipped 1 newer matched session(s): Claude Code holds socket messages from provenance when the target is in bypass mode, and T3 Code doesn't host them. Use a session not running in bypass mode, or one hosted by T3 Code."
+                "Skipped 1 newer matched session(s) not selected for headless resume (they may still be open or otherwise unavailable). Skipped 1 newer matched session(s): Claude Code holds socket messages from provenance when the target was last observed in bypass mode, and T3 Code doesn't host them. Use a session not running in bypass mode, or one hosted by T3 Code."
             )
         );
         std::fs::remove_dir_all(home).unwrap();
