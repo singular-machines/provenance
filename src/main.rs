@@ -3767,6 +3767,78 @@ mod named_tests {
         assert_eq!(send::read(&mailbox).len(), 1);
         std::fs::remove_dir_all(home).unwrap();
     }
+    #[test]
+    fn dead_pid_t3_mapping_revalidated_before_dispatch() {
+        let home = scratch();
+        let session = "c4217d94-c60f-4ad7-9b6b-1b7b52976ea4";
+        let (mut r, s) = socket_target_with_id(&home, None, session);
+        r.pid = Some(u32::MAX);
+        std::fs::write(
+            live::live_dir(&home).join("target.json"),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+        let base = send::t3_base(&home, std::env::var_os("T3CODE_HOME"));
+        // Do not touch an ambient T3 database: execute the case in an isolated child.
+        if std::env::var_os("PROVENANCE_REVALIDATION_FIXTURE").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "named_tests::dead_pid_t3_mapping_revalidated_before_dispatch",
+                ])
+                .env_remove("T3CODE_HOME")
+                .env("PROVENANCE_REVALIDATION_FIXTURE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        t3_add(&base, "thread", "provider", session, "strong", true);
+        let binding = names::Store::new(&home).get("Socket Target").unwrap().1;
+        let (sighting, state, process) = named_recipient(&binding, &[r]).unwrap();
+        let delivery = plan_recipient(
+            &home,
+            &sighting,
+            state,
+            process,
+            None,
+            false,
+            send::Caller::Mcp,
+        );
+        assert!(matches!(delivery, send::Delivery::T3Thread { .. }));
+        t3_add(
+            &base,
+            "thread",
+            "switched",
+            "d4217d94-c60f-4ad7-9b6b-1b7b52976ea4",
+            "strong",
+            true,
+        );
+        let error = deliver_message(
+            &home,
+            Outgoing {
+                sighting: s,
+                delivery,
+                sender: None,
+                pr: None,
+                named: None,
+                note: None,
+            },
+            "never deliver",
+            &|_, _, _, _, _, _, _| panic!("refusal must precede transport"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("nothing was delivered"));
+        assert!(!send::mail_dir(&home).exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
     /// Two "machines" in one test: `here` sends, `there` runs `relay deliver`
     /// through a transport that hands it the envelope directly.
     /// Pins this thread's machine name too, so `PROVENANCE_MACHINE` can't
@@ -3803,7 +3875,13 @@ mod named_tests {
         home: &std::path::Path,
     ) -> (live::Record, std::os::unix::net::UnixListener) {
         let (r, _) = socket_target_with_id(home, None, "e4217d94-c60f-4ad7-9b6b-1b7b52976ea4");
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            send::new_id()
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             home.join(format!(".claude/sessions/{}.json", r.pid.unwrap())),
@@ -4767,7 +4845,13 @@ mod named_tests {
         // Passed back again before the session is back: still not forwarded.
         assert!(relay_reply(&here, &reply).how.contains("not forwarded yet"));
         // The session is back; the next pull forwards it, without asking any machine.
-        let socket = PathBuf::from(format!("/tmp/prov-{}.sock", send::new_id()));
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket = PathBuf::from(format!(
+            "/tmp/prov-{}-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            send::new_id()
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::write(
             here.join(format!(".claude/sessions/{}.json", sender.pid.unwrap())),
