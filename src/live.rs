@@ -490,25 +490,49 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
     if pids.is_empty() {
         return HashMap::new();
     }
-    let mut alive: HashMap<u32, String> = start_time_ps()
-        .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let mut p = l.split_whitespace();
-                    let pid = p.next()?.parse().ok()?;
-                    Some((pid, p.collect::<Vec<_>>().join(" ")))
+    alive_pids_with(
+        records,
+        || {
+            start_time_ps()
+                .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter_map(|l| {
+                            let mut p = l.split_whitespace();
+                            let pid = p.next()?.parse().ok()?;
+                            Some((pid, p.collect::<Vec<_>>().join(" ")))
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+        },
+        &process_start,
+    )
+}
+
+fn alive_pids_with(
+    records: &[Record],
+    batch: impl FnOnce() -> Option<HashMap<u32, String>>,
+    start: &dyn Fn(u32) -> Option<String>,
+) -> HashMap<u32, String> {
+    let Some(alive) = batch() else {
+        // macOS may deny the batch `ps` call in a sandbox, so probe each PID
+        // through the platform-specific fallback. A successful batch already
+        // establishes that omitted PIDs are dead.
+        let mut alive = HashMap::new();
+        fill_alive_pids(records, &mut alive, start);
+        return alive;
+    };
     // Start time alone proves liveness. Do not require executable-path or
     // title visibility, which can be more restricted in a sandbox.
-    fill_alive_pids(records, &mut alive, &process_start);
+    // On macOS, per-PID native identity can still recover PIDs omitted by ps.
+    #[cfg(target_os = "macos")]
+    let mut alive = alive;
+    #[cfg(target_os = "macos")]
+    fill_alive_pids(records, &mut alive, start);
     alive
 }
 
@@ -1189,6 +1213,58 @@ mod tests {
         assert!(!is_alive(&reused, &alive));
         fill_alive_pids(&[r], &mut alive, &|_| None);
         assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
+    }
+
+    fn liveness_record(pid: u32) -> Record {
+        Record {
+            harness: Harness::Codex,
+            session_id: format!("test-{pid}"),
+            app: String::new(),
+            cwd: String::new(),
+            pid: Some(pid),
+            pid_started: Some("start".into()),
+            last_event: "Stop".into(),
+            updated: Utc::now(),
+            branches: vec![],
+            transcript_path: None,
+            permission_mode: None,
+            permission_mode_observed_at: None,
+        }
+    }
+
+    #[test]
+    fn successful_liveness_batch_does_not_probe_missing_pids_on_non_macos() {
+        let records = [liveness_record(42), liveness_record(43)];
+        let per_pid_calls = Cell::new(0);
+        let alive = alive_pids_with(
+            &records,
+            || Some(HashMap::from([(42, "start".into())])),
+            &|_| {
+                per_pid_calls.set(per_pid_calls.get() + 1);
+                None
+            },
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(per_pid_calls.get(), 0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(per_pid_calls.get(), 1);
+        assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
+        assert!(!alive.contains_key(&43));
+    }
+
+    #[test]
+    fn failed_liveness_batch_falls_back_to_per_pid_probes() {
+        let records = [liveness_record(42), liveness_record(43)];
+        let per_pid_calls = Cell::new(0);
+        let alive = alive_pids_with(&records, || None, &|pid| {
+            per_pid_calls.set(per_pid_calls.get() + 1);
+            (pid == 42).then(|| "start".into())
+        });
+
+        assert_eq!(per_pid_calls.get(), 2);
+        assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
+        assert!(!alive.contains_key(&43));
     }
 
     #[test]
