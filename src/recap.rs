@@ -127,6 +127,9 @@ pub struct Entry {
     pub group: Group,
     /// "waiting for you", "running", "no activity 9d", "merged" and so on.
     pub status: String,
+    /// It needs you, but its session asked over `stale_days` ago. Old asks
+    /// don't count as needing you and are folded away unless asked for.
+    pub old_ask: bool,
     pub agent: Option<Agent>,
 }
 
@@ -220,12 +223,17 @@ pub fn entries(
                 closed_at: pr.closed_at,
                 group: Group::Done,
                 status: String::new(),
+                old_ask: false,
                 agent,
             };
             if e.state != PrState::Open && e.ended_at().is_none_or(|t| t < start) {
                 return None;
             }
             (e.group, e.status) = group(&e, now, stale_days);
+            e.old_ask = e.group == Group::NeedsYou
+                && e.agent
+                    .as_ref()
+                    .is_some_and(|a| now - a.last_seen >= Duration::days(i64::from(stale_days)));
             Some(e)
         })
         .collect();
@@ -355,7 +363,8 @@ pub fn render_terminal(
     let merged = count(&|e| e.state == PrState::Merged);
     let closed = count(&|e| e.state == PrState::Closed);
     let open = count(&|e| e.state == PrState::Open);
-    let needs = count(&|e| e.group == Group::NeedsYou);
+    let needs = count(&|e| e.group == Group::NeedsYou && !e.old_ask);
+    let old_asks = count(&|e| e.old_ask);
     let quiet = count(&|e| e.group == Group::Quiet);
     let mut summary = vec![format!(
         "{} PR{}",
@@ -374,6 +383,12 @@ pub fn render_terminal(
         summary.push(style.paint(
             YELLOW_BOLD,
             &format!("{needs} need{} you", if needs == 1 { "s" } else { "" }),
+        ));
+    }
+    if old_asks > 0 {
+        summary.push(format!(
+            "{old_asks} older ask{}",
+            if old_asks == 1 { "" } else { "s" }
         ));
     }
     if quiet > 0 {
@@ -403,7 +418,7 @@ pub fn render_terminal(
         .iter()
         .filter(|e| {
             let n = listed.entry(e.group).or_default();
-            if all || *n < shown(e.group) {
+            if all || (!e.old_ask && *n < shown(e.group)) {
                 *n += 1;
                 true
             } else {
@@ -467,20 +482,38 @@ pub fn render_terminal(
         .max(TITLE_MIN);
 
     let indent = " ".repeat(2 + time_w + 2);
+    // The newest old ask says how long they have all waited at least.
+    let newest_old_ask = entries
+        .iter()
+        .filter(|e| e.old_ask)
+        .filter_map(|e| e.agent.as_ref().map(|a| a.last_seen))
+        .max();
     // "… and 3 more", after a group that was cut short.
     let more = |group: Option<Group>| -> String {
         let Some((g, n)) = group.and_then(|g| hidden.get(&g).map(|n| (g, *n))) else {
             return String::new();
         };
-        let what = match g {
-            Group::Done => "done",
-            Group::Quiet => "with no recent activity",
-            Group::NeedsYou | Group::InFlight => "open",
+        let line = match g {
+            Group::NeedsYou => format!(
+                "{}{n} older ask{}, waiting {}+ (--all)",
+                if listed[&g] > 0 { "… and " } else { "" },
+                if n == 1 { "" } else { "s" },
+                newest_old_ask.map_or_else(String::new, |t| render::ago(t, now)),
+            ),
+            Group::Done => format!("… and {n} more done (--all)"),
+            Group::Quiet => format!("… and {n} more with no recent activity (--all)"),
+            Group::InFlight => format!("… and {n} more open (--all)"),
         };
-        let line = format!("… and {n} more {what} (--all)");
         format!("{indent}{}\n", style.paint(DIM, &line))
     };
     let mut current = None;
+    // With only old asks, Needs you still gets its heading and their count.
+    if listed.get(&Group::NeedsYou) == Some(&0) {
+        out.push('\n');
+        out.push_str(&style.paint(YELLOW_BOLD, "NEEDS YOU"));
+        out.push('\n');
+        out.push_str(&more(Some(Group::NeedsYou)));
+    }
     for l in &lines {
         if current != Some(l.e.group) {
             out.push_str(&more(current));
@@ -870,6 +903,59 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("cached 1m ago"), "{text}");
+    }
+
+    #[test]
+    fn old_asks_dont_count_and_fold_unless_all() {
+        let now = at("2026-11-11T14:20:00Z");
+        let rows = vec![
+            row(
+                "o/web",
+                1,
+                PrState::Open,
+                "2026-10-31T09:00:00Z",
+                None,
+                Some(Some(State::Waiting)),
+            ),
+            row(
+                "o/web",
+                2,
+                PrState::Open,
+                "2026-10-30T09:00:00Z",
+                None,
+                Some(Some(State::Waiting)),
+            ),
+        ];
+        let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None, |_| None);
+        assert!(got.iter().all(|e| e.group == Group::NeedsYou && e.old_ask));
+        let style = Style {
+            color: false,
+            links: false,
+            width: Some(120),
+            verbose: false,
+        };
+        let window = Window {
+            start: local_midnight(now.with_timezone(&Local).date_naive()),
+            days: 1,
+        };
+        let text = render_terminal(&got, &window, now, &style, None, false);
+        assert!(text.contains("2 PRs: 2 open · 2 older asks\n"), "{text}");
+        assert!(!text.contains("need you"), "{text}");
+        assert!(
+            text.contains("NEEDS YOU\n") && text.contains("2 older asks, waiting 11d+ (--all)"),
+            "{text}"
+        );
+        assert!(!text.contains("web#"), "{text}");
+        let text = render_terminal(&got, &window, now, &style, None, true);
+        assert_eq!(text.matches("web#").count(), 2, "{text}");
+
+        // A fresh ask still counts, and the old one folds under it.
+        let mut got = got;
+        got[0].old_ask = false;
+        let text = render_terminal(&got, &window, now, &style, None, false);
+        assert!(text.contains("1 needs you · 1 older ask"), "{text}");
+        assert!(text.contains("web#1") && !text.contains("web#2"), "{text}");
+        assert!(text.contains("… and 1 older ask, waiting 12d+"), "{text}");
     }
 
     #[test]

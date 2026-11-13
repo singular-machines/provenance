@@ -46,6 +46,10 @@ button.chip.quiet{border-color:var(--border);border-style:dashed;color:var(--mut
 .more{position:relative;z-index:1;display:block;width:100%;text-align:left;padding:9px 10px;border:0;border-bottom:1px solid var(--border);background:none;color:var(--accent);font:inherit;font-size:12px;cursor:pointer}
 .chip.needs{border-color:var(--needs);color:var(--needs)}
 .chip.needs b{color:inherit}
+.chip.ok{border-color:var(--merged);color:var(--merged)}
+.chip.snap{border-color:var(--needs);color:var(--fg);background:color-mix(in srgb,var(--needs) 14%,transparent)}
+.sec .m button{all:unset;color:var(--accent);cursor:pointer;margin-left:6px}
+.sec .m button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .grp{height:28px;padding:9px 10px 0;font-size:12px;font-weight:600;position:relative;z-index:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .grp .m{font-weight:400;color:var(--muted);margin-left:6px}
 .lane{position:relative}
@@ -94,7 +98,7 @@ code{font-family:var(--mono);font-size:11.5px}
 const D=/*DATA*/null;
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const H=36e5,DAY=24*H;
-const NOW=new Date(D.generated_at),START=new Date(D.start),TODAY=new Date(D.today);
+const NOW=new Date(D.generated_at),OPENED=new Date(),START=new Date(D.start),TODAY=new Date(D.today);
 // Local calendar arithmetic: days and hours are counted on the clock, so a
 // day with a clock change still ends at midnight and ticks stay on the hour.
 const at=(d,days,h,m=0)=>new Date(d.getFullYear(),d.getMonth(),d.getDate()+days,h,m);
@@ -114,11 +118,15 @@ const E=D.entries.map(e=>{const end=e.state==="merged"?(e.merged_at||e.closed_at
 const names={};for(const e of E){const n=e.repo.split("/").pop();(names[n]=names[n]||new Set).add(e.repo)}
 const short=e=>{const n=e.repo.split("/").pop();return `${names[n].size===1?n:e.repo}#${e.number}`};
 const kind=e=>e.state!=="open"?e.state:e.group==="quiet"?"stale":e.group==="needs-you"?"needs":e.status==="running"?"running":"open";
+const fresh=e=>e.group==="needs-you"&&!e.old_ask;
 const sessionKey=e=>e.agent?`${e.agent.harness}/${e.agent.session_id}`:"";
 let win=D.days>1?"window":"today",grp="pr",showQuiet=false;
-// Sections whose full list is shown: "done", "open", "quiet".
+// A page opened an hour or more after it was made says so: its status is old.
+// Its title says "Today" only on the day it was made.
+const STALE=OPENED-NOW>=H,DAYNAME=`${DN[NOW.getDay()]} ${NOW.getDate()} ${MN[NOW.getMonth()]}`;
+// Sections whose full list is shown: "old" (asks), "done", "open", "quiet".
 const expanded=new Set();
-let sel=(E.find(e=>e.group==="needs-you")||{}).key;
+let sel=(E.find(fresh)||{}).key;
 
 const winBtns=document.getElementById("win");
 if(D.days>1){winBtns.innerHTML=`<button data-v="today">Today</button><button data-v="window" class="on">${esc(D.days)} days</button>`}else winBtns.remove();
@@ -143,12 +151,13 @@ function statusText(e){
 }
 function render(){
   const list=rows(),[A,B]=range(list),X=t=>Math.max(0,Math.min(1,(t-A)/(B-A)))*100;
-  document.getElementById("title").textContent=win==="window"?D.label:`Today (${DN[NOW.getDay()]} ${NOW.getDate()} ${MN[NOW.getMonth()]})`;
-  const all=E.filter(inWindow),n=f=>all.filter(f).length,quiet=n(e=>e.group==="quiet");
+  document.getElementById("title").textContent=win==="window"?D.label:sameDay(OPENED,NOW)?`Today (${DAYNAME})`:DAYNAME;
+  const all=E.filter(inWindow),n=f=>all.filter(f).length,quiet=n(e=>e.group==="quiet"),asks=n(fresh);
   document.getElementById("sum").innerHTML=
+    (STALE?`<span class="chip snap">Snapshot from ${esc(hm(NOW))}, ${esc(dur(NOW,OPENED))} old · run <code>provenance recap --html</code> again</span>`:"")+
     `<span class="chip"><b>${all.length}</b> PRs</span>`+
     [["merged",e=>e.state==="merged"],["closed",e=>e.state==="closed"],["open",e=>e.state==="open"]].filter(([,f])=>n(f)).map(([w,f])=>`<span class="chip"><b>${n(f)}</b> ${w}</span>`).join("")+
-    (n(e=>e.group==="needs-you")?`<span class="chip needs">⚑ <b>${n(e=>e.group==="needs-you")}</b> need${n(e=>e.group==="needs-you")===1?"s":""} you</span>`:"")+
+    (asks?`<span class="chip needs">⚑ <b>${asks}</b> need${asks===1?"s":""} you</span>`:`<span class="chip ok">✓ Nothing new needs you</span>`)+
     (quiet?`<button class="chip quiet" id="quiet">${showQuiet?"Hide":"Show"} ${quiet} gone quiet (no activity for ${esc(D.stale_days)}+ days)</button>`:"");
   const chart=document.getElementById("chart");
   if(!list.length){chart.innerHTML=`<div class="empty">${all.length?"Only PRs that have gone quiet: show them above.":"No open PRs, and none merged or closed in this window."}</div>`;return}
@@ -166,7 +175,7 @@ function render(){
       ticks+=`<div class="tick${we?" we":""}" style="left:${X(step>1?d0:noon)}%">${DN[d0.getDay()]} ${d0.getDate()}${d0.getDate()===1||i===0&&days>7?" "+MN[d0.getMonth()]:""}</div>`;
       bg+=`<div class="gl" style="left:${X(d0)}%"></div>`}}
   if(NOW<B)bg+=`<div class="future" style="left:${X(NOW)}%"></div>`;
-  bg+=`<div class="now" style="left:${X(NOW)}%"><span>now ${hm(NOW)}</span></div>`;
+  bg+=`<div class="now" style="left:${X(NOW)}%"><span>${STALE?"snapshot":"now"} ${hm(NOW)}</span></div>`;
   const row=e=>{const k=kind(e),l=X(e.o),r=X(e.c||NOW),live=!e.c;
     const end=e.c?`<span class="end ${k}" style="left:calc(${r}% + 3px)">${k==="merged"?"✓":"✗"}</span>`:"";
     const who=grp==="pr"?" · "+esc(e.agent?e.agent.name:"no session"):"";
@@ -176,22 +185,31 @@ function render(){
   let body="";
   // Same sections and order as the terminal; long ones show their newest few.
   if(grp==="pr"){
-    const secs=[["needs","Needs you",e=>e.group==="needs-you",Infinity],
+    const secs=[["needs","Needs you",fresh,Infinity],
       ["done",win==="today"||D.days===1?"Done today":"Done",e=>e.state!=="open",6],
       ["open","Still open",e=>e.group==="in-flight",5],
       ["quiet","Gone quiet",e=>e.group==="quiet",5]];
-    // Asks older than the stale cutoff sink below a note, under the fresh ones.
-    const longWait=e=>e.agent&&NOW-new Date(e.agent.last_seen)>=D.stale_days*DAY;
-    for(const [id,name,f,cap] of secs){const items=list.filter(f);if(!items.length)continue;
+    // Asks older than the stale cutoff don't count, and fold away under the fresh ones.
+    const olds=list.filter(e=>e.old_ask);
+    for(const [id,name,f,cap] of secs){const items=list.filter(f);
+      if(id==="needs"){if(items.length||olds.length)body+=needs(items,olds);continue}
+      if(!items.length)continue;
       const shown=expanded.has(id)?items:items.slice(0,cap);
-      const first=id==="needs"?shown.findIndex(longWait):-1;
-      body+=`<div class="sec ${id==="needs"?"needs":""}">${name}<span class="m">${items.length}</span></div>`+
-        shown.map((e,i)=>(i===first?`<div class="sub">Waiting over ${esc(D.stale_days)} days: still yours to answer, or close them</div>`:"")+row(e)).join("")+
+      body+=`<div class="sec">${name}<span class="m">${items.length}</span></div>`+shown.map(row).join("")+
         (shown.length<items.length?`<button class="more" data-more="${id}">Show ${items.length-shown.length} more${id==="done"?"":id==="open"?", most recently active first":" with no recent activity"}</button>`:"");}}
   else{const order=[...new Set(list.map(sessionKey))];
     for(const s of order){const es=list.filter(e=>sessionKey(e)===s),a=es[0].agent;
       const head=a?`${esc(a.name)}<span class="m">${esc([a.app,a.machine&&"on "+a.machine,a.session_id.slice(0,8)+"…"].filter(Boolean).join(" · "))}</span>${a.state?` <span class="m">· ${esc(a.state.replace("-"," "))}</span>`:""}`:`No session found <span class="m">(likely you)</span>`;
       body+=`<div class="grp">${head}</div>`+es.map(row).join("")}}
+  function needs(items,olds){
+    const open=expanded.has("old");
+    // Newest first, so the first old ask has waited the least.
+    const note=olds.length?`${olds.length} older ask${olds.length===1?"":"s"}, waiting ${esc(dur(new Date(olds[0].agent.last_seen),NOW).split(" ")[0])}+`:"";
+    const toggle=`<button data-more="old">${open?"Hide":"Show"}</button>`;
+    return `<div class="sec needs">Needs you<span class="m">${items.length?items.length:`nothing new · ${note}${toggle}`}</span></div>`+items.map(row).join("")+
+      (olds.length&&items.length?`<button class="more" data-more="old">${open?"Hide":"Show"} ${note}</button>`:"")+
+      (olds.length&&open?`<div class="sub">Waiting over ${esc(D.stale_days)} days: still yours to answer, or close them</div>`+olds.map(row).join(""):"");
+  }
   chart.innerHTML=`<div class="bg">${bg}</div><div class="axis"><div></div><div class="ticks">${ticks}</div></div>${body}`;
 }
 // The open row's details and what you can do next, shown under the row.
@@ -210,7 +228,7 @@ document.addEventListener("click",ev=>{
   const b=ev.target.closest(".seg button");
   if(b){b.parentElement.querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));if(b.parentElement.id==="win")win=b.dataset.v;else grp=b.dataset.v;render();return}
   if(ev.target.closest("#quiet")){showQuiet=!showQuiet;render();return}
-  const m=ev.target.closest("[data-more]");if(m){expanded.add(m.dataset.more);render();return}
+  const m=ev.target.closest("[data-more]");if(m){const v=m.dataset.more;v==="old"&&expanded.has(v)?expanded.delete(v):expanded.add(v);render();return}
   const c=ev.target.closest("[data-copy]");
   if(c){navigator.clipboard&&navigator.clipboard.writeText(c.dataset.copy).then(()=>{c.firstChild.textContent="Copied "},()=>{});return}
   // Clicking a row opens its panel; clicking it again closes it.
