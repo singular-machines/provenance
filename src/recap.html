@@ -105,11 +105,20 @@ code{font-family:var(--mono);font-size:11.5px}
 .legend .g{margin-right:4px}
 .foot{font-size:11px;color:var(--muted);margin-top:6px}
 .empty{padding:24px;color:var(--muted)}
+.ask-card{border:1px solid var(--border);border-left:3px solid var(--needs);border-radius:6px;padding:14px 16px;margin-bottom:10px;background:var(--bg)}
+.ask-top{display:flex;align-items:baseline;gap:12px;justify-content:space-between}.ask-top h2{font-size:14px;margin:0;font-weight:600;overflow-wrap:anywhere}.ask-wait{color:var(--needs);white-space:nowrap;font-size:12px;font-weight:600}
+.ask-meta{font-size:12px;color:var(--muted);margin:5px 0 12px;overflow-wrap:anywhere}.ask-message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.5;background:var(--card);border-radius:6px;padding:10px 12px;margin-top:5px}
+.ask-message.clamped{padding:0;border:10px solid var(--card);display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.expand-message{background:none;border:0;color:var(--accent);font:inherit;font-size:12px;padding:6px 0;cursor:pointer}.ask-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.ask-actions .primary{border-color:var(--accent);color:var(--accent)}
+#inbox>.more{border:1px solid var(--border);border-radius:6px;margin-bottom:16px}#inbox{margin-bottom:16px}
+@media(max-width:720px){.ask-card{padding:12px}.ask-top{display:block}.ask-wait{display:block;margin-top:5px}.ask-actions{flex-direction:column}.ask-actions .btn{padding:9px 10px;overflow-wrap:anywhere}.ask-actions code{font-size:10.5px}}
+
+.ask-more{display:flex;flex-direction:column;gap:6px}.ask-more [hidden]{display:none}.ask-more>button{align-self:flex-start}
 </style>
 </head>
 <body>
 <div class="top"><h1 id="title"></h1><div class="seg" id="win"></div><div class="seg" id="grp"><button data-v="pr" class="on">By PR</button><button data-v="session">By session</button></div><div class="status" id="status"></div></div>
 <div id="sum"></div>
+<div id="inbox"></div>
 <div class="chart" id="chart"></div>
 <div class="legend" id="legend"></div>
 <div class="foot" id="foot"></div>
@@ -233,7 +242,7 @@ function render(){
     const st=statusText(e),who=grp==="pr"?" · "+esc(e.agent?e.agent.name:"no session"):"";
     const tip=`Opened ${full(e.o)}${e.c?` · ${e.state} ${full(e.c)}`:""} · last activity ${full(la)}`;
     return `<div class="row ${k}${e.key===sel?" sel":""}" data-key="${esc(e.key)}" aria-expanded="${e.key===sel}"><div class="lab"><div class="l1">${title(e.title)}</div><div class="l2">${st?`<span class="st ${k}">${esc(st)}</span> · `:""}<span class="ref">${rc(e)}${esc(short(e))}</span>${who} · opened ${esc(when(e.o))}</div></div><div class="lane" title="${esc(tip)}">${marks}</div>${gutter(e)}</div>${e.key===sel?panel(e):""}`};
-  let body="";
+  let body="",inbox="";
   // Needs you, Done and Gone quiet match the terminal. Open PRs split by how
   // recently anything happened on them; long sections show their newest few.
   if(grp==="pr"){
@@ -247,7 +256,7 @@ function render(){
     // Asks older than the stale cutoff don't count, and fold away under the fresh ones.
     const olds=list.filter(e=>e.old_ask);
     for(const [id,name,f,cap,g,hint] of secs){const items=list.filter(f);
-      if(id==="needs"){if(items.length||olds.length)body+=needs(items,olds);continue}
+      if(id==="needs"){if(items.length||olds.length)inbox=needs(items,olds);continue}
       if(!items.length)continue;
       const shown=expanded.has(id)?items:items.slice(0,cap);
       body+=`<div class="sec">${glyph(g)}${name}<span class="m">${items.length}</span>${hint?`<span class="h">${hint}</span>`:""}</div>`+shown.map(row).join("")+
@@ -261,11 +270,21 @@ function render(){
     // Newest first, so the first old ask has waited the least.
     const note=olds.length?`${olds.length} older ask${olds.length===1?"":"s"}, waiting ${esc(dur(new Date(olds[0].agent.last_seen),NOW).split(" ")[0])}+`:"";
     const toggle=`<button data-more="old">${open?"Hide":"Show"}</button>`;
-    return `<div class="sec needs">${glyph("needs")}Needs you<span class="m">${items.length?items.length:`nothing new · ${note}${toggle}`}</span></div>`+items.map(row).join("")+
-      (olds.length&&items.length?`<button class="more" data-more="old">${open?"Hide":"Show"} ${note}</button>`:"")+
-      (olds.length&&open?`<div class="sub">Waiting over ${esc(D.stale_days)} days: still yours to answer, or close them</div>`+olds.map(row).join(""):"");
+    const olderRows=olds.length&&open?`<div class="sub">Waiting over ${esc(D.stale_days)} days: still yours to answer, or close them</div>`+olds.map(row).join(""):"";
+    body+=olderRows;
+    return `<div class="sec needs">${glyph("needs")}Needs you<span class="m">${items.length?items.length:`nothing new · ${note}${toggle}`}</span></div>`+ (expanded.has("asks")?items:items.slice(0,3)).map(askCard).join("")+
+      (items.length>3?`<button class="more" data-more="asks">${expanded.has("asks")?"Show fewer":"Show "+(items.length-3)+" more"}</button>`:"")+
+      (olds.length&&items.length?`<button class="more" data-more="old">${open?"Hide":"Show"} ${note}</button>`:"");
   }
+  document.getElementById("inbox").innerHTML=inbox;
+  document.querySelectorAll(".ask-message").forEach(message=>{
+    message.nextElementSibling.hidden=message.scrollHeight<=message.clientHeight+1;
+  });
   chart.innerHTML=`<div class="bg">${bg}</div><div class="axis"><div></div><div class="ticks">${ticks}</div><div class="gh">${STALE?"snapshot":"now"} ${hm(NOW)}</div></div>${body}`;
+}
+function askCard(e){
+ const a=e.agent||{},url=/^https:\/\/github\.com\//.test(e.url)?e.url:"";
+ return `<article class="ask-card"><div class="ask-top"><h2>${title(e.title)}</h2><span class="ask-wait">Waiting ${esc(dur(new Date(a.last_seen||e.last_activity),NOW))}</span></div><div class="ask-meta"><span class="ref">${rc(e)}${esc(short(e))}</span> · ${esc(a.name)} · ${esc(a.app)} · ${esc(a.machine||"machine unknown")}</div><div class="said-h">Last message</div><div class="ask-message clamped">${esc(a.last_message||"No last message recorded.")}</div><button class="expand-message" aria-expanded="false" hidden>Show full message</button><div class="ask-actions">${url?`<a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}<button class="btn" data-copy="${esc('provenance go '+e.key)}">Copy <code>${esc('provenance go '+e.key)}</code></button><div class="ask-more"><button class="btn" data-disclose aria-expanded="false" aria-label="More actions">⋯</button><div hidden><button class="btn" data-copy="${esc('gh pr close '+e.number+' -R '+e.repo)}">Copy <code>${esc('gh pr close '+e.number+' -R '+e.repo)}</code></button></div></div></div></article>`;
 }
 // The open row's details and what you can do next, shown under the row.
 function panel(e){
@@ -280,10 +299,12 @@ function panel(e){
   <div class="acts">${url?`<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}${a?copy(`provenance go ${e.key}`,"Copy"):""}${e.state==="open"?copy(`gh pr close ${e.number} -R ${e.repo}`,"Copy"):""}</div></div>`;
 }
 document.addEventListener("click",ev=>{
+  const disclosure=ev.target.closest("[data-disclose]");if(disclosure){const open=disclosure.getAttribute("aria-expanded")!=="true";disclosure.setAttribute("aria-expanded",String(open));disclosure.nextElementSibling.hidden=!open;return}
+  const x=ev.target.closest(".expand-message");if(x){const open=x.getAttribute("aria-expanded")!=="true";x.setAttribute("aria-expanded",String(open));x.previousElementSibling.classList.toggle("clamped",!open);x.textContent=open?"Collapse message":"Show full message";return}
   const b=ev.target.closest(".seg button");
   if(b){b.parentElement.querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));if(b.parentElement.id==="win")win=b.dataset.v;else grp=b.dataset.v;render();return}
   if(ev.target.closest("#quiet")){showQuiet=!showQuiet;render();return}
-  const m=ev.target.closest("[data-more]");if(m){const v=m.dataset.more;v==="old"&&expanded.has(v)?expanded.delete(v):expanded.add(v);render();return}
+  const m=ev.target.closest("[data-more]");if(m){const v=m.dataset.more;(v==="old"||v==="asks")&&expanded.has(v)?expanded.delete(v):expanded.add(v);render();return}
   const c=ev.target.closest("[data-copy]");
   if(c){navigator.clipboard&&navigator.clipboard.writeText(c.dataset.copy).then(()=>{c.firstChild.textContent="Copied "},()=>{});return}
   // Clicking a row opens its panel; clicking it again closes it.
