@@ -89,11 +89,9 @@ pub fn plan(
                 },
             };
         }
+        // The Codex app opens a thread by its ID, which is the session ID.
         "Codex Desktop" => {
-            return Action::App {
-                bundle: "com.openai.codex",
-                name: "Codex",
-            };
+            return Action::Open(format!("codex://threads/{}", s.session_id));
         }
         "Conductor" => {
             return Action::App {
@@ -637,6 +635,11 @@ mod tests {
             plan(&m, Process::Unknown, None, &Some3),
             Action::App { name: "Claude", .. }
         ));
+        let m = session(Harness::Codex, "Codex Desktop", Some(State::Waiting));
+        assert_eq!(
+            plan(&m, Process::Live(1), None, &Some3),
+            Action::Open("codex://threads/abc-123".into())
+        );
     }
 
     #[test]
