@@ -2244,7 +2244,7 @@ fn forward_once(
     let text = send::reply_to(mailbox, id).with_context(|| format!("no reply to {id} is saved"))?;
     let records = live::load_records(home);
     match forward_reply(home, &records, to, id, from, &text) {
-        Ok(ReplyForwardStatus::Forwarded(status)) => {
+        Ok(ReplyForwardStatus::Forwarded(status) | ReplyForwardStatus::Failed(status)) => {
             send::append_new(
                 mailbox,
                 &send::Mail::Forwarded {
@@ -2255,9 +2255,6 @@ fn forward_once(
             Ok(status)
         }
         Ok(ReplyForwardStatus::Saved(status)) => Ok(status),
-        Ok(ReplyForwardStatus::Failed(status)) => Ok(format!(
-            "saved, but not forwarded yet ({status}); the next `provenance peer pull` tries again"
-        )),
         Err(e) => Ok(format!(
             "saved, but not forwarded yet ({e:#}); the next `provenance peer pull` tries again"
         )),
@@ -5576,6 +5573,55 @@ exit {status}
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
     }
+    #[test]
+    fn relayed_reply_to_gone_session_is_marked_and_not_retried() {
+        stamps::set_test_machine("m-here");
+        let home = scratch();
+        let replier = send::Sender {
+            harness: Harness::Codex,
+            session_id: "remote-codex".into(),
+        };
+        let gone_sender = send::Sender {
+            harness: Harness::Codex,
+            session_id: "session-that-has-ended".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&home), replier.harness, &replier.session_id);
+        send::append(
+            &mailbox,
+            &send::Mail::Message {
+                id: "m-0000000000b0".into(),
+                pr: None,
+                named_address: None,
+                from: "terminal on machine m-remote".into(),
+                sender: Some(gone_sender),
+                from_machine: None,
+                to_machine: Some("m-remote".into()),
+                text: "question".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let reply = relay::ReplyEnvelope {
+            protocol: relay::PROTOCOL,
+            id: "m-0000000000b0".into(),
+            from_machine: "m-remote".into(),
+            replier,
+            text: "answer".into(),
+        };
+
+        let first = relay_reply(&home, &reply);
+        assert!(first.accepted, "{first:?}");
+        assert!(
+            first.how.contains("isn't running to receive it"),
+            "{first:?}"
+        );
+        assert!(send::forwarded(&mailbox, &reply.id));
+        let second = relay_reply(&home, &reply);
+        assert_eq!(second.how, "already received");
+
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn a_reply_both_passed_back_and_collected_is_delivered_once() {
         stamps::set_test_machine("m-here");
