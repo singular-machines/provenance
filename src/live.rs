@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -497,19 +497,27 @@ pub fn alive_pids(records: &[Record]) -> HashMap<u32, String> {
                 .args(["-o", "pid=", "-o", "lstart=", "-p", &pids.join(",")])
                 .output()
                 .ok()
-                .filter(|out| out.status.success())
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .filter_map(|l| {
-                            let mut p = l.split_whitespace();
-                            let pid = p.next()?.parse().ok()?;
-                            Some((pid, p.collect::<Vec<_>>().join(" ")))
-                        })
-                        .collect()
-                })
+                .and_then(parse_ps_batch)
         },
         &process_start,
+    )
+}
+
+fn parse_ps_batch(out: Output) -> Option<HashMap<u32, String>> {
+    let empty_no_matches =
+        out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty();
+    if !out.status.success() && !empty_no_matches {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut p = l.split_whitespace();
+                let pid = p.next()?.parse().ok()?;
+                Some((pid, p.collect::<Vec<_>>().join(" ")))
+            })
+            .collect(),
     )
 }
 
@@ -1261,6 +1269,60 @@ mod tests {
             per_pid_calls.set(per_pid_calls.get() + 1);
             (pid == 42).then(|| "start".into())
         });
+
+        assert_eq!(per_pid_calls.get(), 2);
+        assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
+        assert!(!alive.contains_key(&43));
+    }
+
+    #[test]
+    fn empty_exit_one_ps_batch_means_all_recorded_pids_are_dead() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let records = [liveness_record(42), liveness_record(43)];
+        let per_pid_calls = Cell::new(0);
+        let alive = alive_pids_with(
+            &records,
+            || {
+                parse_ps_batch(Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+            &|_| {
+                per_pid_calls.set(per_pid_calls.get() + 1);
+                None
+            },
+        );
+
+        assert!(alive.is_empty());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(per_pid_calls.get(), 0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(per_pid_calls.get(), 2);
+    }
+
+    #[test]
+    fn ps_batch_failure_with_stderr_falls_back_to_per_pid_probes() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let records = [liveness_record(42), liveness_record(43)];
+        let per_pid_calls = Cell::new(0);
+        let alive = alive_pids_with(
+            &records,
+            || {
+                parse_ps_batch(Output {
+                    status: std::process::ExitStatus::from_raw(2 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"ps: invalid process list".to_vec(),
+                })
+            },
+            &|pid| {
+                per_pid_calls.set(per_pid_calls.get() + 1);
+                (pid == 42).then(|| "start".into())
+            },
+        );
 
         assert_eq!(per_pid_calls.get(), 2);
         assert_eq!(alive.get(&42).map(String::as_str), Some("start"));

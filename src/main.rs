@@ -1738,7 +1738,7 @@ fn deliver_message_as_via(
         sender,
         pr,
         named,
-        note,
+        mut note,
     } = outgoing;
     let target = send::Sender {
         harness: s.harness,
@@ -1801,8 +1801,14 @@ fn deliver_message_as_via(
             None => {
                 let (sender, machine) = send::record_reply(&send::mail_dir(home), Some(&target), &id, &output)
                     .context("saving Codex structured reply after delivery; do not resend the original message")?;
-                forward_recorded_reply(home, &live::load_records(home), Some(&target), &id, &output, reply_transport, sender, machine)
+                let forward_status = forward_recorded_reply(home, &live::load_records(home), Some(&target), &id, &output, reply_transport, sender, machine)
                     .context("Codex reply was saved, but forwarding failed; do not resend the original message")?;
+                if let Some(forward_note) = forward_status.failure_note() {
+                    note = Some(match note {
+                        Some(existing) => format!("{existing} {forward_note}"),
+                        None => forward_note,
+                    });
+                }
                 output
             }
         };
@@ -1946,6 +1952,31 @@ fn reply_recorded(
 ) -> Result<String> {
     let (sender, from_machine) = send::record_reply(&send::mail_dir(home), me, id, text)?;
     forward_recorded_reply(home, records, me, id, text, transport, sender, from_machine)
+        .map(|status| status.message().to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyForwardStatus {
+    Forwarded(String),
+    Saved(String),
+    Failed(String),
+}
+
+impl ReplyForwardStatus {
+    fn message(&self) -> &str {
+        match self {
+            Self::Forwarded(message) | Self::Saved(message) | Self::Failed(message) => message,
+        }
+    }
+
+    fn failure_note(&self) -> Option<String> {
+        match self {
+            Self::Failed(message) => Some(format!(
+                "Codex reply was saved, but forwarding failed: {message}"
+            )),
+            Self::Forwarded(_) | Self::Saved(_) => None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1958,16 +1989,16 @@ fn forward_recorded_reply(
     transport: &relay::Transport<'_>,
     sender: Option<send::Sender>,
     from_machine: Option<String>,
-) -> Result<String> {
+) -> Result<ReplyForwardStatus> {
     if let Some(machine) = from_machine {
         // record_reply only succeeds for the session the message went to.
         let me = me.context("reply has no identified session")?;
         return Ok(reply_back(home, &machine, me, id, text, transport));
     }
     let Some(to) = sender else {
-        return Ok(format!(
+        return Ok(ReplyForwardStatus::Saved(format!(
             "Reply to {id} saved for the terminal that sent it."
-        ));
+        )));
     };
     forward_reply(home, records, &to, id, &label(me), text)
 }
@@ -1981,22 +2012,24 @@ fn reply_back(
     id: &str,
     text: &str,
     transport: &relay::Transport<'_>,
-) -> String {
+) -> ReplyForwardStatus {
     let peer = match relay::load(home).map(|peers| relay::find(&peers, machine).cloned()) {
         Ok(Some(peer)) => peer,
         Ok(None) => {
-            return format!(
+            return ReplyForwardStatus::Failed(format!(
                 "Reply to {id} saved here for machine {machine} to collect (`provenance peer pull` there): it isn't paired from this machine, so it can't be passed back."
-            );
+            ));
         }
         Err(e) => {
-            return format!(
+            return ReplyForwardStatus::Failed(format!(
                 "Reply to {id} saved here, but the paired machines couldn't be read: {e:#}."
-            );
+            ));
         }
     };
     let Some(here) = stamps::machine_name() else {
-        return format!("Reply to {id} saved here, but this machine has no name to send it from.");
+        return ReplyForwardStatus::Failed(format!(
+            "Reply to {id} saved here, but this machine has no name to send it from."
+        ));
     };
     let reply = relay::ReplyEnvelope {
         protocol: relay::PROTOCOL,
@@ -2006,14 +2039,17 @@ fn reply_back(
         text: text.into(),
     };
     match relay::call_reply(&peer, &reply, transport) {
-        Ok(o) if o.accepted => format!("Reply to {id} passed back to machine {machine}: {}", o.how),
-        Ok(o) => format!(
+        Ok(o) if o.accepted => ReplyForwardStatus::Forwarded(format!(
+            "Reply to {id} passed back to machine {machine}: {}",
+            o.how
+        )),
+        Ok(o) => ReplyForwardStatus::Failed(format!(
             "Reply to {id} saved here, but machine {machine} refused it: {}",
             o.why.as_deref().unwrap_or("no reason given")
-        ),
-        Err(e) => format!(
+        )),
+        Err(e) => ReplyForwardStatus::Failed(format!(
             "Reply to {id} saved here, but it couldn't be passed back to machine {machine}: {e:#}"
-        ),
+        )),
     }
 }
 
@@ -2025,7 +2061,19 @@ fn forward_reply(
     id: &str,
     from: &str,
     text: &str,
-) -> Result<String> {
+) -> Result<ReplyForwardStatus> {
+    forward_reply_with(home, records, to, id, from, text, &send::deliver_reply)
+}
+
+fn forward_reply_with(
+    home: &std::path::Path,
+    records: &[live::Record],
+    to: &send::Sender,
+    id: &str,
+    from: &str,
+    text: &str,
+    deliver: &dyn Fn(&send::Delivery, &str, &str, &str) -> Result<String>,
+) -> Result<ReplyForwardStatus> {
     let alive = live::alive_pids(records);
     let route = records
         .iter()
@@ -2039,20 +2087,22 @@ fn forward_reply(
             _ => None,
         });
     let Some(route) = route else {
-        return Ok(format!(
+        return Ok(ReplyForwardStatus::Failed(format!(
             "Reply to {id} saved, but {} isn't running to receive it.",
             label(Some(to))
-        ));
+        )));
     };
     let route = match send::bypass_route(home, to, &route) {
         Some(send::Delivery::Refuse(why)) => {
-            return Ok(format!("Reply to {id} saved, but not forwarded: {why}."));
+            return Ok(ReplyForwardStatus::Failed(format!(
+                "Reply to {id} saved, but not forwarded: {why}."
+            )));
         }
         Some(rerouted) => rerouted,
         None => route,
     };
-    send::deliver_reply(&route, id, from, text)?;
-    Ok(reply_receipt(&route, id, to))
+    deliver(&route, id, from, text)?;
+    Ok(ReplyForwardStatus::Forwarded(reply_receipt(&route, id, to)))
 }
 
 fn reply_receipt(route: &send::Delivery, id: &str, to: &send::Sender) -> String {
@@ -2194,7 +2244,7 @@ fn forward_once(
     let text = send::reply_to(mailbox, id).with_context(|| format!("no reply to {id} is saved"))?;
     let records = live::load_records(home);
     match forward_reply(home, &records, to, id, from, &text) {
-        Ok(status) => {
+        Ok(ReplyForwardStatus::Forwarded(status) | ReplyForwardStatus::Failed(status)) => {
             send::append_new(
                 mailbox,
                 &send::Mail::Forwarded {
@@ -2204,6 +2254,7 @@ fn forward_once(
             )?;
             Ok(status)
         }
+        Ok(ReplyForwardStatus::Saved(status)) => Ok(status),
         Err(e) => Ok(format!(
             "saved, but not forwarded yet ({e:#}); the next `provenance peer pull` tries again"
         )),
@@ -3625,6 +3676,18 @@ mod named_tests {
         tool_reply: bool,
         relayed: bool,
     ) -> (Result<Sent>, PathBuf, Vec<String>) {
+        structured_fixture_via_with_note(response, event, status, tool_reply, relayed, None, true)
+    }
+
+    fn structured_fixture_via_with_note(
+        response: &str,
+        event: &str,
+        status: i32,
+        tool_reply: bool,
+        relayed: bool,
+        note: Option<String>,
+        reply_accepted: bool,
+    ) -> (Result<Sent>, PathBuf, Vec<String>) {
         use std::os::unix::fs::PermissionsExt;
         let home = scratch();
         std::process::Command::new("git")
@@ -3701,7 +3764,7 @@ exit {status}
                 sender: None,
                 pr: None,
                 named: None,
-                note: None,
+                note,
             },
             "hello",
             &|d, id, pr, from, to, log, text| {
@@ -3722,10 +3785,18 @@ exit {status}
                 assert_eq!(reply.id, "m-structured");
                 assert_eq!(reply.replier, recipient);
                 seen.borrow_mut().push(reply.text);
-                Ok(serde_json::to_vec(&relay::Outcome {
-                    accepted: true,
-                    ..Default::default()
-                })?)
+                let outcome = if reply_accepted {
+                    relay::Outcome {
+                        accepted: true,
+                        ..Default::default()
+                    }
+                } else {
+                    relay::Outcome {
+                        why: Some("synthetic refusal".into()),
+                        ..Default::default()
+                    }
+                };
+                Ok(serde_json::to_vec(&outcome)?)
             },
         );
         (result, home, seen.into_inner())
@@ -3792,6 +3863,36 @@ exit {status}
                 sent.id,
                 "remote answer".into()
             )]
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn structured_codex_forward_failure_appends_to_existing_skipped_session_note() {
+        let existing = "Skipped 2 newer matched sessions not selected for headless resume (they may still be open or otherwise unavailable).";
+        let (result, home, _) = structured_fixture_via_with_note(
+            r#"{"reply":"answer saved despite the forwarding failure"}"#,
+            r#"{"type":"turn.completed"}"#,
+            0,
+            false,
+            true,
+            Some(existing.into()),
+            false,
+        );
+        let sent = result.unwrap();
+        let note = sent.note.expect("skip and forwarding notes are reported");
+        assert!(note.contains(existing), "{note}");
+        assert!(
+            note.contains("Codex reply was saved, but forwarding failed"),
+            "{note}"
+        );
+        assert!(
+            note.contains("machine m-here refused it: synthetic refusal"),
+            "{note}"
+        );
+        assert_eq!(
+            send::reply_to(&sent.mailbox, &sent.id).as_deref(),
+            Some("answer saved despite the forwarding failure")
         );
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -4116,6 +4217,79 @@ exit {status}
             .unwrap();
         let (s, _, _) = named_recipient(&binding, std::slice::from_ref(&r)).unwrap();
         (r, s)
+    }
+    #[test]
+    fn forward_reply_returns_typed_forwarded_saved_and_saved_but_failed_statuses() {
+        let home = scratch();
+        let codex = send::Sender {
+            harness: Harness::Codex,
+            session_id: "codex-sender".into(),
+        };
+        let stopped = forward_reply_with(
+            &home,
+            &[],
+            &codex,
+            "m-1",
+            "from",
+            "answer",
+            &|_, _, _, _| panic!("no route should not deliver"),
+        )
+        .unwrap();
+        assert!(matches!(
+            &stopped,
+            ReplyForwardStatus::Failed(message) if message.contains("saved, but") && message.contains("isn't running")
+        ));
+
+        let (session_record, _) = socket_target(&home, Some("bypassPermissions"));
+        let claude = send::Sender {
+            harness: Harness::ClaudeCode,
+            session_id: session_record.session_id.clone(),
+        };
+        let held = forward_reply_with(
+            &home,
+            std::slice::from_ref(&session_record),
+            &claude,
+            "m-2",
+            "from",
+            "answer",
+            &|_, _, _, _| panic!("bypass refusal should happen before delivery"),
+        )
+        .unwrap();
+        assert!(matches!(
+            &held,
+            ReplyForwardStatus::Failed(message) if message.contains("saved, but not forwarded")
+        ));
+
+        let (_, started, _) = live::ps_info(std::process::id()).unwrap();
+        let codex_record = record("codex-sender", Harness::Codex, std::process::id(), &started);
+        let delivered = forward_reply_with(
+            &home,
+            std::slice::from_ref(&codex_record),
+            &codex,
+            "m-3",
+            "from",
+            "answer",
+            &|route, _, _, _| {
+                assert!(matches!(route, send::Delivery::CodexQueue(id) if id == "codex-sender"));
+                Ok("queued".into())
+            },
+        )
+        .unwrap();
+        assert!(matches!(delivered, ReplyForwardStatus::Forwarded(_)));
+
+        let saved = forward_recorded_reply(
+            &home,
+            &[],
+            Some(&codex),
+            "m-4",
+            "answer",
+            &|_, _, _| panic!("terminal replies do not use relay transport"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(saved, ReplyForwardStatus::Saved(_)));
+        std::fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn bypass_socket_refused_before_mail_on_pr_and_named_routes() {
@@ -5026,6 +5200,35 @@ exit {status}
     }
     #[test]
     fn a_dry_run_refuses_a_codex_resume_that_delivery_would_refuse() {
+        let root = std::env::var_os("PROVENANCE_DRY_RUN_FIXTURE_ROOT").map(PathBuf::from);
+        let isolated = std::env::var_os("PROVENANCE_DRY_RUN_FIXTURE_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && root == std::env::var_os("HOME").map(PathBuf::from)
+            && root.as_ref().is_some_and(|path| path.is_dir());
+        if !isolated {
+            let root = std::env::temp_dir().join(format!("prov-dry-run-{}", send::new_id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "named_tests::a_dry_run_refuses_a_codex_resume_that_delivery_would_refuse",
+                ])
+                .env("PROVENANCE_DRY_RUN_FIXTURE_CHILD", "1")
+                .env("PROVENANCE_DRY_RUN_FIXTURE_ROOT", &root)
+                .env("HOME", &root)
+                .env("TMPDIR", &root)
+                .env("GIT_CEILING_DIRECTORIES", &root)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         stamps::set_test_machine("m-here");
         let there = scratch();
         let pid = std::process::id();
@@ -5370,6 +5573,55 @@ exit {status}
         std::fs::remove_dir_all(here).unwrap();
         std::fs::remove_dir_all(there).unwrap();
     }
+    #[test]
+    fn relayed_reply_to_gone_session_is_marked_and_not_retried() {
+        stamps::set_test_machine("m-here");
+        let home = scratch();
+        let replier = send::Sender {
+            harness: Harness::Codex,
+            session_id: "remote-codex".into(),
+        };
+        let gone_sender = send::Sender {
+            harness: Harness::Codex,
+            session_id: "session-that-has-ended".into(),
+        };
+        let mailbox = send::mailbox(&send::mail_dir(&home), replier.harness, &replier.session_id);
+        send::append(
+            &mailbox,
+            &send::Mail::Message {
+                id: "m-0000000000b0".into(),
+                pr: None,
+                named_address: None,
+                from: "terminal on machine m-remote".into(),
+                sender: Some(gone_sender),
+                from_machine: None,
+                to_machine: Some("m-remote".into()),
+                text: "question".into(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let reply = relay::ReplyEnvelope {
+            protocol: relay::PROTOCOL,
+            id: "m-0000000000b0".into(),
+            from_machine: "m-remote".into(),
+            replier,
+            text: "answer".into(),
+        };
+
+        let first = relay_reply(&home, &reply);
+        assert!(first.accepted, "{first:?}");
+        assert!(
+            first.how.contains("isn't running to receive it"),
+            "{first:?}"
+        );
+        assert!(send::forwarded(&mailbox, &reply.id));
+        let second = relay_reply(&home, &reply);
+        assert_eq!(second.how, "already received");
+
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn a_reply_both_passed_back_and_collected_is_delivered_once() {
         stamps::set_test_machine("m-here");
@@ -6329,11 +6581,45 @@ fn deleted_codex_resume_reports_gone_folder_before_mail_or_transport() {
 }
 
 #[test]
-fn claude_resume_is_allowed_in_a_non_git_folder() {
-    let cwd = std::env::temp_dir()
-        .join(format!("prov-claude-non-git-{}", send::new_id()))
-        .to_string_lossy()
-        .into_owned();
+fn claude_resume_is_allowed_in_an_existing_non_git_folder() {
+    let root = std::env::var_os("PROVENANCE_CLAUDE_NON_GIT_ROOT").map(PathBuf::from);
+    let isolated = std::env::var_os("PROVENANCE_CLAUDE_NON_GIT_CHILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && root == std::env::var_os("HOME").map(PathBuf::from)
+        && root.as_ref().is_some_and(|path| path.is_dir());
+    if !isolated {
+        let root = std::env::temp_dir().join(format!("prov-claude-non-git-{}", send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "claude_resume_is_allowed_in_an_existing_non_git_folder",
+            ])
+            .env("PROVENANCE_CLAUDE_NON_GIT_CHILD", "1")
+            .env("PROVENANCE_CLAUDE_NON_GIT_ROOT", &root)
+            .env("HOME", &root)
+            .env("TMPDIR", &root)
+            .env("GIT_CEILING_DIRECTORIES", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let cwd = root.unwrap().join("session-folder");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let git_check = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .status()
+        .unwrap();
+    assert!(!git_check.success(), "fixture folder must be outside git");
+    let cwd = cwd.to_string_lossy().into_owned();
     let sighting = sessions::Sighting {
         harness: Harness::ClaudeCode,
         session_id: "claude-fixture".into(),
