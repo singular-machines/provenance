@@ -160,6 +160,7 @@ let win=D.days>1?"window":"today",grp="pr",showQuiet=false;
 const STALE=OPENED-NOW>=H,DAYNAME=`${DN[NOW.getDay()]} ${NOW.getDate()} ${MN[NOW.getMonth()]}`;
 // Sections whose full list is shown: "old" (asks), "done", "open", "quiet".
 const expanded=new Set();
+const expandedMessages=new Set(),openDisclosures=new Set();
 let sel=(E.find(fresh)||{}).key;
 
 const winBtns=document.getElementById("win");
@@ -271,20 +272,20 @@ function render(){
     const note=olds.length?`${olds.length} older ask${olds.length===1?"":"s"}, waiting ${esc(dur(new Date(olds[0].agent.last_seen),NOW).split(" ")[0])}+`:"";
     const toggle=`<button data-more="old">${open?"Hide":"Show"}</button>`;
     const olderRows=olds.length&&open?`<div class="sub">Waiting over ${esc(D.stale_days)} days: still yours to answer, or close them</div>`+olds.map(row).join(""):"";
-    body+=olderRows;
     return `<div class="sec needs">${glyph("needs")}Needs you<span class="m">${items.length?items.length:`nothing new · ${note}${toggle}`}</span></div>`+ (expanded.has("asks")?items:items.slice(0,3)).map(askCard).join("")+
       (items.length>3?`<button class="more" data-more="asks">${expanded.has("asks")?"Show fewer":"Show "+(items.length-3)+" more"}</button>`:"")+
-      (olds.length&&items.length?`<button class="more" data-more="old">${open?"Hide":"Show"} ${note}</button>`:"");
+      (olds.length&&items.length?`<button class="more" data-more="old">${open?"Hide":"Show"} ${note}</button>`:"")+olderRows;
   }
   document.getElementById("inbox").innerHTML=inbox;
   document.querySelectorAll(".ask-message").forEach(message=>{
-    message.nextElementSibling.hidden=message.scrollHeight<=message.clientHeight+1;
+    message.nextElementSibling.hidden=!expandedMessages.has(message.closest(".ask-card").dataset.key)&&message.scrollHeight<=message.clientHeight+1;
   });
   chart.innerHTML=`<div class="bg">${bg}</div><div class="axis"><div></div><div class="ticks">${ticks}</div><div class="gh">${STALE?"snapshot":"now"} ${hm(NOW)}</div></div>${body}`;
 }
 function askCard(e){
  const a=e.agent||{},url=/^https:\/\/github\.com\//.test(e.url)?e.url:"";
- return `<article class="ask-card"><div class="ask-top"><h2>${title(e.title)}</h2><span class="ask-wait">Waiting ${esc(dur(new Date(a.last_seen||e.last_activity),NOW))}</span></div><div class="ask-meta"><span class="ref">${rc(e)}${esc(short(e))}</span> · ${esc(a.name)} · ${esc(a.app)} · ${esc(a.machine||"machine unknown")}</div><div class="said-h">Last message</div><div class="ask-message clamped">${esc(a.last_message||"No last message recorded.")}</div><button class="expand-message" aria-expanded="false" hidden>Show full message</button><div class="ask-actions">${url?`<a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}<button class="btn" data-copy="${esc('provenance go '+e.key)}">Copy <code>${esc('provenance go '+e.key)}</code></button><div class="ask-more"><button class="btn" data-disclose aria-expanded="false" aria-label="More actions">⋯</button><div hidden><button class="btn" data-copy="${esc('gh pr close '+e.number+' -R '+e.repo)}">Copy <code>${esc('gh pr close '+e.number+' -R '+e.repo)}</code></button></div></div></div></article>`;
+ const messageOpen=expandedMessages.has(e.key),moreOpen=openDisclosures.has(e.key);
+ return `<article class="ask-card" data-key="${esc(e.key)}"><div class="ask-top"><h2>${title(e.title)}</h2><span class="ask-wait">Waiting ${esc(dur(new Date(a.last_seen||e.last_activity),NOW))}</span></div><div class="ask-meta"><span class="ref">${rc(e)}${esc(short(e))}</span> · ${esc(a.name)} · ${esc(a.app)} · ${esc(a.machine||"machine unknown")}</div><div class="said-h">Last message</div><div class="ask-message${messageOpen?"":" clamped"}">${esc(a.last_message||"No last message recorded.")}</div><button class="expand-message" aria-expanded="${messageOpen}" hidden>${messageOpen?"Collapse message":"Show full message"}</button><div class="ask-actions">${url?`<a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}<button class="btn" data-copy="${esc('provenance go '+e.key)}">Copy <code>${esc('provenance go '+e.key)}</code></button><div class="ask-more"><button class="btn" data-disclose aria-expanded="${moreOpen}" aria-label="More actions">⋯</button><div${moreOpen?"":" hidden"}><button class="btn" data-copy="${esc('gh pr close '+e.number+' -R '+e.repo)}">Copy <code>${esc('gh pr close '+e.number+' -R '+e.repo)}</code></button></div></div></div></article>`;
 }
 // The open row's details and what you can do next, shown under the row.
 function panel(e){
@@ -299,8 +300,8 @@ function panel(e){
   <div class="acts">${url?`<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open PR ↗</a>`:""}${a?copy(`provenance go ${e.key}`,"Copy"):""}${e.state==="open"?copy(`gh pr close ${e.number} -R ${e.repo}`,"Copy"):""}</div></div>`;
 }
 document.addEventListener("click",ev=>{
-  const disclosure=ev.target.closest("[data-disclose]");if(disclosure){const open=disclosure.getAttribute("aria-expanded")!=="true";disclosure.setAttribute("aria-expanded",String(open));disclosure.nextElementSibling.hidden=!open;return}
-  const x=ev.target.closest(".expand-message");if(x){const open=x.getAttribute("aria-expanded")!=="true";x.setAttribute("aria-expanded",String(open));x.previousElementSibling.classList.toggle("clamped",!open);x.textContent=open?"Collapse message":"Show full message";return}
+  const disclosure=ev.target.closest("[data-disclose]");if(disclosure){const open=disclosure.getAttribute("aria-expanded")!=="true";const key=disclosure.closest(".ask-card").dataset.key;open?openDisclosures.add(key):openDisclosures.delete(key);disclosure.setAttribute("aria-expanded",String(open));disclosure.nextElementSibling.hidden=!open;return}
+  const x=ev.target.closest(".expand-message");if(x){const open=x.getAttribute("aria-expanded")!=="true";const key=x.closest(".ask-card").dataset.key;open?expandedMessages.add(key):expandedMessages.delete(key);x.setAttribute("aria-expanded",String(open));x.previousElementSibling.classList.toggle("clamped",!open);x.textContent=open?"Collapse message":"Show full message";return}
   const b=ev.target.closest(".seg button");
   if(b){b.parentElement.querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));if(b.parentElement.id==="win")win=b.dataset.v;else grp=b.dataset.v;render();return}
   if(ev.target.closest("#quiet")){showQuiet=!showQuiet;render();return}
@@ -309,7 +310,8 @@ document.addEventListener("click",ev=>{
   if(c){navigator.clipboard&&navigator.clipboard.writeText(c.dataset.copy).then(()=>{c.firstChild.textContent="Copied "},()=>{});return}
   // Clicking a row opens its panel; clicking it again closes it.
   const r=ev.target.closest(".row");if(r){sel=sel===r.dataset.key?null:r.dataset.key;render()}});
-addEventListener("resize",render);
+let viewportWidth=innerWidth;
+addEventListener("resize",()=>{if(innerWidth!==viewportWidth){viewportWidth=innerWidth;render()}});
 document.getElementById("legend").innerHTML=[["done","merged"],["closed","closed"],["moving","moving"],["needs","needs you"],
   ["opened","opened"],["last","last activity"],["idle","no activity since"],["carry","opened before the chart starts"]]
   .map(([g,w])=>`<span>${glyph(g)}${w}</span>`).join("")+`<span>right column: time since the last activity</span>${D.days>1?"<span>shaded: night (20:00–08:00)</span>":""}`;
