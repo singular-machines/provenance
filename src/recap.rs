@@ -1060,6 +1060,20 @@ mod tests {
         )];
         rows[0].pr.title = "</script><img src=x onerror=alert(1)>".into();
         let got = entries(rows, at("2026-11-11T00:00:00Z"), now, 3, |_| None, |_| None);
+        let mut got = got;
+        got[0].group = Group::NeedsYou;
+        got[0].agent = Some(Agent {
+            harness: Harness::Codex,
+            name: "Codex (GPT-6.1 Sol)".into(),
+            model: Some("gpt-6.1-sol".into()),
+            app: "CLI".into(),
+            session_id: "fixture".into(),
+            state: None,
+            last_seen: now,
+            matched_by: MatchKind::Stamp,
+            machine: None,
+            last_message: Some("First line\n</script><img src=x onerror=alert(1)>".into()),
+        });
         let window = Window {
             start: local_midnight(now.with_timezone(&Local).date_naive()),
             days: 1,
@@ -1068,6 +1082,7 @@ mod tests {
         assert!(!html.contains("/*DATA*/null"));
         assert!(!html.contains("</script><img"));
         assert!(html.contains("\\u003c/script>\\u003cimg"));
+        assert!(html.contains("First line\\n\\u003c/script>"));
         assert_eq!(html.matches("</script>").count(), 1);
     }
 }
