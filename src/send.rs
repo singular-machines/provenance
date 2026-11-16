@@ -1058,16 +1058,6 @@ pub fn record_reply(
     id: &str,
     text: &str,
 ) -> Result<(Option<Sender>, Option<String>)> {
-    let (sender, machine) = persist_reply(dir, me, id, text)?;
-    Ok((sender, machine))
-}
-
-pub fn persist_reply(
-    dir: &Path,
-    me: Option<&Sender>,
-    id: &str,
-    text: &str,
-) -> Result<(Option<Sender>, Option<String>)> {
     let Some(me) = me else {
         bail!(
             "reply works only inside the session the message was sent to, with provenance's session hooks installed"

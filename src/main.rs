@@ -1738,7 +1738,7 @@ fn deliver_message_as_via(
         sender,
         pr,
         named,
-        note,
+        mut note,
     } = outgoing;
     let target = send::Sender {
         harness: s.harness,
@@ -1801,8 +1801,11 @@ fn deliver_message_as_via(
             None => {
                 let (sender, machine) = send::record_reply(&send::mail_dir(home), Some(&target), &id, &output)
                     .context("saving Codex structured reply after delivery; do not resend the original message")?;
-                forward_recorded_reply(home, &live::load_records(home), Some(&target), &id, &output, reply_transport, sender, machine)
+                let forward_status = forward_recorded_reply(home, &live::load_records(home), Some(&target), &id, &output, reply_transport, sender, machine)
                     .context("Codex reply was saved, but forwarding failed; do not resend the original message")?;
+                if let Some(forward_note) = codex_forward_note(&forward_status) {
+                    note = Some(forward_note);
+                }
                 output
             }
         };
@@ -1821,6 +1824,34 @@ fn deliver_message_as_via(
         from_session: sender.is_some(),
         relayed_to: None,
     })
+}
+
+fn codex_forward_note(status: &str) -> Option<String> {
+    (status.contains(" saved ") && !status.contains(" saved for the terminal that sent it"))
+        .then(|| format!("Codex reply was saved, but forwarding failed: {status}"))
+}
+
+#[cfg(test)]
+mod codex_forward_note_tests {
+    use super::codex_forward_note;
+
+    #[test]
+    fn saved_codex_reply_reports_when_forwarding_did_not_succeed() {
+        assert_eq!(
+            codex_forward_note("Reply to m-1 passed back to machine m-away: ssh"),
+            None
+        );
+        assert_eq!(
+            codex_forward_note("Reply to m-1 saved for the terminal that sent it."),
+            None
+        );
+        let note = codex_forward_note(
+            "Reply to m-1 saved here, but it couldn't be passed back to machine m-away: timeout",
+        )
+        .unwrap();
+        assert!(note.contains("reply was saved"), "{note}");
+        assert!(note.contains("couldn't be passed back"), "{note}");
+    }
 }
 
 /// Escape terminal controls at presentation only; preserve newlines and tabs.
@@ -5026,6 +5057,35 @@ exit {status}
     }
     #[test]
     fn a_dry_run_refuses_a_codex_resume_that_delivery_would_refuse() {
+        let root = std::env::var_os("PROVENANCE_DRY_RUN_FIXTURE_ROOT").map(PathBuf::from);
+        let isolated = std::env::var_os("PROVENANCE_DRY_RUN_FIXTURE_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && root == std::env::var_os("HOME").map(PathBuf::from)
+            && root.as_ref().is_some_and(|path| path.is_dir());
+        if !isolated {
+            let root = std::env::temp_dir().join(format!("prov-dry-run-{}", send::new_id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "named_tests::a_dry_run_refuses_a_codex_resume_that_delivery_would_refuse",
+                ])
+                .env("PROVENANCE_DRY_RUN_FIXTURE_CHILD", "1")
+                .env("PROVENANCE_DRY_RUN_FIXTURE_ROOT", &root)
+                .env("HOME", &root)
+                .env("TMPDIR", &root)
+                .env("GIT_CEILING_DIRECTORIES", &root)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         stamps::set_test_machine("m-here");
         let there = scratch();
         let pid = std::process::id();
@@ -6329,11 +6389,45 @@ fn deleted_codex_resume_reports_gone_folder_before_mail_or_transport() {
 }
 
 #[test]
-fn claude_resume_is_allowed_in_a_non_git_folder() {
-    let cwd = std::env::temp_dir()
-        .join(format!("prov-claude-non-git-{}", send::new_id()))
-        .to_string_lossy()
-        .into_owned();
+fn claude_resume_is_allowed_in_an_existing_non_git_folder() {
+    let root = std::env::var_os("PROVENANCE_CLAUDE_NON_GIT_ROOT").map(PathBuf::from);
+    let isolated = std::env::var_os("PROVENANCE_CLAUDE_NON_GIT_CHILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && root == std::env::var_os("HOME").map(PathBuf::from)
+        && root.as_ref().is_some_and(|path| path.is_dir());
+    if !isolated {
+        let root = std::env::temp_dir().join(format!("prov-claude-non-git-{}", send::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "claude_resume_is_allowed_in_an_existing_non_git_folder",
+            ])
+            .env("PROVENANCE_CLAUDE_NON_GIT_CHILD", "1")
+            .env("PROVENANCE_CLAUDE_NON_GIT_ROOT", &root)
+            .env("HOME", &root)
+            .env("TMPDIR", &root)
+            .env("GIT_CEILING_DIRECTORIES", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let cwd = root.unwrap().join("session-folder");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let git_check = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .status()
+        .unwrap();
+    assert!(!git_check.success(), "fixture folder must be outside git");
+    let cwd = cwd.to_string_lossy().into_owned();
     let sighting = sessions::Sighting {
         harness: Harness::ClaudeCode,
         session_id: "claude-fixture".into(),
