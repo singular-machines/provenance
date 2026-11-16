@@ -95,6 +95,12 @@ h1{font-size:18px;margin:0 6px 0 0}
 .sub{position:relative;z-index:1;padding:8px 10px 4px;font-size:11px;color:var(--muted);background:var(--bg);border-bottom:1px solid color-mix(in srgb,var(--border) 45%,transparent)}
 .btn{font:inherit;font-size:12px;border:1px solid var(--border);background:var(--card);color:var(--fg);border-radius:6px;padding:5px 10px;cursor:pointer;text-align:left;text-decoration:none}
 code{font-family:var(--mono);font-size:11.5px}
+@media (max-width:720px){
+.panel{grid-template-columns:minmax(0,1fr)}
+.panel .info,.panel .acts{overflow-wrap:anywhere}
+.panel .acts{min-width:0}
+.panel .btn{white-space:normal;overflow-wrap:anywhere}
+}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:10px}
 .legend .g{margin-right:4px}
 .foot{font-size:11px;color:var(--muted);margin-top:6px}
