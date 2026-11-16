@@ -129,7 +129,8 @@ The tested launch paths and remaining session-ID limitations are recorded in [th
 | T3 Code | Opens the thread in T3 Code |
 | Claude desktop | Opens the session in the Claude app with `claude://code/continue` (untested; archived sessions can't be opened this way) |
 | Claude Code on the web | Opens its claude.ai link |
-| Conductor, Codex desktop | Brings the app forward; neither has a link to one session |
+| Codex desktop | Opens the thread in the Codex app with `codex://threads/<id>` |
+| Conductor | Brings the app forward; it has no link to one session |
 | Another machine | Says which machine it ran on |
 
 ### Messaging the session behind a PR

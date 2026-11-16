@@ -96,6 +96,19 @@ pub fn match_prs_with(
         }
     }
 
+    // The app each session ran in, from any sighting: Codex hooks don't say
+    // which app started a session, and its log, which does, records only the
+    // branch the session started on, so may not match the PR.
+    let mut app_by_id: HashMap<(Harness, &str), &Sighting> = HashMap::new();
+    for s in sightings.iter().filter(|s| !s.app.is_empty()) {
+        let e = app_by_id
+            .entry((s.harness, s.session_id.as_str()))
+            .or_insert(s);
+        if s.last_seen > e.last_seen {
+            *e = s;
+        }
+    }
+
     prs.into_iter()
         .map(|pr| {
             let mut sessions: Vec<SessionMatch> = pr
@@ -124,10 +137,16 @@ pub fn match_prs_with(
                     }
                 }
             }
-            PrRow {
-                sessions: merge_sessions(sessions),
-                pr,
+            let mut sessions = merge_sessions(sessions);
+            for m in &mut sessions {
+                let s = &mut m.sighting;
+                if s.app.is_empty()
+                    && let Some(known) = app_by_id.get(&(s.harness, s.session_id.as_str()))
+                {
+                    s.app = known.app.clone();
+                }
             }
+            PrRow { sessions, pr }
         })
         .collect()
 }
@@ -510,6 +529,19 @@ mod tests {
         assert_eq!(s[0].sighting.session_id, "other", "newest first");
         assert_eq!(s[1].kind, MatchKind::Stamp);
         assert_eq!(s[1].sighting.app, "web");
+    }
+
+    #[test]
+    fn app_comes_from_the_sessions_log_on_another_branch() {
+        // A Codex Desktop session: its log saw only the starting branch, and
+        // the hook that saw the PR branch doesn't know the app.
+        let mut log = sighting("s", "main", Some("https://github.com/o/myrepo"), 1);
+        log.app = "Codex Desktop".into();
+        let mut hook = sighting("s", "feat", Some("https://github.com/o/myrepo"), 2);
+        hook.app = String::new();
+        let rows = match_prs(vec![pr("o/myrepo", None, "feat")], &[log, hook]);
+        assert_eq!(rows[0].sessions.len(), 1);
+        assert_eq!(rows[0].sessions[0].sighting.app, "Codex Desktop");
     }
 
     #[test]
