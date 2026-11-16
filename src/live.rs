@@ -1304,6 +1304,32 @@ mod tests {
     }
 
     #[test]
+    fn ps_batch_failure_with_stderr_falls_back_to_per_pid_probes() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let records = [liveness_record(42), liveness_record(43)];
+        let per_pid_calls = Cell::new(0);
+        let alive = alive_pids_with(
+            &records,
+            || {
+                parse_ps_batch(Output {
+                    status: std::process::ExitStatus::from_raw(2 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"ps: invalid process list".to_vec(),
+                })
+            },
+            &|pid| {
+                per_pid_calls.set(per_pid_calls.get() + 1);
+                (pid == 42).then(|| "start".into())
+            },
+        );
+
+        assert_eq!(per_pid_calls.get(), 2);
+        assert_eq!(alive.get(&42).map(String::as_str), Some("start"));
+        assert!(!alive.contains_key(&43));
+    }
+
+    #[test]
     fn branches_keep_the_folder_they_were_seen_in() {
         let f = Fake {
             started: "Fri Oct 30 18:46:07 2026".into(),
