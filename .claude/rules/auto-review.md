@@ -1,10 +1,10 @@
 # auto-review extension for provenance
 
-Install at `.claude/rules/auto-review.md`. Loaded by the generic cts-brain skill `auto-review` at start.
+Install at `.claude/rules/auto-review.md`. Loaded at start by the user-level `auto-review` skill.
 
 ## Overrides
 
-- The skill describes itself as for CTS repos. This repo uses its format, verdict line and labels anyway: first line `Verdict: approve` or `Verdict: changes needed`, the machine-readable verdict line, and the labels `code-review:clean`, `code-review:needs-fix` and `code-review:resolved`.
+- The skill's description names other repos. This repo uses its format, verdict line and labels anyway: first line `Verdict: approve` or `Verdict: changes needed`, the machine-readable verdict line, and the labels `code-review:clean`, `code-review:needs-fix` and `code-review:resolved`.
 
 ## Extra checks
 
