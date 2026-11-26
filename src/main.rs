@@ -1,4 +1,5 @@
 mod cache;
+mod decisions;
 mod github;
 mod go;
 mod install;
@@ -35,6 +36,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Repository opt-in and per-PR local history of implementation choices.
+    Decisions {
+        #[command(subcommand)]
+        action: decisions::Command,
+    },
     /// List PRs (open by default) with the last known session that worked on each.
     Prs {
         /// Only this repository (owner/name).
@@ -254,6 +260,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Ok(home)
     };
     match cli.command {
+        Cmd::Decisions { action } => decisions::run(&home()?, action),
         Cmd::Prs {
             repo,
             author,
