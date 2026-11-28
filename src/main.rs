@@ -1,4 +1,5 @@
 mod cache;
+mod decision_guidance;
 mod decisions;
 mod github;
 mod go;
@@ -36,10 +37,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Repository opt-in and per-PR local history of implementation choices.
+    /// Show recent decisions or manage the local decision journal.
+    #[command(args_conflicts_with_subcommands = true)]
     Decisions {
+        /// Show only independent decisions in the recent timeline.
+        #[arg(long)]
+        independent: bool,
         #[command(subcommand)]
-        action: decisions::Command,
+        action: Option<decisions::Command>,
     },
     /// List PRs (open by default) with the last known session that worked on each.
     Prs {
@@ -260,7 +265,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Ok(home)
     };
     match cli.command {
-        Cmd::Decisions { action } => decisions::run(&home()?, action),
+        Cmd::Decisions {
+            action,
+            independent,
+        } => decisions::run(&home()?, action, independent),
         Cmd::Prs {
             repo,
             author,
