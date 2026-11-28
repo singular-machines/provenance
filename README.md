@@ -72,47 +72,71 @@ provenance install      # optional: exact stamps and live status
 | `provenance machine [alias]` | Show or set this machine's name in stamps |
 | `provenance peer add <ssh-destination>` | Pair with another machine so its sessions can be messaged (`peer list`, `peer remove`, `peer pull`) |
 | `provenance send '@name@machine' "message"` | Message a session registered under a name on a paired machine |
+| `provenance decisions [--independent]` | Read the newest ten decisions in the current GitHub repository |
 | `provenance decisions status [REPO] --json` | Check whether explicit decision recording is enabled for a repository |
-| `provenance decisions list <PR> --json` | Read locally recorded implementation choices and their rationale |
+| `provenance decisions guidance` | Read agent recording instructions for the current opted-in repository |
+| `provenance decisions list [REPO_OR_PR] [--independent] [--json]` | Read the full history across a repository or for one PR |
+| `provenance decisions show [REPO] <REF>` | Read the full rationale, actor and evidence for an entry |
+| `provenance decisions link <REPO> <ID> --pr <PR>` | Attach a repository decision to a PR or use `--commit <SHA>` to attach a commit |
 
 ### Decision history (opt in once per repository)
 
 Decision history is **off by default**. It is a local journal of explicitly reported implementation choices: what changed, why, and the evidence supporting the choice. It never processes transcripts, captures hidden reasoning, or records choices automatically. Installing hooks does not enable it. There is no GitHub write, session messaging, or peer replication.
 
-At the owner's explicit request, enable recording once for a repository. This covers every existing and future PR in that repository on this machine and state root; entries remain organized per PR:
+At the owner's explicit request, enable recording once for a repository. This covers decisions with or without a PR on this machine and state root.
 
 ```sh
 provenance decisions enable owner/repo
 provenance decisions status owner/repo --json
 ```
 
-Agents should first check `provenance decisions status owner/repo --json` and record only when `enabled` is `true`. An agent must not enable recording merely because a task involves a PR; the owner must request repository opt-in first. Once enabled, agents can record choices for any PR in that repository without asking again. After making a meaningful implementation choice, append a concise report:
+Enabling also installs a small, managed startup instruction in your Codex `AGENTS.md` (or the active `AGENTS.override.md`) and Claude Code's `rules/provenance-decisions.md`. The files live in the harness configuration directories, which default to `~/.codex` and `~/.claude` and respect `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. Existing user instructions are preserved. Start a fresh harness session to pick up installation, and rerun `enable` once for existing opt-ins to install or repair the instructions. If either setup step fails, the command reports it and keeps the previous opt-in status. Disabling recording stops repository-specific guidance while the shared startup instruction stays available for other repositories.
+
+The startup instruction asks agents to run `provenance decisions guidance` from the checkout or worktree where they are working. It reads the local Git remotes and journal. A GitHub `origin` takes precedence, then a single unambiguous GitHub fetch repository. There is no output outside an opted-in repository. Harness profiles must load their user instructions and have `provenance` on the command path.
+
+Agents should first check `provenance decisions status owner/repo --json` and record only when `enabled` is `true`. The owner must request repository opt-in first. Once enabled, agents can record choices in that repository without asking again. Use the repository when a PR is unavailable, or use a PR reference when the choice belongs to a known PR.
+
+Record a material trade-off chosen independently or selected by the user when a plausible alternative could change product behavior, security or privacy, reliability or data integrity, performance or cost, or the scope of a change relative to a safeguard. Skip routine mechanics, status or verification recaps, and restatements of requirements. This example weighs schedule compatibility against protecting execution policy. Replace the evidence placeholder with a verifiable reference from the work.
 
 ```sh
-provenance decisions record owner/repo#123 \
+provenance decisions record owner/repo \
   --actor "codex/<session-id>" \
-  --what "Store decisions in the existing local state directory" \
-  --why "Keep the journal private and follow the existing state override" \
-  --evidence "src/state.rs: root()" \
-  --evidence "cargo test --test decisions: passed" \
+  --title "Keep existing job edits schedule-only" \
+  --what "Let existing jobs change their run schedule while keeping the execution policy fixed" \
+  --why "Preserve compatibility with existing jobs while protecting their execution policy. Policy edits need their own reviewed path" \
+  --alternative "Allow general payload edits" "That would let schedule edits change execution policy" \
+  --alternative "Keep existing jobs read-only" "Operators would have to recreate jobs to adjust run times" \
+  --evidence "<test verifying a schedule edit preserves the execution policy>" \
   --source independent \
   --timing contemporaneous
-provenance decisions list owner/repo#123
+provenance decisions list owner/repo --json
+provenance decisions link owner/repo 1 --pr 123
+provenance decisions link owner/repo 1 --commit 0123456789abcdef0123456789abcdef01234567
 provenance decisions list owner/repo#123 --json
 ```
 
-All report fields are required. Repeat `--evidence` for references to commits, paths, test results, observations, or the user instruction that prompted the choice. Use `--source user-directed` when the user explicitly requested that choice, and `independent` for the agent's implementation judgment. Use `--timing retrospective` when reconstructing the rationale later; `contemporaneous` means recording it when making the choice. `recorded_at` is always the actual recording time, not an inferred decision time. Supply the real session ID in `--actor` when known; it is a supplied attribution, not an authenticated identity. Evidence and classifications are also supplied claims, not independently verified facts or a complete audit of everything the agent considered. A retrospective explanation must not be presented as a contemporaneous record.
+All report fields are required. The title is a nonblank single line of at most 76 display columns. Use `--what` for the choice and affected scope. Use `--why` for the benefit sought and any material cost, remaining risk, or assumption that would change the decision. Flag material uncertainty. Use `--evidence` for verifiable references to commits, paths, test results, observations, or the user instruction that prompted the choice. Repeat it for more references.
+
+Give at least one `--alternative <OPTION> <REASON_NOT_SELECTED>` pair, and repeat the flag for more options. Include only options actually considered, with the reason each was passed over. Keeping current behavior or deferring can count when genuinely considered. Skip recording if no alternative was considered. Leave out invented alternatives, risks, and evidence, including options merely suggested by later evidence.
+
+Use `--source user-directed` when the user explicitly requested that choice, and `independent` for the agent's implementation judgment. Use `--timing retrospective` when reconstructing the rationale later; `contemporaneous` means recording it when making the choice. `recorded_at` is always the actual recording time, not an inferred decision time. Supply the real session ID in `--actor` when known; it is a supplied attribution, not an authenticated identity. Evidence and classifications are also supplied claims, not independently verified facts or a complete audit of everything the agent considered. A retrospective explanation must not be presented as a contemporaneous record.
+
+Run `provenance decisions` from a checkout to read the newest ten reports. The CLI reads local Git remotes, preferring a GitHub `origin` or using the sole GitHub repository among the fetch remotes. Run `provenance decisions list` for the full timeline, or pass an explicit repository from anywhere. The table groups reports by UTC day, newest first, and wraps the decision and rationale. Narrow terminals stack the rationale below the decision. The metadata line includes the source, harness, associated PR or no PR, abbreviated commit if attached, and a retrospective label where applicable. Colour is used on supported terminals and omitted for pipes, `NO_COLOR`, and `TERM=dumb`. Use `--independent` with either command to see only independent choices. The same filter works with `list --json`, which includes `alternatives` as an array of `option` and `reason_not_selected` pairs when present. Older entries keep their original fields.
+
+References identify the original recording target. From the repository's checkout, use `provenance decisions show repo:5` for a report recorded under the repository, or `provenance decisions show '#123:3'` for one recorded under PR 123. Quote references that start with `#` so the shell passes them to the command. From anywhere, use `provenance decisions show owner/repo '#123:3'`. The explicit forms `show owner/repo 5` and `show owner/repo#123 3` also work. A repository report keeps its original `repo:` reference when linked to a PR. The table uses titles for new entries and the original choice for older entries. Details include the full choice, rationale, alternatives and reasons when recorded, actor, evidence, commit hash if attached, and exact recording time and timing.
 
 ```sh
 provenance decisions disable owner/repo
 provenance decisions status owner/repo --json
 ```
 
-Disabling rejects new records for every PR in that repository and preserves existing history for `list`; re-enabling appends to that history. Repository opt-in grants no recording access to other repositories. `enable`, `disable`, and `status` accept `owner/repo` or a GitHub repository URL such as `https://github.com/owner/repo`; omit the repository to use the current folder's repository via `gh repo view`. They deliberately reject PR references to keep the scope of consent clear. `record` and `list` accept a PR number, `owner/repo#number`, or a GitHub PR URL. A bare PR number also uses `gh repo view`. Qualified references need no network or session lookup and do not verify that the repository or PR exists. Repository names are case-insensitive.
+Disabling rejects new records and links for that repository and keeps history readable. Repository opt-in applies only to the named repository. `enable`, `disable`, and `status` accept `owner/repo` or a GitHub repository URL such as `https://github.com/owner/repo`. Omit the repository for those commands to use the current folder's repository via `gh repo view`. `record` and `list` accept both repository forms as well as a PR number, `owner/repo#number`, or a GitHub PR URL. A bare PR number in `record` or `list` uses `gh repo view`. Repository names are case-insensitive.
 
-Existing version 1 journals retain their PR history, but their per-PR opt-ins never authorize repository-wide recording. After reading such a journal, recording stays disabled until the owner explicitly enables the repository with the command above; the next successful write upgrades storage to version 2 while preserving entries.
+Listing a repository shows all its decisions, including those recorded directly under a PR. In JSON, the `target` field identifies where an entry was recorded when it differs from the requested PR or when listing a repository. IDs are local to that target. Linking uses the ID of an entry originally recorded under the repository. It can add one PR in that repository and one full Git commit hash, together or separately. Repeating an existing link succeeds, and links preserve the original decision and attribution. Once a PR is linked, its filtered list includes that decision. Repository-qualified references and links are recorded locally without looking up repositories, PRs, or commits.
 
-The journal is stored as private JSON in `~/.local/state/provenance/decisions/history.json`, or `$PROVENANCE_STATE_DIR/decisions/history.json` when that override is set. Repository enablement is separate from per-PR entries; writes use a lock and atomic replacement so concurrent agents cannot lose records. Reading an untouched journal creates no state. Records are append-only through the CLI, but the owner can edit the local file: this is not tamper-proof storage. To remove all decision data and opt-ins, stop concurrent writers and delete the `decisions` directory in the active state root. Hooks and `uninstall` do not remove this journal. Avoid recording secrets or private transcript excerpts in the evidence.
+Version 2 and 3 journals keep their existing repository opt-ins and entries. Version 1 journals keep their PR entries and require explicit repository opt-in. Reads leave the journal untouched. The next successful write upgrades it to version 4, which requires a CLI with decision title support. Existing entries stay untitled.
+
+The journal is stored as private JSON in `~/.local/state/provenance/decisions/history.json`, or `$PROVENANCE_STATE_DIR/decisions/history.json` when that override is set. Writes use a lock and atomic replacement so concurrent agents cannot lose records. Reading an untouched journal creates no state. Through the CLI, reports are append-only and links can be added later. The owner can also edit the local file directly. To remove all decision data and opt-ins, stop concurrent writers and delete the `decisions` directory in the active state root. Hooks and `uninstall` do not remove this journal. Avoid recording secrets or private transcript excerpts in the evidence.
 
 ### Named sessions
 
